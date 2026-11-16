@@ -1,5 +1,8 @@
 # fnmusic-gateway
 
+[![docker](https://github.com/kid941005/fnmusic-gateway/actions/workflows/docker.yml/badge.svg)](https://github.com/kid941005/fnmusic-gateway/actions/workflows/docker.yml)
+[![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
+
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
 | 出口 | 地址 | 谁用 | 用途 |
@@ -54,6 +57,26 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 | `FNMUSIC_DEVICE_ID` | 内置 | 换设备号会强制重新登录 |
 
 ## 部署到飞牛 NAS（与小智服务端同宿主机）
+
+### 直接用 CI 构建好的镜像（不用自己 build）
+
+每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
+并推到 GHCR：
+
+```bash
+docker pull ghcr.io/kid941005/fnmusic-gateway:latest
+```
+
+compose 里把 `build: .` 换成镜像即可：
+
+```yaml
+    # build: .
+    image: ghcr.io/kid941005/fnmusic-gateway:latest
+```
+
+镜像包默认 private：要么在 GitHub 包设置里改成 public，要么在 NAS 上
+`docker login ghcr.io -u kid941005` 用 PAT（read:packages）登录。
+
 
 > 需要把密码写进文件时，在 compose 同目录手工建 `.env`（本工具链会拒绝代写 `.env*` 类文件），
 > 键名见上面环境变量表；compose 里已用 `${VAR:-默认值}` 形式读取，不建也能跑（密码留空则首次登录失败）。

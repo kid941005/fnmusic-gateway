@@ -1,0 +1,24 @@
+services:
+  fnmusic-gateway:
+    build: .
+    image: fnmusic-gateway:1.0.0
+    container_name: fnmusic-gateway
+    restart: unless-stopped
+    # 设备要直连这个端口，用 host 网络最省事（飞牛上 Docker 默认支持）
+    network_mode: host
+    environment:
+      GW_PORT: "8766"
+      # 设备访问网关用的地址：必须是设备能 ping 通的 NAS 局域网地址
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8766}"
+      GW_URL_TTL: "900"
+      GW_CACHE_MAX_BYTES: "8589934592"
+      GW_MP3_BITRATE: "128k"
+      # 不填则自动生成并持久化到 /data/sign.key
+      GW_SIGN_SECRET: "${GW_SIGN_SECRET:-}"
+      # 飞牛音乐
+      FNMUSIC_BASE: "${FNMUSIC_BASE:-http://192.168.50.100:59820}"
+      FNMUSIC_USER: "${FNMUSIC_USER:-KID}"
+      FNMUSIC_PASS: "${FNMUSIC_PASS:-}"
+      FNMUSIC_DEVICE_ID: "${FNMUSIC_DEVICE_ID:-}"
+    volumes:
+      - ./data:/data

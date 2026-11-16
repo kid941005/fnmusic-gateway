@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/cache/
+data/mock/
+data/sign.key
+data/state.json
+data/moods.json
+data/.fnmusic_token.json

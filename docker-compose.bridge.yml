@@ -1,0 +1,23 @@
+# 备用：不用 host 网络时用这个文件（效果等价，端口靠映射）
+#   docker compose -f docker-compose.bridge.yml up -d --build
+services:
+  fnmusic-gateway:
+    build: .
+    image: fnmusic-gateway:1.0.0
+    container_name: fnmusic-gateway
+    restart: unless-stopped
+    ports:
+      - "8766:8766"
+    environment:
+      GW_PORT: "8766"
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8766}"
+      GW_URL_TTL: "900"
+      GW_CACHE_MAX_BYTES: "8589934592"
+      GW_MP3_BITRATE: "128k"
+      GW_SIGN_SECRET: "${GW_SIGN_SECRET:-}"
+      FNMUSIC_BASE: "${FNMUSIC_BASE:-http://192.168.50.100:59820}"
+      FNMUSIC_USER: "${FNMUSIC_USER:-KID}"
+      FNMUSIC_PASS: "${FNMUSIC_PASS:-}"
+      FNMUSIC_DEVICE_ID: "${FNMUSIC_DEVICE_ID:-}"
+    volumes:
+      - ./data:/data

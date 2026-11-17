@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 1.3.0 (2026-11-17)
+
+### 新增：播放时显示歌名 / 歌手 / 歌词
+- 网关按 `歌名 + 歌手` 从 LRCLIB 取歌词，优先 `syncedLyrics`；只有 `plainLyrics` 时按 4 秒一行补
+  `[mm:ss.xx]` 时间戳（固件只认带时间戳的行）。LRC 缓存到 `$GW_DATA/lyrics/<guid>.lrc`，
+  查不到写空文件并在 `GW_LYRICS_RETRY`（默认 86400 秒）后才重试。
+- 新增签名歌词直链 `GET /lyrics/<guid>.lrc?exp=&sig=`（与音频同一套 HMAC，`text/plain`，支持 HEAD，
+  坏签名/过期 403，无歌词 404）。`GW_PUBLIC_PORT` 公网面同时放行 `/lyrics/`，管理面路径仍全部 404。
+- `/api/play` 返回新增 `lyric_url` 与 `device_args`（url/title/artist/lyric_url 一次给全）；
+  MCP `music_play` 的返回文本与工具描述都要求 LLM 调 `self.music.play_url` 时带齐 title/artist/lyric_url。
+- 示例插件 `examples/xiaozhi_plugin_fnmusic_gw.py` 改为传 `url + title + artist + lyric_url`
+  （`lyric_url` 为空或超 2048 字节时自动省略），修复设备屏显 `unknown`、无歌词的问题。
+- 新增环境变量 `GW_LYRICS`（默认 1）、`GW_LRCLIB_URL`、`GW_LYRICS_DIR`、`GW_LYRICS_RETRY`。
+- 测试 21 → 26 个用例：`plain_to_lrc` 时间戳、`fetch_lyrics` 优先级与离线降级、`/lyrics/` 签名/403/404、
+  `/api/play` 元数据、公网面 `/lyrics/` 放行。
+
 ## 1.2.2 (2026-11-17)
 
 ### 文档

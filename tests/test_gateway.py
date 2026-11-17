@@ -21,6 +21,7 @@ sys.path.insert(0, HERE)
 DATA = tempfile.mkdtemp(prefix="gw-test-")
 os.environ.setdefault("GW_DATA", DATA)
 os.environ["FNMUSIC_MOCK"] = "1"
+os.environ["GW_LYRICS"] = "0"  # 单测不联网查歌词
 os.environ.pop("GW_PUBLIC_BASE", None)
 
 import app  # noqa: E402
@@ -31,6 +32,7 @@ class Base(unittest.TestCase):
     def setUpClass(cls):
         # 前一个测试类可能清理过临时目录，这里补回来（app.CACHE 是模块级单例）
         os.makedirs(app.CACHE_DIR, exist_ok=True)
+        os.makedirs(app.LYRICS_DIR, exist_ok=True)
         cls.srv = app.GatewayServer(("127.0.0.1", 0), app.Handler)
         cls.port = cls.srv.server_address[1]
         cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -89,6 +91,29 @@ class TestPure(unittest.TestCase):
         self.assertEqual(app.norm_track({"id": "x", "name": "n"})["guid"], "x")
         pl = app.norm_playlist({"guid": "p", "name": "n", "trackCount": "abc"})
         self.assertEqual(pl["count"], 0)
+
+    def test_plain_to_lrc(self):
+        lrc = app.plain_to_lrc("第一行\n\n第二行\n第三行", step=5)
+        self.assertEqual(lrc.splitlines()[0], "[00:00.00]第一行")
+        self.assertEqual(lrc.splitlines()[1], "[00:05.00]第二行")
+        self.assertEqual(lrc.splitlines()[2], "[00:10.00]第三行")
+        self.assertEqual(len(lrc.splitlines()), 3)  # 空行被丢弃
+
+    def test_fetch_lyrics_prefers_synced(self):
+        old_enabled, old_json = app.LYRICS_ENABLED, app._http_json
+        app.LYRICS_ENABLED = True
+        try:
+            app._http_json = lambda url, timeout: {"syncedLyrics": "[00:01.00]hi", "plainLyrics": "hi"}
+            self.assertEqual(app.fetch_lyrics("t", "a"), "[00:01.00]hi")
+            app._http_json = lambda url, timeout: {"syncedLyrics": "", "plainLyrics": "a\nb"}
+            self.assertEqual(app.fetch_lyrics("t", "a").splitlines(),
+                             ["[00:00.00]a", "[00:04.00]b"])
+            def boom(url, timeout):
+                raise OSError("offline")
+            app._http_json = boom
+            self.assertEqual(app.fetch_lyrics("t", "a"), "")
+        finally:
+            app.LYRICS_ENABLED, app._http_json = old_enabled, old_json
 
     def test_clamp(self):
         self.assertEqual(app.clamp_limit(0, 10), 10)   # 0 视为未传
@@ -182,6 +207,32 @@ class TestHttp(Base):
         r, d = self.req("POST", "/api/favorite", {"action": "add", "guid": "mock-1"})
         self.assertEqual(r.status, 200)
 
+    def test_lyrics_route(self):
+        guid = "lyr-1"
+        with open(app.lyric_cache_path(guid), "w", encoding="utf-8") as fp:
+            fp.write("[00:01.00]第一句\n")
+        exp = int(app.time.time()) + 60
+        path = "/lyrics/%s.lrc?exp=%d&sig=%s" % (guid, exp, app.sign(guid, exp))
+        r, body = self.req("GET", path, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn("text/plain", r.getheader("Content-Type"))
+        self.assertIn("[00:01.00]第一句".encode(), body)
+        bad = path.replace("sig=", "sig=0")
+        r2, _ = self.req("GET", bad, raw=True)
+        self.assertEqual(r2.status, 403)
+        exp2 = int(app.time.time()) + 60
+        r3, _ = self.req("GET", "/lyrics/nope.lrc?exp=%d&sig=%s" % (exp2, app.sign("nope", exp2)), raw=True)
+        self.assertEqual(r3.status, 404)
+        r4, _ = self.req("GET", "/lyrics/", raw=True)
+        self.assertEqual(r4.status, 400)
+
+    def test_api_play_has_metadata(self):
+        r, d = self.req("GET", "/api/play?query=" + urllib.parse.quote("晴天"))
+        self.assertEqual(r.status, 200)
+        self.assertIn("lyric_url", d)
+        self.assertEqual(d["device_args"]["title"], d["title"])
+        self.assertEqual(d["device_args"]["url"], d["url"])
+
     def test_unknown_route(self):
         r, _ = self.req("GET", "/playlists", raw=True)
         self.assertEqual(r.status, 404)
@@ -238,6 +289,16 @@ class TestPublicPort(Base):
         self.assertEqual(r.status, 404)
         r, _ = self.req("DELETE", "/mcp", raw=True)
         self.assertEqual(r.status, 404)
+
+    def test_lyrics_allowed(self):
+        guid = "lyr-pub"
+        os.makedirs(app.LYRICS_DIR, exist_ok=True)
+        with open(app.lyric_cache_path(guid), "w", encoding="utf-8") as fp:
+            fp.write("[00:02.00]公网歌词\n")
+        exp = int(app.time.time()) + 60
+        r, body = self.req("GET", "/lyrics/%s.lrc?exp=%d&sig=%s" % (guid, exp, app.sign(guid, exp)), raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn("公网歌词".encode(), body)
 
     def test_play_still_works(self):
         exp = int(app.time.time()) + 60

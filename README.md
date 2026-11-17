@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.2.2**（见 [`CHANGELOG.md`](CHANGELOG.md)）
+> 当前版本 **1.3.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
 
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
@@ -44,7 +44,7 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GW_PORT` | 8766 | 管理端口（REST + MCP，**只留内网**） |
-| `GW_PUBLIC_PORT` | 0=关闭 | 公网专用端口：**只开放 `/play/`**，其余路径 404（见下文"公网只暴露播放端口"） |
+| `GW_PUBLIC_PORT` | 0=关闭 | 公网专用端口：**只开放 `/play/` 与 `/lyrics/`**，其余路径 404（见下文"公网只暴露播放端口"） |
 | `GW_PUBLIC_BASE` | 空=按请求 Host 推导 | **设备能访问的地址**，如 `http://192.168.50.100:8766` |
 | `GW_URL_TTL` | 900 | 直链有效期（秒） |
 | `GW_SIGN_SECRET` | 空=自动生成 `/data/sign.key` | 签名密钥，多副本部署要一致 |
@@ -56,6 +56,10 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 | `GW_PREWARM` | 1 | `/api/play` 返回前先转码，设备连上即可读 |
 | `GW_MAX_LIMIT` | 50 | 单次查询返回条数上限（LLM 传再大也会被收敛） |
 | `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把 NAS CPU 打满 |
+| `GW_LYRICS` | 1 | 是否查歌词（设备屏显用）；0=关闭，`lyric_url` 一律留空 |
+| `GW_LRCLIB_URL` | `https://lrclib.net/api/get` | 歌词源（LRCLIB 免费无 key，可自建） |
+| `GW_LYRICS_DIR` | `$GW_DATA/lyrics` | LRC 缓存目录 |
+| `GW_LYRICS_RETRY` | 86400 | 查不到歌词的重试间隔（秒） |
 | `GW_MOODS_FILE` | `$GW_DATA/moods.json` | 心情映射表 |
 | `FNMUSIC_MOCK` | 0 | 1=离线自测 |
 | `FNMUSIC_BASE` | `http://192.168.50.100:59820` | 飞牛音乐地址 |
@@ -68,10 +72,10 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 直接用 CI 构建好的镜像（不用自己 build）
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
-并推到 GHCR（`v1.2.2` 这类 tag 会生成 `1.2.2`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
+并推到 GHCR（`v1.3.0` 这类 tag 会生成 `1.3.0`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.2   # 生产建议锁定版本（compose 默认用 latest）
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.3.0   # 生产建议锁定版本（compose 默认用 latest）
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
@@ -79,7 +83,7 @@ docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 
 ```bash
 # 生产建议显式锁定版本，避免 latest 漂移
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.2.2 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.3.0 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合 docker compose build
 ```
 
@@ -105,10 +109,10 @@ curl -s http://127.0.0.1:8766/healthz
 不在 NAS 上构建（本地构建后搬运）：
 
 ```bash
-docker build -t fnmusic-gateway:1.2.2 .
-docker save fnmusic-gateway:1.2.2 | gzip > fnmusic-gateway-1.2.2.tgz
+docker build -t fnmusic-gateway:1.3.0 .
+docker save fnmusic-gateway:1.3.0 | gzip > fnmusic-gateway-1.3.0.tgz
 # 传到 NAS 后
-GW_IMAGE=fnmusic-gateway:1.2.2 docker load -i fnmusic-gateway-1.2.2.tgz && GW_IMAGE=fnmusic-gateway:1.2.2 docker compose up -d
+GW_IMAGE=fnmusic-gateway:1.3.0 docker load -i fnmusic-gateway-1.3.0.tgz && GW_IMAGE=fnmusic-gateway:1.3.0 docker compose up -d
 ```
 
 ### 和小智服务端怎么组网
@@ -267,11 +271,46 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 | `GET /readyz` | 就绪：真访问一次曲库 | 返回 503 + 原因（NAS 不通 / 账号错 / token 失效） |
 
 ```bash
-python tests/test_gateway.py -v   # 19 个用例：签名/直链/Range/MCP/REST/参数校验/缓存，全离线（mock）
+python tests/test_gateway.py -v   # 26 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ```
 
 `test_gateway.py` 进程内起服务，不需要 NAS 也不需要 Docker；有 ffmpeg 时还会验转码缓存不留残片。
+
+## 播放时显示歌名 / 歌手 / 歌词
+
+固件 `self.music.play_url` 不只接受 `url`，还接受 `title` / `artist` / `lyric_url`
+（见 `xiaozhi-esp32-zhj` 的 `main/mcp_server.cc`）。只传 `url` 时屏幕上是 `unknown`、没有歌词。
+
+网关 1.3.0 起：`/api/play` 的 JSON 多了 `lyric_url` 与 `device_args`，MCP `music_play` 也会把
+歌名、歌手、歌词直链一起吐给 LLM，要求它调 `self.music.play_url` 时四个参数都带上。
+
+歌词来源与格式：
+
+- 源是 [LRCLIB](https://lrclib.net)（免费、无 key、无需登录），按 `歌名 + 歌手` 查。
+- 优先用 `syncedLyrics`（带 `[mm:ss.xx]` 时间轴）。只有 `plainLyrics` 时，网关按 4 秒一行
+  自动补时间戳——**固件只认带时间戳的行，纯文本会被整行丢掉**。
+- LRC 缓存在 `$GW_DATA/lyrics/<guid>.lrc`；查不到会写一个空文件，`GW_LYRICS_RETRY`（默认 1 天）
+  后才会重试，避免每次播放都卡在查歌词上。
+- 纯音乐 / 查不到 → `lyric_url` 为空串，插件就不传该参数，屏幕只显示歌名与歌手。
+- 歌词直链与音频直链同一套 HMAC 签名，同样受 `GW_URL_TTL` 限制；公网面 `GW_PUBLIC_PORT` 同样放行。
+
+示例插件（`examples/xiaozhi_plugin_fnmusic_gw.py`）已经把这些参数带上：
+
+```python
+args = {"url": url, "title": data["title"], "artist": data["artist"] or "unknown"}
+if data.get("lyric_url"):
+    args["lyric_url"] = data["lyric_url"]
+_device(conn, DEVICE_PLAY, args)   # self.music.play_url
+```
+
+自测：
+
+```bash
+curl -s "http://127.0.0.1:8766/api/play?query=%E6%99%B4%E5%A4%A9" \
+  | python -c "import json,sys;d=json.load(sys.stdin);print(d['lyric_url'])"
+curl -s "<上一步的 lyric_url>" | head -3   # 期望 [00:29.36] 故事的小黃花 ...
+```
 
 ## 心情映射
 
@@ -291,9 +330,11 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 真实模式缺账号 | `/healthz` 200 且 `provider_error` 说明原因，`/api/play` 500 带同一错误，不崩 |
 | Docker 镜像构建 | 成功：alpine 261 MB / debian 805 MB，均带 HEALTHCHECK |
 | 容器内跑通（bridge + 端口映射） | `/healthz` healthy；容器内 ffmpeg 8.1.3 含 libmp3lame，直链 200 / 65245 字节；缓存落到 `/data/cache` |
-| `tests/test_gateway.py`（21 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片 |
+| `tests/test_gateway.py`（26 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片 |
 | `/healthz` 与 `/readyz` | 前者只报进程存活，后者真探曲库；NAS 异常时 `/readyz` 返回 503 |
-| `GW_PUBLIC_PORT` 公网面 | `/play/...` 200 / Range 206 / HEAD 200；`/healthz`、`/readyz`、`/api/*`、`POST /mcp`、`DELETE /mcp` 全部 404；`GW_PORT` 管理面不受影响 |
+| `GW_PUBLIC_PORT` 公网面 | `/play/...` 200 / Range 206 / HEAD 200、`/lyrics/...` 200 text/plain；`/healthz`、`/readyz`、`/api/*`、`POST /mcp`、`DELETE /mcp` 全部 404；`GW_PORT` 管理面不受影响 |
+| 歌词链路（真实 LRCLIB） | `/api/play?query=晴天` → `lyric_url`；拉取 200 `text/plain; charset=utf-8`，首行 `[00:29.36] 故事的小黃花`（带 LRC 时间戳，固件才认） |
+| 公网面歌词 | `/lyrics/...` 200、坏签名 403，其余路径仍 404 |
 
 真实飞牛未验证：开发机到 `192.168.50.100:59820` 不通，需在 NAS 同网段跑一次。
 
@@ -302,16 +343,16 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 网关的 `/api/*`、`/mcp`、`/healthz` **没有任何鉴权**。如果整域名反代到 `GW_PORT`（8766），
 等于把曲库浏览、签名直链（`/api/play` 会直接发出签名 URL）、转码接口全暴露到公网。
 
-正确做法：开一个**只服务 `/play/` 的公网端口**，反代只指向它。
+正确做法：开一个**只服务 `/play/` 与 `/lyrics/` 的公网端口**，反代只指向它。
 
 ```yaml
 environment:
   GW_PORT: "8766"          # 管理面，内网
-  GW_PUBLIC_PORT: "8767"   # 公网面，只放行 /play/
+  GW_PUBLIC_PORT: "8767"   # 公网面，只放行 /play/ 与 /lyrics/
 ```
 
 - 反代（Lucky / nginx / caddy）把 `https://fnmusic.example.com` 整域名转发到 `192.168.50.100:8767`，**不需要任何路径规则**。
-- `8767` 上：`GET/HEAD /play/<guid>.mp3?exp=&sig=` 正常（200 / 206，支持 Range）；其余一律 **404**。
+- `8767` 上：`GET/HEAD /play/<guid>.mp3?exp=&sig=` 正常（200 / 206，支持 Range）；`GET /lyrics/<guid>.lrc?exp=&sig=` 正常（200 `text/plain`）；其余一律 **404**。
 - `8766` 不上公网，插件方式 B、桥接器、探针都走它。
 - `GW_PUBLIC_BASE` 填这个公网地址（如 `https://fnmusic.example.com`），设备拿到的直链就走公网。
 
@@ -324,5 +365,5 @@ environment:
   播放控制权在设备）。
 - 签名直链到 `self.music.play_url` 的端到端验收在固件 v2.6.0 上**还没做过**
   （见 `docs/merge_v2.6.0_assessment.md:97`），先用上面"直链自测"验通再上线。
-- 无进度条/封面/歌词：固件只认 URL。
+- 无进度条/封面：固件只显示歌名、歌手和滚动歌词，没有封面图与进度条。
 - 网关单实例：缓存与签名密钥都在本地，多副本要共享 `/data`。

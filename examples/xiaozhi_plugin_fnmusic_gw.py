@@ -116,8 +116,17 @@ def fnmusic_gw_play(conn, mode="search", value=""):
         return ActionResponse(action=Action.RESPONSE, result="no url", response="没找到这首歌。")
     if len(url) > MAX_URL:
         return ActionResponse(action=Action.RESPONSE, result="url too long", response="直链太长了，换一首吧。")
+    # 设备屏显要歌名/歌手/歌词：固件 play_url 支持 title/artist/lyric_url
+    args = {
+        "url": url,
+        "title": str(data.get("title") or "") or "unknown",
+        "artist": str(data.get("artist") or "") or "unknown",
+    }
+    lyric_url = str(data.get("lyric_url") or "")
+    if lyric_url and len(lyric_url) <= MAX_URL:
+        args["lyric_url"] = lyric_url
     try:
-        _device(conn, DEVICE_PLAY, {"url": url})
+        _device(conn, DEVICE_PLAY, args)
     except Exception as e:
         return ActionResponse(
             action=Action.RESPONSE, result="device failed: %s" % e, response="设备没能播放这首歌。"

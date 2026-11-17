@@ -41,10 +41,11 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -91,6 +92,15 @@ HTTP_BODY_CAP = 1024 * 1024
 MCP_BODY_CAP = 4 * 1024 * 1024
 _HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$")
 TRANSCODE_CONCURRENCY = max(1, _env_int("GW_TRANSCODE_CONCURRENCY", 2))
+
+# 歌词（设备端 self.music.play_url 的 lyric_url 会自己去拉 LRC）
+LYRICS_ENABLED = _env_bool("GW_LYRICS", True)
+LYRICS_DIR = _env("GW_LYRICS_DIR", os.path.join(DATA_DIR, "lyrics"))
+LRCLIB_URL = (_env("GW_LRCLIB_URL", "https://lrclib.net/api/get") or "").rstrip("/")
+LRCLIB_TIMEOUT = max(1, _env_int("GW_LRCLIB_TIMEOUT", 6))
+LYRICS_RETRY = max(60, _env_int("GW_LYRICS_RETRY", 86400))
+LYRIC_MAX_BYTES = 64 * 1024
+os.makedirs(LYRICS_DIR, exist_ok=True)
 
 
 def _log_level(name):
@@ -584,6 +594,113 @@ def make_url(base, guid, ttl=None):
     return "%s/play/%s.mp3?exp=%d&sig=%s" % (base, g, exp, sign(guid, exp))
 
 
+def make_lyric_url(base, guid, ttl=None):
+    exp = int(time.time()) + (ttl or URL_TTL)
+    g = urllib.parse.quote(guid, safe="")
+    return "%s/lyrics/%s.lrc?exp=%d&sig=%s" % (base, g, exp, sign(guid, exp))
+
+
+def lyric_cache_path(guid):
+    return os.path.join(LYRICS_DIR, urllib.parse.quote(guid, safe="") + ".lrc")
+
+
+def _http_json(url, timeout):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "fnmusic-gateway/" + VERSION,
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read(2 * 1024 * 1024).decode("utf-8", "replace"))
+
+
+def plain_to_lrc(text, step=4):
+    """把无时间轴的纯文本歌词按固定间隔补上 LRC 时间戳（固件只认 [mm:ss.xx] 行）。"""
+    out, ts = [], 0
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        mm, ss = divmod(ts, 60)
+        out.append("[%02d:%02d.00]%s" % (mm, ss, line))
+        ts += step
+    return "\n".join(out)
+
+
+def fetch_lyrics(title, artist):
+    """LRCLIB 查歌词：优先 syncedLyrics，退化为 plainLyrics 补时间戳；查不到返回空串。"""
+    if not LYRICS_ENABLED or not title or not LRCLIB_URL:
+        return ""
+    title = str(title).strip()
+    artist = str(artist or "").strip()
+    data = None
+    try:
+        q = {"track_name": title, "artist_name": artist}
+        data = _http_json(LRCLIB_URL + "?" + urllib.parse.urlencode(q), LRCLIB_TIMEOUT)
+    except Exception as e:
+        LOG.info("lyrics get %s / %s failed: %s", title, artist, e)
+        data = None
+    if not isinstance(data, dict):
+        try:
+            q = {"track_name": title}
+            if artist:
+                q["artist_name"] = artist
+            rows = _http_json(LRCLIB_URL.replace("/get", "/search") + "?" +
+                              urllib.parse.urlencode(q), LRCLIB_TIMEOUT)
+            data = rows[0] if isinstance(rows, list) and rows else None
+        except Exception as e:
+            LOG.info("lyrics search %s / %s failed: %s", title, artist, e)
+            return ""
+    if not isinstance(data, dict):
+        return ""
+    synced = str(data.get("syncedLyrics") or "").strip()
+    if synced:
+        return synced[:LYRIC_MAX_BYTES]
+    plain = str(data.get("plainLyrics") or "").strip()
+    return plain_to_lrc(plain)[:LYRIC_MAX_BYTES] if plain else ""
+
+
+def lyrics_for(track):
+    """取（必要时抓取并缓存）一首歌的 LRC 文件路径；空文件表示查不到。"""
+    guid = str(track.get("guid") or "")
+    if not guid:
+        return ""
+    path = lyric_cache_path(guid)
+    try:
+        st = os.stat(path)
+        if st.st_size > 0 or (time.time() - st.st_mtime) < LYRICS_RETRY:
+            return path
+    except OSError:
+        pass
+    text = fetch_lyrics(track.get("title"), track.get("artist"))
+    tmp = path + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        LOG.warning("write lyrics %s failed: %s", guid, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return ""
+    LOG.info("lyrics for %s: %d bytes", guid, len(text))
+    return path
+
+
+def lyric_url_for(base, track, ttl=None):
+    """有歌词才返回签名直链；没有则返回空串（设备页面只显示歌名/歌手）。"""
+    path = lyrics_for(track)
+    if not path:
+        return ""
+    try:
+        if os.path.getsize(path) <= 0:
+            return ""
+    except OSError:
+        return ""
+    return make_lyric_url(base, track["guid"], ttl)
+
+
 # ---------------------------------------------------------------- MCP 工具
 TOOLS = [
     {
@@ -625,7 +742,9 @@ TOOLS = [
     },
     {
         "name": "music_play",
-        "description": "拿一首歌的可播放直链（给设备 self.music.play_url 用）。query/mood/playlist 三选一，index 从 1 开始。",
+        "description": ("拿一首歌的可播放直链，同时给出歌名、歌手和歌词直链（设备屏显要用）。"
+                        "query/mood/playlist 三选一，index 从 1 开始。"
+                        "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url 四个参数都填上。"),
         "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string"}, "mood": {"type": "string"},
             "playlist": {"type": "string"}, "index": {"type": "integer"}}, "required": []},
@@ -711,10 +830,14 @@ def call_tool(name, args, base):
         url = make_url(base, t["guid"])
         save_state({"guid": t["guid"], "title": t["title"], "artist": t["artist"],
                     "at": int(time.time()), "url": url})
+        lurl = lyric_url_for(base, t)
         return ("准备播放：%s%s\n%s 第 %d 首\n直链（%d 分钟内有效）：%s\n"
-                "设备工具：self.music.play_url，参数 url 填上面的直链。" % (
+                "歌词直链：%s\n"
+                "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
+                "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空）。" % (
                     t["title"], (" - " + t["artist"]) if t["artist"] else "", label, idx,
-                    max(1, URL_TTL // 60), url))
+                    max(1, URL_TTL // 60), url, lurl or "（这首歌查不到歌词，留空即可）",
+                    t["title"], t["artist"] or ""))
 
     if name == "music_favorite":
         action = str(args.get("action") or "").lower()
@@ -823,6 +946,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_readyz()
             if path == "/play" or path.startswith("/play/"):
                 return self._handle_play(u, qs)
+            if path == "/lyrics" or path.startswith("/lyrics/"):
+                return self._handle_lyrics(u, qs)
             if path == "/api/search":
                 q = (qs.get("q") or [""])[0].strip()
                 if not q:
@@ -964,16 +1089,53 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 LOG.warning("prewarm %s failed: %s", t["guid"], e)
                 warm = None
-        url = make_url(self._base(), t["guid"])
+        base = self._base()
+        url = make_url(base, t["guid"])
+        lyric_url = lyric_url_for(base, t)
         save_state({"guid": t["guid"], "title": t["title"], "artist": t["artist"],
                     "at": int(time.time()), "url": url})
         return self._json({
             "guid": t["guid"], "title": t["title"], "artist": t["artist"], "album": t["album"],
-            "url": url, "expires_in": URL_TTL, "label": label, "index": index,
-            "count": len(rows), "warmed_bytes": warm,
+            "url": url, "lyric_url": lyric_url, "expires_in": URL_TTL, "label": label,
+            "index": index, "count": len(rows), "warmed_bytes": warm,
+            "device_args": {"url": url, "title": t["title"], "artist": t["artist"] or "",
+                            "lyric_url": lyric_url},
             "device_tool": "self.music.play_url",
             "spoken": "%s%s" % (t["title"], ("，" + t["artist"]) if t["artist"] else ""),
         })
+
+    def _handle_lyrics(self, u, qs):
+        """签名歌词直链：设备 self.music.play_url 的 lyric_url 会自己来拉 LRC。"""
+        guid = (qs.get("guid") or [""])[0]
+        if not guid and u.path.startswith("/lyrics/"):
+            name = u.path[len("/lyrics/"):]
+            if name.endswith(".lrc"):
+                name = name[:-4]
+            guid = urllib.parse.unquote(name)
+        if not guid:
+            return self._json({"error": "missing guid"}, 400)
+        exp = (qs.get("exp") or [""])[0]
+        sig = (qs.get("sig") or [""])[0]
+        if not verify(guid, exp, sig):
+            return self._json({"error": "invalid or expired signature"}, 403)
+        path = lyric_cache_path(guid)
+        try:
+            with open(path, "rb") as fp:
+                body = fp.read(LYRIC_MAX_BYTES)
+        except OSError:
+            return self._json({"error": "no lyrics"}, 404)
+        if not body:
+            return self._json({"error": "no lyrics"}, 404)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, max-age=300")
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
 
     def _handle_play(self, u, qs):
         guid = (qs.get("guid") or [""])[0]
@@ -1138,7 +1300,8 @@ class PublicHandler(Handler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
-        if not (u.path == "/play" or u.path.startswith("/play/")):
+        if not (u.path == "/play" or u.path.startswith("/play/") or
+                u.path == "/lyrics" or u.path.startswith("/lyrics/")):
             return self._not_found()
         return Handler.do_GET(self)
 

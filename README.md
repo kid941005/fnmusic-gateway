@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.2.1**（见 [`CHANGELOG.md`](CHANGELOG.md)）
+> 当前版本 **1.2.2**（见 [`CHANGELOG.md`](CHANGELOG.md)）
 
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
@@ -68,14 +68,14 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 直接用 CI 构建好的镜像（不用自己 build）
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
-并推到 GHCR（`v1.2.1` 这类 tag 会生成 `1.2.1`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
+并推到 GHCR（`v1.2.2` 这类 tag 会生成 `1.2.2`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.1   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.2   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
-**两份 compose 默认已经指向 `1.2.1` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
+**两份 compose 默认已经指向 `1.2.2` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
 
 ```bash
 GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:latest docker compose up -d
@@ -104,10 +104,10 @@ curl -s http://127.0.0.1:8766/healthz
 不在 NAS 上构建（本地构建后搬运）：
 
 ```bash
-docker build -t fnmusic-gateway:1.2.1 .
-docker save fnmusic-gateway:1.2.1 | gzip > fnmusic-gateway-1.2.1.tgz
+docker build -t fnmusic-gateway:1.2.2 .
+docker save fnmusic-gateway:1.2.2 | gzip > fnmusic-gateway-1.2.2.tgz
 # 传到 NAS 后
-GW_IMAGE=fnmusic-gateway:1.2.1 docker load -i fnmusic-gateway-1.2.1.tgz && GW_IMAGE=fnmusic-gateway:1.2.1 docker compose up -d
+GW_IMAGE=fnmusic-gateway:1.2.2 docker load -i fnmusic-gateway-1.2.2.tgz && GW_IMAGE=fnmusic-gateway:1.2.2 docker compose up -d
 ```
 
 ### 和小智服务端怎么组网
@@ -130,6 +130,50 @@ GW_IMAGE=fnmusic-gateway:1.2.1 docker load -i fnmusic-gateway-1.2.1.tgz && GW_IM
 ```
 
 端口冲突先查：`ss -ltnp | grep 8766`。
+
+### 公网播放：只反代 8767，绝不要反代 8766
+
+`/api/*`、`/mcp`、`/healthz` **没有鉴权**。要设备在外网也能播，正确做法是开一个
+**只服务 `/play/` 的公网端口**，反代只指向它：
+
+```yaml
+  fnmusic-gateway:
+    network_mode: host
+    environment:
+      GW_PORT: "8766"                                        # 管理面：REST + MCP，只留内网
+      GW_PUBLIC_PORT: "8767"                                 # 公网面：只放行 /play/
+      GW_PUBLIC_BASE: "https://fnmusic.example.com"          # 设备拿到的直链走这个地址
+```
+
+反代（Lucky / nginx / caddy）把整个域名转发到 `192.168.50.100:8767`，**不需要任何路径规则**：
+
+| 请求 | 8767（公网面） | 8766（管理面） |
+|---|---|---|
+| `GET/HEAD /play/<guid>.mp3?exp=&sig=` | 200 / 206（支持 Range） | 200 / 206 |
+| `/api/*`、`/mcp`、`/healthz`、`/readyz` | **404** | 200 |
+| `POST` / `DELETE /mcp` | **404** | 200 / 204 |
+
+验证（应全部符合上表）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://fnmusic.example.com/healthz        # 404
+curl -s -o /dev/null -w '%{http_code}\n' https://fnmusic.example.com/api/playlists  # 404
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' https://fnmusic.example.com/mcp  # 404
+```
+
+> `GW_PUBLIC_PORT` 是进程内的路径判断，不依赖反代软件的子规则，配错也不会漏。
+
+### hairpin：家里设备拉公网域名会失败怎么办
+
+`GW_PUBLIC_BASE` 是公网域名后，**在家的设备也会去拉这个公网域名**。如果路由器不支持
+NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”。两种解法任选：
+
+1. 在 Lucky 或内网 DNS 里把该域名解析到 `192.168.50.100`（内外都通，推荐）；
+2. 或让路由器/防火墙放行内网访问公网 IP 的回环。
+
+固件对 `self.music.play_url` 的限制：**URL ≤ 2048 字节、仅 http/https、不能含空格和 `@`**。
+
 
 ### 两个必须注意的挂载
 

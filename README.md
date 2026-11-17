@@ -71,14 +71,15 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 并推到 GHCR（`v1.2.2` 这类 tag 会生成 `1.2.2`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.2   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.2   # 生产建议锁定版本（compose 默认用 latest）
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
-**两份 compose 默认已经指向 `1.2.2` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
+**两份 compose 默认跟 `latest`**（CI 每次推 main / tag 都会更新它），不用改；想锁定版本或换本地镜像时用环境变量覆盖：
 
 ```bash
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:latest docker compose up -d
+# 生产建议显式锁定版本，避免 latest 漂移
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.2.2 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合 docker compose build
 ```
 

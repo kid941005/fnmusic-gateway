@@ -219,5 +219,42 @@ class TestCache(Base):
         self.assertEqual(app.CACHE.ensure("mock-1", p), path)  # 命中缓存
 
 
+class TestPublicPort(Base):
+    """GW_PUBLIC_PORT 用的 PublicHandler：只放行 /play/，其余一律 404。"""
+
+    @classmethod
+    def setUpClass(cls):
+        os.makedirs(app.CACHE_DIR, exist_ok=True)
+        cls.srv = app.GatewayServer(("127.0.0.1", 0), app.PublicHandler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    def test_non_play_paths_blocked(self):
+        for p in ("/healthz", "/readyz", "/api/search?q=x", "/api/play?query=x",
+                  "/api/playlists", "/api/moods", "/mcp"):
+            r, _ = self.req("GET", p, raw=True)
+            self.assertEqual(r.status, 404, p)
+        r, _ = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, raw=True)
+        self.assertEqual(r.status, 404)
+        r, _ = self.req("DELETE", "/mcp", raw=True)
+        self.assertEqual(r.status, 404)
+
+    def test_play_still_works(self):
+        exp = int(app.time.time()) + 60
+        path = "/play/mock-1.mp3?exp=%d&sig=%s" % (exp, app.sign("mock-1", exp))
+        r, body = self.req("GET", path, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.getheader("Content-Type"), "audio/mpeg")
+        self.assertGreater(len(body), 1024)
+        r2, part = self.req("GET", path, headers={"Range": "bytes=0-99"}, raw=True)
+        self.assertEqual(r2.status, 206)
+        self.assertEqual(len(part), 100)
+        r3, _ = self.req("HEAD", path, raw=True)
+        self.assertEqual(r3.status, 200)
+        bad = "/play/mock-1.mp3?exp=%d&sig=deadbeef" % exp
+        r4, _ = self.req("GET", bad, raw=True)
+        self.assertEqual(r4.status, 403)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

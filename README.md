@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.2.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
+> 当前版本 **1.2.1**（见 [`CHANGELOG.md`](CHANGELOG.md)）
 
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
@@ -43,7 +43,8 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GW_PORT` | 8766 | 监听端口 |
+| `GW_PORT` | 8766 | 管理端口（REST + MCP，**只留内网**） |
+| `GW_PUBLIC_PORT` | 0=关闭 | 公网专用端口：**只开放 `/play/`**，其余路径 404（见下文"公网只暴露播放端口"） |
 | `GW_PUBLIC_BASE` | 空=按请求 Host 推导 | **设备能访问的地址**，如 `http://192.168.50.100:8766` |
 | `GW_URL_TTL` | 900 | 直链有效期（秒） |
 | `GW_SIGN_SECRET` | 空=自动生成 `/data/sign.key` | 签名密钥，多副本部署要一致 |
@@ -67,14 +68,14 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 直接用 CI 构建好的镜像（不用自己 build）
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
-并推到 GHCR（`v1.2.0` 这类 tag 会生成 `1.2.0`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
+并推到 GHCR（`v1.2.1` 这类 tag 会生成 `1.2.1`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.0   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.1   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
-**两份 compose 默认已经指向 `1.2.0` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
+**两份 compose 默认已经指向 `1.2.1` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
 
 ```bash
 GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:latest docker compose up -d
@@ -103,10 +104,10 @@ curl -s http://127.0.0.1:8766/healthz
 不在 NAS 上构建（本地构建后搬运）：
 
 ```bash
-docker build -t fnmusic-gateway:1.2.0 .
-docker save fnmusic-gateway:1.2.0 | gzip > fnmusic-gateway-1.2.0.tgz
+docker build -t fnmusic-gateway:1.2.1 .
+docker save fnmusic-gateway:1.2.1 | gzip > fnmusic-gateway-1.2.1.tgz
 # 传到 NAS 后
-GW_IMAGE=fnmusic-gateway:1.2.0 docker load -i fnmusic-gateway-1.2.0.tgz && GW_IMAGE=fnmusic-gateway:1.2.0 docker compose up -d
+GW_IMAGE=fnmusic-gateway:1.2.1 docker load -i fnmusic-gateway-1.2.1.tgz && GW_IMAGE=fnmusic-gateway:1.2.1 docker compose up -d
 ```
 
 ### 和小智服务端怎么组网
@@ -245,10 +246,31 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 真实模式缺账号 | `/healthz` 200 且 `provider_error` 说明原因，`/api/play` 500 带同一错误，不崩 |
 | Docker 镜像构建 | 成功：alpine 261 MB / debian 805 MB，均带 HEALTHCHECK |
 | 容器内跑通（bridge + 端口映射） | `/healthz` healthy；容器内 ffmpeg 8.1.3 含 libmp3lame，直链 200 / 65245 字节；缓存落到 `/data/cache` |
-| `tests/test_gateway.py`（19 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片 |
+| `tests/test_gateway.py`（21 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片 |
 | `/healthz` 与 `/readyz` | 前者只报进程存活，后者真探曲库；NAS 异常时 `/readyz` 返回 503 |
+| `GW_PUBLIC_PORT` 公网面 | `/play/...` 200 / Range 206 / HEAD 200；`/healthz`、`/readyz`、`/api/*`、`POST /mcp`、`DELETE /mcp` 全部 404；`GW_PORT` 管理面不受影响 |
 
 真实飞牛未验证：开发机到 `192.168.50.100:59820` 不通，需在 NAS 同网段跑一次。
+
+## 公网只暴露播放端口（GW_PUBLIC_PORT）
+
+网关的 `/api/*`、`/mcp`、`/healthz` **没有任何鉴权**。如果整域名反代到 `GW_PORT`（8766），
+等于把曲库浏览、签名直链（`/api/play` 会直接发出签名 URL）、转码接口全暴露到公网。
+
+正确做法：开一个**只服务 `/play/` 的公网端口**，反代只指向它。
+
+```yaml
+environment:
+  GW_PORT: "8766"          # 管理面，内网
+  GW_PUBLIC_PORT: "8767"   # 公网面，只放行 /play/
+```
+
+- 反代（Lucky / nginx / caddy）把 `https://fnmusic.example.com` 整域名转发到 `192.168.50.100:8767`，**不需要任何路径规则**。
+- `8767` 上：`GET/HEAD /play/<guid>.mp3?exp=&sig=` 正常（200 / 206，支持 Range）；其余一律 **404**。
+- `8766` 不上公网，插件方式 B、桥接器、探针都走它。
+- `GW_PUBLIC_BASE` 填这个公网地址（如 `https://fnmusic.example.com`），设备拿到的直链就走公网。
+
+> 0 = 关闭（默认）。这是纯进程内的路径判断，不依赖反代软件的子规则，配错也不会漏。
 
 ## 已知限制
 

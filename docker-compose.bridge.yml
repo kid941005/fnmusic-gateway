@@ -2,14 +2,16 @@
 #   docker compose -f docker-compose.bridge.yml up -d --build
 services:
   fnmusic-gateway:
-    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.2.0}
+    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.2.1}
     # build: .
     container_name: fnmusic-gateway
     restart: unless-stopped
     ports:
       - "8766:8766"
+      - "8767:8767"   # 公网只反代这个端口
     environment:
       GW_PORT: "8766"
+      GW_PUBLIC_PORT: "${GW_PUBLIC_PORT:-8767}"
       GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8766}"
       GW_URL_TTL: "900"
       GW_CACHE_MAX_BYTES: "8589934592"
@@ -25,7 +27,7 @@ services:
       - ./data:/data
 
   fnmusic-bridge:
-    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.2.0}
+    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.2.1}
     container_name: fnmusic-bridge
     restart: unless-stopped
     depends_on:

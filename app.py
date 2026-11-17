@@ -44,7 +44,7 @@ import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -73,6 +73,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 HOST = _env("GW_HOST", "0.0.0.0")
 PORT = _env_int("GW_PORT", 8766)
+# 公网专用端口：只对外提供 /play/，其余路径 404（0 = 关闭）。用于整域名反代场景。
+PUBLIC_PORT = _env_int("GW_PUBLIC_PORT", 0)
 PUBLIC_BASE = (_env("GW_PUBLIC_BASE", "") or "").rstrip("/")
 URL_TTL = _env_int("GW_URL_TTL", 900)
 CACHE_DIR = _env("GW_CACHE_DIR", os.path.join(DATA_DIR, "cache"))
@@ -1123,10 +1125,46 @@ class GatewayServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+class PublicHandler(Handler):
+    """公网专用端口（GW_PUBLIC_PORT）：只开放 /play/ 签名直链，其余路径一律 404。
+
+    背景：/api/*、/mcp、/healthz 没有鉴权，整域名反代到 GW_PORT 会全部暴露。
+    开启 GW_PUBLIC_PORT 后，反代指向这个端口，管理面仍旧只听 GW_PORT（内网）。
+    只依赖路径判断，不依赖反代软件的任何高级特性。
+    """
+
+    def _not_found(self):
+        return self._json({"error": "not found"}, 404)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        if not (u.path == "/play" or u.path.startswith("/play/")):
+            return self._not_found()
+        return Handler.do_GET(self)
+
+    def do_POST(self):
+        return self._not_found()
+
+    def do_DELETE(self):
+        return self._not_found()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Allow", "GET, HEAD, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
 def main():
     srv = GatewayServer((HOST, PORT), Handler)
     LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB)",
              VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
+    if PUBLIC_PORT and PUBLIC_PORT != PORT:
+        pub = GatewayServer((HOST, PUBLIC_PORT), PublicHandler)
+        threading.Thread(target=pub.serve_forever, name="gw-public", daemon=True).start()
+        LOG.info("public play-only listener on %s:%d (only GET /play/..., 其他路径 404)", HOST, PUBLIC_PORT)
+    elif PUBLIC_PORT:
+        LOG.warning("GW_PUBLIC_PORT=%d 与 GW_PORT 相同，已忽略（公网面与管理面不能共用端口）", PUBLIC_PORT)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

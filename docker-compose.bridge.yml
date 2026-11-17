@@ -2,7 +2,7 @@
 #   docker compose -f docker-compose.bridge.yml up -d --build
 services:
   fnmusic-gateway:
-    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.1.0}
+    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.2.0}
     # build: .
     container_name: fnmusic-gateway
     restart: unless-stopped
@@ -25,7 +25,7 @@ services:
       - ./data:/data
 
   fnmusic-bridge:
-    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.1.0}
+    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.2.0}
     container_name: fnmusic-bridge
     restart: unless-stopped
     depends_on:

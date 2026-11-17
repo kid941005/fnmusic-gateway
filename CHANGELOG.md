@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Unreleased
+## 1.2.0 (2026-11-17)
 
 ### 修复（会影响实际可用性）
 - **示例插件注册错误**（`examples/xiaozhi_plugin_fnmusic_gw.py`）：给 `register_function` 多传了参数会直接 TypeError，

@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.1.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
+> 当前版本 **1.2.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
 
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
@@ -67,14 +67,14 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 直接用 CI 构建好的镜像（不用自己 build）
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
-并推到 GHCR（`v1.1.0` 这类 tag 会生成 `1.1.0`、`1.1`、`latest`、`sha-xxxxxxx` 四个标签）：
+并推到 GHCR（`v1.2.0` 这类 tag 会生成 `1.2.0`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.1.0   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.2.0   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
-**两份 compose 默认已经指向 `1.1.0` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
+**两份 compose 默认已经指向 `1.2.0` 镜像**，不用改；想换版本或本地镜像时用环境变量覆盖：
 
 ```bash
 GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:latest docker compose up -d
@@ -103,10 +103,10 @@ curl -s http://127.0.0.1:8766/healthz
 不在 NAS 上构建（本地构建后搬运）：
 
 ```bash
-docker build -t fnmusic-gateway:1.1.0 .
-docker save fnmusic-gateway:1.1.0 | gzip > fnmusic-gateway-1.1.0.tgz
+docker build -t fnmusic-gateway:1.2.0 .
+docker save fnmusic-gateway:1.2.0 | gzip > fnmusic-gateway-1.2.0.tgz
 # 传到 NAS 后
-GW_IMAGE=fnmusic-gateway:1.1.0 docker load -i fnmusic-gateway-1.1.0.tgz && GW_IMAGE=fnmusic-gateway:1.1.0 docker compose up -d
+GW_IMAGE=fnmusic-gateway:1.2.0 docker load -i fnmusic-gateway-1.2.0.tgz && GW_IMAGE=fnmusic-gateway:1.2.0 docker compose up -d
 ```
 
 ### 和小智服务端怎么组网

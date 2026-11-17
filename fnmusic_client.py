@@ -26,7 +26,7 @@
 import hashlib
 import json
 import os
-import random
+import secrets
 import ssl
 import threading
 import time
@@ -70,7 +70,7 @@ def build_authx(pathname, method, params=None, body=None):
     else:
         src = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     body_hash = _md5(src)
-    nonce = str(random.randint(100000, 999999))
+    nonce = str(100000 + secrets.randbelow(900000))
     ts = str(int(time.time() * 1000))
     sign = _md5("_".join([API_SECRET, pathname, nonce, ts, body_hash, API_KEY]))
     return "nonce=%s&timestamp=%s&sign=%s" % (nonce, ts, sign)
@@ -296,29 +296,3 @@ class FnMusicClient:
         if status != 200 or not raw:
             raise FnMusicError("stream status=%s head=%r" % (status, raw[:80]), status)
         return hdr.get("Content-Type", ""), raw
-
-
-def client_from_env(env_file=None, **over):
-    """从 .secrets/fnos.env 或环境变量构造客户端。"""
-    cfg = {}
-    env_file = env_file or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                        ".secrets", "fnos.env")
-    if os.path.exists(env_file):
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip().strip('"').strip("'")
-    for k in ("FNOS_BASE", "FNOS_USER", "FNOS_PASS", "FNOS_DEVICE_ID", "FNOS_TOKEN_FILE"):
-        if os.environ.get(k):
-            cfg[k] = os.environ[k]
-    cfg.update({k: v for k, v in over.items() if v is not None})
-    return FnMusicClient(
-        base=cfg.get("FNOS_BASE", DEFAULT_BASE),
-        username=cfg.get("FNOS_USER") or DEFAULT_USERNAME,
-        password=cfg.get("FNOS_PASS"),
-        device_id=cfg.get("FNOS_DEVICE_ID") or DEFAULT_DEVICE_ID,
-        token_file=cfg.get("FNOS_TOKEN_FILE") or os.path.join(os.path.dirname(env_file), "fnos.token"),
-    )

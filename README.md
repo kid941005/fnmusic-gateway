@@ -28,7 +28,8 @@
 cd fnmusic-gateway
 cp data/moods.json.example data/moods.json   # 可选，改心情映射
 docker compose up -d --build
-curl -s http://127.0.0.1:8766/healthz | python -m json.tool
+curl -s http://127.0.0.1:8766/healthz | python -m json.tool   # 存活
+curl -s http://127.0.0.1:8766/readyz  | python -m json.tool   # 就绪（真访问曲库）
 ```
 
 裸跑（本机调试 / 没有 Docker）：
@@ -52,6 +53,8 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 | `GW_MP3_BITRATE` | 128k | 转码码率 |
 | `GW_MP3_SR` | 44100 | 采样率 |
 | `GW_PREWARM` | 1 | `/api/play` 返回前先转码，设备连上即可读 |
+| `GW_MAX_LIMIT` | 50 | 单次查询返回条数上限（LLM 传再大也会被收敛） |
+| `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把 NAS CPU 打满 |
 | `GW_MOODS_FILE` | `$GW_DATA/moods.json` | 心情映射表 |
 | `FNMUSIC_MOCK` | 0 | 1=离线自测 |
 | `FNMUSIC_BASE` | `http://192.168.50.100:59820` | 飞牛音乐地址 |
@@ -208,6 +211,22 @@ ffprobe -v error -show_entries stream=codec_name,sample_rate,channels,bit_rate -
 curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 ```
 
+## 自检与测试
+
+两个探针分工不同，别混用：
+
+| 探针 | 语义 | 失败时 |
+|---|---|---|
+| `GET /healthz` | 存活：只证明网关进程活着，不碰 NAS（NAS 掉线时缓存仍能服务） | 进程挂了 |
+| `GET /readyz` | 就绪：真访问一次曲库 | 返回 503 + 原因（NAS 不通 / 账号错 / token 失效） |
+
+```bash
+python tests/test_gateway.py -v   # 19 个用例：签名/直链/Range/MCP/REST/参数校验/缓存，全离线（mock）
+python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
+```
+
+`test_gateway.py` 进程内起服务，不需要 NAS 也不需要 Docker；有 ffmpeg 时还会验转码缓存不留残片。
+
 ## 心情映射
 
 飞牛 API 没有 genre/mood 维度，只有 `/search/track?q=`。所以心情靠 `data/moods.json`
@@ -226,6 +245,8 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 | 真实模式缺账号 | `/healthz` 200 且 `provider_error` 说明原因，`/api/play` 500 带同一错误，不崩 |
 | Docker 镜像构建 | 成功：alpine 261 MB / debian 805 MB，均带 HEALTHCHECK |
 | 容器内跑通（bridge + 端口映射） | `/healthz` healthy；容器内 ffmpeg 8.1.3 含 libmp3lame，直链 200 / 65245 字节；缓存落到 `/data/cache` |
+| `tests/test_gateway.py`（19 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片 |
+| `/healthz` 与 `/readyz` | 前者只报进程存活，后者真探曲库；NAS 异常时 `/readyz` 返回 503 |
 
 真实飞牛未验证：开发机到 `192.168.50.100:59820` 不通，需在 NAS 同网段跑一次。
 

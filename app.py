@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import subprocess
 import sys
@@ -83,10 +84,27 @@ PREWARM = _env_bool("GW_PREWARM", True)
 MOCK = _env_bool("FNMUSIC_MOCK", False)
 MOODS_FILE = _env("GW_MOODS_FILE", os.path.join(DATA_DIR, "moods.json"))
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
+HTTP_BODY_CAP = 1024 * 1024
+MCP_BODY_CAP = 4 * 1024 * 1024
+_HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$")
+TRANSCODE_CONCURRENCY = max(1, _env_int("GW_TRANSCODE_CONCURRENCY", 2))
 
-logging.basicConfig(level=_env("GW_LOG_LEVEL", "INFO"),
+
+def _log_level(name):
+    return getattr(logging, str(name or "INFO").strip().upper(), logging.INFO)
+
+
+logging.basicConfig(level=_log_level(_env("GW_LOG_LEVEL", "INFO")),
                     format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("fnmusic-gw")
+
+# 同时最多几个 ffmpeg：防止多台设备同时点播把 NAS 的 CPU 打满
+_TRANSCODE_SLOTS = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
+
+
+class BadRequest(Exception):
+    """调用方参数错误：HTTP 映射为 400，MCP 侧原样回文本。"""
 
 
 # ---------------------------------------------------------------- 签名
@@ -175,6 +193,18 @@ def _first(d, *keys, default=""):
     return default
 
 
+def _to_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp_limit(v, default=10, top=None):
+    """把外部传进来的 limit 收敛到 [1, top]，非法值退回默认。"""
+    return max(1, min(_to_int(v, default) or default, top or MAX_LIMIT))
+
+
 def _rows(data):
     if data is None:
         return []
@@ -215,7 +245,7 @@ def norm_playlist(p):
     return {
         "guid": str(_first(p, "guid", "playlistGuid", "playlistGUID", "id")),
         "name": str(_first(p, "name", "title", "playlistName")),
-        "count": int(_first(p, "trackCount", "count", "songCount", default=0) or 0),
+        "count": _to_int(_first(p, "trackCount", "count", "songCount", default=0)),
     }
 
 
@@ -270,6 +300,19 @@ class Mp3Cache:
         os.makedirs(d, exist_ok=True)
         self._locks = {}
         self._guard = threading.Lock()
+        self._cleanup_stale()
+
+    def _cleanup_stale(self):
+        """清掉上次进程被 kill 时留下的 .part / .src 半成品。"""
+        try:
+            for n in os.listdir(self.dir):
+                if n.endswith(".part") or ".src" in n:
+                    try:
+                        os.remove(os.path.join(self.dir, n))
+                    except OSError:
+                        pass
+        except Exception as e:
+            LOG.warning("cache cleanup failed: %s", e)
 
     def path(self, guid):
         return os.path.join(self.dir, hashlib.sha1(guid.encode("utf-8")).hexdigest() + ".mp3")
@@ -295,24 +338,27 @@ class Mp3Cache:
             ctype = (ctype or "").lower()
             ext = ".flac" if "flac" in ctype else (".mp3" if "mpeg" in ctype else ".wav" if "wav" in ctype else ".bin")
             src = dst + ".src" + ext
-            with open(src, "wb") as f:
-                f.write(raw)
-            tmp = dst + ".tmp.mp3"
-            cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", src,
-                   "-vn", "-map_metadata", "-1",
-                   "-ac", str(MP3_CHANNELS), "-ar", str(MP3_SR),
-                   "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", tmp]
+            tmp = dst + ".part"     # 不以 .mp3 结尾：不会被当成缓存条目统计或淘汰
             try:
-                subprocess.run(cmd, check=True, timeout=timeout,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                with open(src, "wb") as f:
+                    f.write(raw)
+                cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", src,
+                       "-vn", "-map_metadata", "-1",
+                       "-ac", str(MP3_CHANNELS), "-ar", str(MP3_SR),
+                       "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", tmp]
+                with _TRANSCODE_SLOTS:
+                    subprocess.run(cmd, check=True, timeout=timeout,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
+                    raise RuntimeError("ffmpeg 转码失败: %s" % guid)
+                os.replace(tmp, dst)
             finally:
-                try:
-                    os.remove(src)
-                except Exception:
-                    pass
-            if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
-                raise RuntimeError("ffmpeg 转码失败: %s" % guid)
-            os.replace(tmp, dst)
+                # 失败路径不留垃圾：.src 与 .part 一律清掉（成功时已被 replace/删除）
+                for leftover in (src, tmp):
+                    try:
+                        os.remove(leftover)
+                    except Exception:
+                        pass
             self.evict()
             return dst
 
@@ -375,6 +421,14 @@ class FnProvider:
     def playlist_tracks(self, guid, limit=200):
         return dedupe(norm_track(t) for t in _rows(self.client.playlist_tracks(guid, 1, limit)))
 
+    def albums(self, limit=20):
+        rows = _rows(self.client.album_list(1, limit))
+        return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
+
+    def artists(self, limit=20):
+        rows = _rows(self.client.artist_list(1, limit))
+        return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
+
     def favorites(self, limit=100):
         return dedupe(norm_track(t) for t in _rows(self.client.favorite_list(1, limit)))
 
@@ -421,6 +475,12 @@ class MockProvider:
             return [self.TRACKS[0], self.TRACKS[3]]
         return []
 
+    def albums(self, limit=20):
+        return ["叶惠美", "十一月的萧邦", "What's Going On", "猎户星座", "First Love"][:limit]
+
+    def artists(self, limit=20):
+        return ["周杰伦", "陈奕迅", "朴树", "Yiruma"][:limit]
+
     def favorites(self, limit=100):
         return [self.TRACKS[0], self.TRACKS[4]]
 
@@ -442,19 +502,24 @@ class MockProvider:
 
 _PROVIDER = None
 _PROVIDER_ERR = None
+_PROVIDER_LOCK = threading.Lock()
 
 
 def provider():
+    """惰性单例。并发首请求只登录一次（否则会重复登录/重复建连接）。"""
     global _PROVIDER, _PROVIDER_ERR
-    if _PROVIDER is not None:
+    p = _PROVIDER
+    if p is not None:
+        return p
+    with _PROVIDER_LOCK:
+        if _PROVIDER is None:
+            try:
+                _PROVIDER = MockProvider() if MOCK else FnProvider()
+                _PROVIDER_ERR = None
+            except Exception as e:
+                _PROVIDER_ERR = str(e)
+                raise
         return _PROVIDER
-    try:
-        _PROVIDER = MockProvider() if MOCK else FnProvider()
-        _PROVIDER_ERR = None
-    except Exception as e:
-        _PROVIDER_ERR = str(e)
-        raise
-    return _PROVIDER
 
 
 def provider_error():
@@ -499,16 +564,16 @@ def pick_tracks(p, query="", mood="", playlist="", limit=10):
     if playlist:
         pl = resolve_playlist(p, playlist)
         if not pl:
-            raise RuntimeError("没有找到歌单「%s」" % playlist)
+            raise BadRequest("没有找到歌单「%s」" % playlist)
         return p.playlist_tracks(pl["guid"], 200)[:limit], "歌单「%s」" % pl["name"]
     if mood:
         return mood_tracks(p, mood, limit), "心情「%s」" % mood
     if query:
         rows = p.search(query, limit)
         if not rows:
-            raise RuntimeError("没有搜到「%s」" % query)
+            raise BadRequest("没有搜到「%s」" % query)
         return rows, "搜索「%s」" % query
-    raise RuntimeError("需要 query / mood / playlist 之一")
+    raise BadRequest("需要 query / mood / playlist 之一")
 
 
 def make_url(base, guid, ttl=None):
@@ -581,26 +646,27 @@ TOOLS = [
 def call_tool(name, args, base):
     args = args or {}
     p = provider()
-    limit = int(args.get("limit") or 10)
+    limit = clamp_limit(args.get("limit"), 10)
 
     if name == "music_search":
         q = str(args.get("query") or "").strip()
         if not q:
-            raise RuntimeError("query 不能为空")
+            raise BadRequest("query 不能为空")
         rows = p.search(q, limit)
         return "搜索「%s」找到 %d 首：\n%s" % (q, len(rows), fmt_tracks(rows, limit))
 
     if name == "music_browse":
         cat = str(args.get("category") or "track")
+        if cat not in ("track", "album", "artist", "playlist"):
+            raise BadRequest("category 只能是 track / album / artist / playlist")
         if cat == "playlist":
             pls = p.playlists()
             return "歌单 %d 个：\n%s" % (len(pls), "\n".join(
                 "%d. %s（%d 首）" % (i, x["name"], x["count"]) for i, x in enumerate(pls, 1)) or "（空）")
         if cat in ("album", "artist"):
-            fn = "album_list" if cat == "album" else "artist_list"
-            rows = _rows(getattr(p.client, fn)(1, limit)) if hasattr(p, "client") else []
-            names = [str(_first(r, "name", "title", default="")) for r in rows]
-            return "%s %d 个：\n%s" % (cat, len(names), "\n".join(
+            names = p.albums(limit) if cat == "album" else p.artists(limit)
+            label = "专辑" if cat == "album" else "歌手"
+            return "%s %d 个：\n%s" % (label, len(names), "\n".join(
                 "%d. %s" % (i, n) for i, n in enumerate(names, 1)) or "（空）")
         rows = p.list_tracks(limit)
         return "全部歌曲（前 %d 首）：\n%s" % (len(rows), fmt_tracks(rows, limit))
@@ -613,7 +679,7 @@ def call_tool(name, args, base):
     if name == "music_playlist_tracks":
         pl = resolve_playlist(p, str(args.get("name") or ""))
         if not pl:
-            raise RuntimeError("没有找到歌单「%s」" % args.get("name"))
+            raise BadRequest("没有找到歌单「%s」" % args.get("name"))
         rows = p.playlist_tracks(pl["guid"], 200)[:limit]
         return "歌单「%s」共 %d 首：\n%s" % (pl["name"], len(rows), fmt_tracks(rows, limit))
 
@@ -624,16 +690,16 @@ def call_tool(name, args, base):
     if name == "music_mood":
         mood = str(args.get("mood") or "").strip()
         if not mood:
-            raise RuntimeError("mood 不能为空")
+            raise BadRequest("mood 不能为空")
         rows = mood_tracks(p, mood, limit)
         return "「%s」为你挑了 %d 首：\n%s" % (mood, len(rows), fmt_tracks(rows, limit))
 
     if name == "music_play":
         rows, label = pick_tracks(p, str(args.get("query") or ""), str(args.get("mood") or ""),
                                   str(args.get("playlist") or ""), 20)
-        idx = int(args.get("index") or 1)
+        idx = _to_int(args.get("index"), 1)
         if idx < 1 or idx > len(rows):
-            raise RuntimeError("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
+            raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
         t = rows[idx - 1]
         if PREWARM:
             try:
@@ -652,10 +718,10 @@ def call_tool(name, args, base):
         action = str(args.get("action") or "").lower()
         q = str(args.get("query") or "").strip()
         if not q:
-            raise RuntimeError("query 不能为空")
+            raise BadRequest("query 不能为空")
         rows = p.search(q, 5)
         if not rows:
-            raise RuntimeError("没找到「%s」" % q)
+            raise BadRequest("没找到「%s」" % q)
         t = rows[0]
         if action == "add":
             p.add_favorite(t["guid"])
@@ -663,15 +729,16 @@ def call_tool(name, args, base):
         if action == "remove":
             p.remove_favorite(t["guid"])
             return "已取消收藏：%s" % t["title"]
-        raise RuntimeError("action 只能是 add 或 remove")
+        raise BadRequest("action 只能是 add 或 remove")
 
     if name == "music_status":
         st = load_state()
         if not st.get("title"):
             return "还没播放过。"
+        at = _to_int(st.get("at"))
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)) if at > 0 else "时间未知"
         return "上一次播放：%s%s（%s）" % (
-            st.get("title"), (" - " + st["artist"]) if st.get("artist") else "",
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.get("at") or 0)))
+            st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", when)
 
     raise RuntimeError("未知工具：%s" % name)
 
@@ -703,51 +770,80 @@ class Handler(BaseHTTPRequestHandler):
     def _base(self):
         if PUBLIC_BASE:
             return PUBLIC_BASE
-        host = self.headers.get("Host") or ("127.0.0.1:%d" % PORT)
+        host = (self.headers.get("Host") or "").strip()
+        # Host 会原样拼进返回给设备的直链，只放行 host[:port]
+        if not _HOST_RE.match(host):
+            host = "127.0.0.1:%d" % PORT
         return "http://" + host
 
     def _qs(self):
         u = urllib.parse.urlparse(self.path)
         return u, urllib.parse.parse_qs(u.query)
 
+    def _qs_int(self, qs, key, default):
+        raw = (qs.get(key) or [""])[0]
+        if raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise BadRequest("参数 %s 必须是整数" % key)
+
+    def _body(self, cap=HTTP_BODY_CAP):
+        n = _to_int(self.headers.get("Content-Length"), 0)
+        if n < 0:
+            raise BadRequest("Content-Length 非法")
+        if n > cap:
+            raise BadRequest("请求体过大（上限 %d 字节）" % cap)
+        raw = self.rfile.read(n) if n else b""
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise BadRequest("请求体不是合法 JSON")
+        if not isinstance(data, dict):
+            raise BadRequest("请求体必须是 JSON 对象")
+        return data
+
     def do_GET(self):
         try:
             u, qs = self._qs()
             path = u.path
             if path == "/healthz":
-                try:
-                    p = provider()
-                    ok = True
-                    err = None
-                    n = len(p.list_tracks(1)) if MOCK else 0
-                except Exception as e:
-                    ok, err, n = False, str(e), 0
-                return self._json({"ok": ok, "version": VERSION, "mock": MOCK,
-                                   "provider_error": err, "cache_mb": round(self._cache_mb(), 1),
-                                   "moods": sorted(MOODS.keys()), "tracks_probe": n})
-            if path.startswith("/play"):
+                # 存活探针：只证明进程活着，不碰 NAS（NAS 掉线时缓存仍能服务）
+                return self._json({"ok": True, "version": VERSION, "mock": MOCK,
+                                   "provider_error": provider_error(),
+                                   "cache_mb": round(self._cache_mb(), 1),
+                                   "moods": sorted(MOODS.keys())})
+            if path == "/readyz":
+                # 就绪探针：真访问一次曲库，NAS/账号异常回 503
+                return self._handle_readyz()
+            if path == "/play" or path.startswith("/play/"):
                 return self._handle_play(u, qs)
             if path == "/api/search":
-                q = (qs.get("q") or [""])[0]
-                limit = int((qs.get("limit") or ["10"])[0])
+                q = (qs.get("q") or [""])[0].strip()
+                if not q:
+                    raise BadRequest("参数 q 不能为空")
+                limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
                 rows = provider().search(q, limit)
                 return self._json({"query": q, "count": len(rows), "tracks": rows})
             if path == "/api/playlists":
                 return self._json({"playlists": provider().playlists()})
             if path == "/api/playlist":
                 name = (qs.get("name") or [""])[0]
-                limit = int((qs.get("limit") or ["200"])[0])
+                limit = clamp_limit(self._qs_int(qs, "limit", 200), 200, 500)
                 p = provider()
                 pl = resolve_playlist(p, name)
                 if not pl:
                     return self._json({"error": "playlist not found: " + name}, 404)
                 return self._json({"playlist": pl, "tracks": p.playlist_tracks(pl["guid"], limit)[:limit]})
             if path == "/api/favorites":
-                limit = int((qs.get("limit") or ["100"])[0])
+                limit = clamp_limit(self._qs_int(qs, "limit", 100), 100)
                 return self._json({"tracks": provider().favorites(limit)})
             if path == "/api/mood":
                 mood = (qs.get("mood") or [""])[0]
-                limit = int((qs.get("limit") or ["10"])[0])
+                limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
                 rows = mood_tracks(provider(), mood, limit)
                 return self._json({"mood": mood, "count": len(rows), "tracks": rows})
             if path == "/api/play":
@@ -758,6 +854,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "use POST /mcp (streamable-http)"}, 405,
                                   [("Allow", "POST, OPTIONS")])
             return self._json({"error": "not found", "path": path}, 404)
+        except BadRequest as e:
+            self._json({"error": str(e)}, 400)
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -776,11 +874,12 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/mcp":
                 return self._handle_mcp()
             if u.path == "/api/favorite":
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                body = self._body()
                 p = provider()
                 action = str(body.get("action") or "add").lower()
-                guid = str(body.get("guid") or "")
+                if action not in ("add", "remove"):
+                    raise BadRequest("action 只能是 add 或 remove")
+                guid = str(body.get("guid") or "").strip()
                 if not guid:
                     rows = p.search(str(body.get("query") or ""), 1)
                     if not rows:
@@ -792,12 +891,15 @@ class Handler(BaseHTTPRequestHandler):
                     p.remove_favorite(guid)
                 return self._json({"ok": True, "guid": guid, "action": action})
             if u.path == "/api/warm":
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
-                guid = str(body.get("guid") or "")
+                body = self._body()
+                guid = str(body.get("guid") or "").strip()
+                if not guid:
+                    raise BadRequest("guid 不能为空")
                 path = CACHE.ensure(guid, provider())
                 return self._json({"ok": True, "guid": guid, "bytes": os.path.getsize(path)})
             return self._json({"error": "not found", "path": u.path}, 404)
+        except BadRequest as e:
+            self._json({"error": str(e)}, 400)
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -823,6 +925,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json({"error": "not found", "path": u.path}, 404)
 
+    def _handle_readyz(self):
+        try:
+            p = provider()
+            rows = p.list_tracks(1)
+            return self._json({"ok": True, "provider": "mock" if MOCK else "fnmusic",
+                               "tracks_probe": len(rows)})
+        except Exception as e:
+            return self._json({"ok": False, "error": str(e)}, 503)
+
     def _cache_mb(self):
         try:
             total = 0
@@ -837,7 +948,7 @@ class Handler(BaseHTTPRequestHandler):
         query = (qs.get("query") or qs.get("q") or [""])[0]
         mood = (qs.get("mood") or [""])[0]
         playlist = (qs.get("playlist") or [""])[0]
-        index = int((qs.get("index") or ["1"])[0])
+        index = self._qs_int(qs, "index", 1)
         p = provider()
         rows, label = pick_tracks(p, query, mood, playlist, 20)
         if index < 1 or index > len(rows):
@@ -890,6 +1001,8 @@ class Handler(BaseHTTPRequestHandler):
             size = os.path.getsize(path)
         except OSError:
             return self._json({"error": "not found"}, 404)
+        if size <= 0:
+            return self._json({"error": "empty audio file"}, 502)
         start, end, code = 0, size - 1, 200
         rng = self.headers.get("Range") or ""
         if rng.startswith("bytes="):
@@ -936,7 +1049,10 @@ class Handler(BaseHTTPRequestHandler):
             LOG.info("client aborted while streaming %s", path)
 
     def _handle_mcp(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        n = _to_int(self.headers.get("Content-Length"), 0)
+        if n < 0 or n > MCP_BODY_CAP:
+            return self._json({"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32600, "message": "payload too large"}}, 413)
         raw = self.rfile.read(n) if n else b""
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else None
@@ -999,9 +1115,16 @@ class Handler(BaseHTTPRequestHandler):
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(e)}}
 
 
+class GatewayServer(ThreadingHTTPServer):
+    """默认 request_queue_size=5，多台设备同时拉流容易被拒；这里放宽到 64。"""
+
+    daemon_threads = True
+    request_queue_size = 64
+    allow_reuse_address = True
+
+
 def main():
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    srv.daemon_threads = True
+    srv = GatewayServer((HOST, PORT), Handler)
     LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB)",
              VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
     try:

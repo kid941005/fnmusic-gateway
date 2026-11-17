@@ -116,7 +116,14 @@ async def forward(raw: str):
 
     resp = await asyncio.to_thread(_post_sync, raw.encode("utf-8"))
     if resp is None:
-        return None
+        # 网关没回包（超时 / 202 空体）：给每个请求回一条 JSON-RPC 错误。
+        # 不回包的话接入点会一直等，用户侧表现为"工具无响应"。
+        errs = [
+            {"jsonrpc": "2.0", "id": m.get("id"),
+             "error": {"code": -32603, "message": "fnmusic-gateway 无响应"}}
+            for m in requests
+        ]
+        return json.dumps(errs if isinstance(msg, list) else errs[0], ensure_ascii=False)
 
     for item in (resp if isinstance(resp, list) else [resp]):
         if isinstance(item, dict) and isinstance(item.get("result"), dict):

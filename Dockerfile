@@ -6,6 +6,10 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 COPY app.py fnmusic_client.py ./
+COPY bridge/ ./bridge/
+
+# 接入小智 MCP 接入点（WebSocket）用的桥接器依赖
+RUN pip install --no-cache-dir "websockets>=13"
 
 ENV PYTHONUNBUFFERED=1 \
     GW_DATA=/data \

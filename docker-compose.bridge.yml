@@ -21,3 +21,15 @@ services:
       FNMUSIC_DEVICE_ID: "${FNMUSIC_DEVICE_ID:-}"
     volumes:
       - ./data:/data
+
+  fnmusic-bridge:
+    image: fnmusic-gateway:1.0.0
+    container_name: fnmusic-bridge
+    restart: unless-stopped
+    depends_on:
+      - fnmusic-gateway
+    command: ["python", "-u", "bridge/mcp_pipe_http.py"]
+    environment:
+      MCP_ENDPOINT: "${MCP_ENDPOINT:-}"
+      GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"
+      GW_TIMEOUT: "120"

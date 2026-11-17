@@ -22,3 +22,18 @@ services:
       FNMUSIC_DEVICE_ID: "${FNMUSIC_DEVICE_ID:-}"
     volumes:
       - ./data:/data
+
+  # 把 9 个音乐工具挂到小智「MCP 接入点」（wss://.../mcp_endpoint/mcp/?token=...）
+  # 不填 MCP_ENDPOINT 就只跑网关，桥接器连不上会一直重试（不影响网关）
+  fnmusic-bridge:
+    image: fnmusic-gateway:1.0.0
+    container_name: fnmusic-bridge
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - fnmusic-gateway
+    command: ["python", "-u", "bridge/mcp_pipe_http.py"]
+    environment:
+      MCP_ENDPOINT: "${MCP_ENDPOINT:-}"
+      GW_MCP_URL: "http://127.0.0.1:8766/mcp"
+      GW_TIMEOUT: "120"

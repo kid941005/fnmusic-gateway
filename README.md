@@ -159,6 +159,38 @@ GET /api/play?query=晴天  ->  {"url": "http://nas:8766/play/xxx.mp3?exp=&sig="
 call_mcp_tool(conn, conn.mcp_client, "self.music.play_url", {"url": url})
 ```
 
+### 方式 C：小智 MCP 接入点（wss，已有接入点时用这个）
+
+如果你的小智已经有「MCP 接入点」地址，形如
+`wss://xxx:59826/mcp_endpoint/mcp/?token=...`，那它就是一个**消息转发中心**：
+xiaozhi-server 连上去要工具，工具端也要连上去供工具。工具端必须主动外连，
+所以不需要公网 IP，也不用改 xiaozhi-server 配置。
+
+```
+xiaozhi-server --WS--> 接入点 <--WS-- fnmusic-bridge --HTTP--> fnmusic-gateway
+```
+
+bridge 已经打进同一个镜像（`bridge/mcp_pipe_http.py`，只依赖 `websockets`），
+在 compose 里加一个服务即可（两份 compose 都已写好，填 `MCP_ENDPOINT` 就会启动）：
+
+```bash
+export MCP_ENDPOINT='wss://xxx:59826/mcp_endpoint/mcp/?token=...'
+docker compose up -d            # fnmusic-gateway + fnmusic-bridge
+docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 9 个工具" 即成功
+```
+
+不填 `MCP_ENDPOINT` 时桥接器会一直重连、不影响网关本体。
+
+接入点会把同一 token 下所有工具端的工具**合并**成一张表，所以：
+- 一个 token 只跑一个 fnmusic-bridge，重复连会看到重复工具；
+- 想换工具集，直接重启 bridge（接入点会重新拉 tools/list）。
+
+本地自测（不用真接入点，用假 broker 跑一遍 initialize/tools/list/ping/tools/call）：
+
+```bash
+python tests/bridge_selftest.py    # 需网关已在 127.0.0.1:8799 以 mock 模式运行
+```
+
 ## 直链自测
 
 ```bash

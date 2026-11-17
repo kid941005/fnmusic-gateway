@@ -1,6 +1,0 @@
-ci: GitHub Actions 自动构建并推送 GHCR 镜像
-
-- 推 main / 打 v* tag 触发，多架构 linux/amd64 + linux/arm64
-- 用 docker/metadata-action 生成 latest / semver / sha 标签
-- gha 缓存加速，附带 provenance 与 sbom
-- README 增加构建徽章与「直接用 CI 镜像」说明

@@ -1,0 +1,7 @@
+feat: 支持接入小智 MCP 接入点（wss 桥接器）
+
+- 新增 bridge/mcp_pipe_http.py：接入点 WS <-> 网关 /mcp 的 JSON-RPC 转发（自动重连、日志脱敏）
+- Dockerfile 内置 bridge 并安装 websockets
+- 两份 compose 增加 fnmusic-bridge 服务，填 MCP_ENDPOINT 即启用
+- tests/bridge_selftest.py：假 broker 自测 initialize/tools/list/ping/tools/call
+- README 增加「方式 C：小智 MCP 接入点」

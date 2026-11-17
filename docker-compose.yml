@@ -33,6 +33,9 @@ services:
     depends_on:
       - fnmusic-gateway
     command: ["python", "-u", "bridge/mcp_pipe_http.py"]
+    # 镜像自带的是网关的 /healthz 探针，桥接器不监听端口，必须关掉
+    healthcheck:
+      disable: true
     environment:
       MCP_ENDPOINT: "${MCP_ENDPOINT:-}"
       GW_MCP_URL: "http://127.0.0.1:8766/mcp"

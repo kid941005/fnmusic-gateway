@@ -29,6 +29,8 @@ services:
     depends_on:
       - fnmusic-gateway
     command: ["python", "-u", "bridge/mcp_pipe_http.py"]
+    healthcheck:
+      disable: true
     environment:
       MCP_ENDPOINT: "${MCP_ENDPOINT:-}"
       GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"

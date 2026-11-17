@@ -1,7 +1,8 @@
 services:
   fnmusic-gateway:
-    build: .
-    image: fnmusic-gateway:1.0.0
+    # 默认用 CI 发布到 GHCR 的镜像（amd64/arm64 双架构）；本地自己构建就注释掉 image、取消 build 注释
+    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.1.0}
+    # build: .
     container_name: fnmusic-gateway
     restart: unless-stopped
     # 设备要直连这个端口，用 host 网络最省事（飞牛上 Docker 默认支持）
@@ -26,7 +27,7 @@ services:
   # 把 9 个音乐工具挂到小智「MCP 接入点」（wss://.../mcp_endpoint/mcp/?token=...）
   # 不填 MCP_ENDPOINT 就只跑网关，桥接器连不上会一直重试（不影响网关）
   fnmusic-bridge:
-    image: fnmusic-gateway:1.0.0
+    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:1.1.0}
     container_name: fnmusic-bridge
     restart: unless-stopped
     network_mode: host

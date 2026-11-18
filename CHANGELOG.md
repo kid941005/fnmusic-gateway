@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 1.4.0 (2026-11-18)
+
+### 新增：搜索别名纠错 + 相关度排序
+- 新增文本归一化 `_norm_text`（NFKC 全角转半角、大小写折叠、去空格/标点/书名号）与
+  别名表 `apply_aliases`：`$GW_DATA/music_aliases.json`（示例 `data/music_aliases.json.example`），
+  按 mtime/size 自动重载，最长匹配替换，解决中文 ASR 把歌名/歌手听成同音字（青花磁→青花瓷、周杰轮→周杰伦）。
+- 新增 `score_track` / `rank_tracks` / `search_tracks`：精确 > 前缀 > 包含 > difflib 相似度，
+  歌手命中 +12，未提版本词时「伴奏/纯音乐/钢琴版/翻唱/remix…」候选 −15，标题长度接近 +3；
+  别名生效时同时用纠正前后两个词搜索再合并排序。
+- `pick_tracks` 的 query 分支、MCP `music_search`、REST `/api/search` 都改走 `search_tracks`；
+  `/api/search` 多返回 `corrected` 字段，MCP 文本注明「已按别名纠正」，`music_search` 工具描述同步。
+- 新增环境变量 `GW_SMART_SEARCH`（默认 1，0=回退原始顺序）、`GW_ALIASES_FILE`（默认 `$GW_DATA/music_aliases.json`）。
+- 测试 26 → **35 个用例**：归一化、别名应用与重载、精确版压过版本词、歌手命中、排序、`search_tracks` 别名纠正、
+  `/api/search` 排序与 `corrected`、`/api/play` 优先录音室版。
+- README 新增「搜索更聪明」一节，环境变量表与已知限制（只支持 MP3）同步更新。
+
 ## 1.3.0 (2026-11-17)
 
 ### 新增：播放时显示歌名 / 歌手 / 歌词

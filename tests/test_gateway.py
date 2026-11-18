@@ -317,5 +317,83 @@ class TestPublicPort(Base):
         self.assertEqual(r4.status, 403)
 
 
+class TestRanking(unittest.TestCase):
+    """搜索排序 + alias 单测（不启服务）。"""
+
+    def setUp(self):
+        self.ap = os.path.join(DATA, "aliases-test.json")
+        with open(self.ap, "w", encoding="utf-8") as fp:
+            fp.write(json.dumps({"青花磁": "晴天", "周董": "周杰伦"}, ensure_ascii=False))
+        app.ALIASES_FILE = self.ap
+        app._ALIAS_CACHE.update(stamp=None, table={})
+
+    def tearDown(self):
+        app.ALIASES_FILE = ""
+        app._ALIAS_CACHE.update(stamp=None, table={})
+
+    def test_norm_text(self):
+        self.assertEqual(app._norm_text("《晴天》 Live!"), "晴天live")
+        self.assertEqual(app._norm_text("ＡＢＣ　１２３"), "abc123")
+        self.assertEqual(app._norm_text(None), "")
+
+    def test_aliases_and_apply(self):
+        self.assertEqual(app.apply_aliases("青花磁"), ("晴天", True))
+        self.assertEqual(app.apply_aliases("周董"), ("周杰伦", True))
+        self.assertEqual(app.apply_aliases("夜曲"), ("夜曲", False))
+        self.assertIn("周杰伦", app.aliases().values())
+
+    def test_score_prefers_exact_over_version(self):
+        exact = {"guid": "a", "title": "晴天", "artist": "周杰伦"}
+        variant = {"guid": "b", "title": "晴天（钢琴版）", "artist": "纯音乐"}
+        self.assertGreater(app.score_track("晴天", exact), app.score_track("晴天", variant))
+
+    def test_score_artist_match(self):
+        t = {"guid": "a", "title": "夜曲", "artist": "周杰伦"}
+        self.assertGreater(app.score_track("周杰伦", t), app.score_track("陈奕迅", t))
+
+    def test_rank_tracks_order(self):
+        rows = [
+            {"guid": "mock-6", "title": "晴天（钢琴版）", "artist": "纯音乐"},
+            {"guid": "mock-1", "title": "晴天", "artist": "周杰伦"},
+        ]
+        self.assertEqual(app.rank_tracks("晴天", rows, 2)[0]["guid"], "mock-1")
+
+    def test_search_tracks_uses_alias(self):
+        rows, fixed = app.search_tracks(app.provider(), "青花磁", 5)
+        self.assertEqual(fixed, "晴天")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["guid"], "mock-1")
+
+
+class TestSearchApi(Base):
+    """REST 搜索走排序与别名纠正。"""
+
+    def test_api_search_ranked(self):
+        r, body = self.req("GET", "/api/search?q=" + urllib.parse.quote("晴天"))
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body["tracks"][0]["guid"], "mock-1")
+        self.assertNotIn("corrected", body)
+
+    def test_api_search_alias_corrected(self):
+        ap = os.path.join(DATA, "aliases-api.json")
+        with open(ap, "w", encoding="utf-8") as fp:
+            fp.write(json.dumps({"周董": "周杰伦"}, ensure_ascii=False))
+        app.ALIASES_FILE = ap
+        app._ALIAS_CACHE.update(stamp=None, table={})
+        try:
+            r, body = self.req("GET", "/api/search?q=" + urllib.parse.quote("周董"))
+            self.assertEqual(r.status, 200)
+            self.assertEqual(body.get("corrected"), "周杰伦")
+            self.assertTrue(body["tracks"])
+        finally:
+            app.ALIASES_FILE = ""
+            app._ALIAS_CACHE.update(stamp=None, table={})
+
+    def test_api_play_prefers_studio_version(self):
+        r, body = self.req("GET", "/api/play?query=" + urllib.parse.quote("晴天"))
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body["guid"], "mock-1")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

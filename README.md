@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.3.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
+> 当前版本 **1.4.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
 
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
@@ -60,6 +60,8 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 | `GW_LRCLIB_URL` | `https://lrclib.net/api/get` | 歌词源（LRCLIB 免费无 key，可自建） |
 | `GW_LYRICS_DIR` | `$GW_DATA/lyrics` | LRC 缓存目录 |
 | `GW_LYRICS_RETRY` | 86400 | 查不到歌词的重试间隔（秒） |
+| `GW_SMART_SEARCH` | 1 | 搜索是否做别名纠错 + 相关度排序；0=沿用飞牛原始顺序 |
+| `GW_ALIASES_FILE` | `$GW_DATA/music_aliases.json` | ASR 同音字/错字纠正表（示例见 `data/music_aliases.json.example`，改完自动重载） |
 | `GW_MOODS_FILE` | `$GW_DATA/moods.json` | 心情映射表 |
 | `FNMUSIC_MOCK` | 0 | 1=离线自测 |
 | `FNMUSIC_BASE` | `http://192.168.50.100:59820` | 飞牛音乐地址 |
@@ -72,10 +74,10 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 直接用 CI 构建好的镜像（不用自己 build）
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
-并推到 GHCR（`v1.3.0` 这类 tag 会生成 `1.3.0`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
+并推到 GHCR（`v1.4.0` 这类 tag 会生成 `1.4.0`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.3.0   # 生产建议锁定版本（compose 默认用 latest）
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.4.0   # 生产建议锁定版本（compose 默认用 latest）
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
@@ -83,7 +85,7 @@ docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 
 ```bash
 # 生产建议显式锁定版本，避免 latest 漂移
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.3.0 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.4.0 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合 docker compose build
 ```
 
@@ -109,10 +111,10 @@ curl -s http://127.0.0.1:8766/healthz
 不在 NAS 上构建（本地构建后搬运）：
 
 ```bash
-docker build -t fnmusic-gateway:1.3.0 .
-docker save fnmusic-gateway:1.3.0 | gzip > fnmusic-gateway-1.3.0.tgz
+docker build -t fnmusic-gateway:1.4.0 .
+docker save fnmusic-gateway:1.4.0 | gzip > fnmusic-gateway-1.4.0.tgz
 # 传到 NAS 后
-GW_IMAGE=fnmusic-gateway:1.3.0 docker load -i fnmusic-gateway-1.3.0.tgz && GW_IMAGE=fnmusic-gateway:1.3.0 docker compose up -d
+GW_IMAGE=fnmusic-gateway:1.4.0 docker load -i fnmusic-gateway-1.4.0.tgz && GW_IMAGE=fnmusic-gateway:1.4.0 docker compose up -d
 ```
 
 ### 和小智服务端怎么组网
@@ -271,7 +273,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 | `GET /readyz` | 就绪：真访问一次曲库 | 返回 503 + 原因（NAS 不通 / 账号错 / token 失效） |
 
 ```bash
-python tests/test_gateway.py -v   # 26 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词，全离线（mock）
+python tests/test_gateway.py -v   # 35 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ```
 
@@ -282,7 +284,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 固件 `self.music.play_url` 不只接受 `url`，还接受 `title` / `artist` / `lyric_url`
 （见 `xiaozhi-esp32-zhj` 的 `main/mcp_server.cc`）。只传 `url` 时屏幕上是 `unknown`、没有歌词。
 
-网关 1.3.0 起：`/api/play` 的 JSON 多了 `lyric_url` 与 `device_args`，MCP `music_play` 也会把
+网关 1.4.0 起：`/api/play` 的 JSON 多了 `lyric_url` 与 `device_args`，MCP `music_play` 也会把
 歌名、歌手、歌词直链一起吐给 LLM，要求它调 `self.music.play_url` 时四个参数都带上。
 
 歌词来源与格式：
@@ -358,6 +360,26 @@ environment:
 
 > 0 = 关闭（默认）。这是纯进程内的路径判断，不依赖反代软件的子规则，配错也不会漏。
 
+## 搜索更聪明：错字/同音字纠正 + 相关度排序
+
+中文语音识别经常把歌名/歌手听成同音字（"青花瓷"→"青花磁"、"周杰伦"→"周杰轮"），飞牛接口本身只做简单匹配，所以网关拿到结果后自己再排一次序：
+
+- **归一化**：NFKC（全角转半角）、大小写折叠、去掉空格/标点/书名号。
+- **别名表**：`$GW_DATA/music_aliases.json`（示例 `data/music_aliases.json.example`），键=听到的词、值=正确写法；最长匹配替换，改完立即生效（按 mtime/size 重载，不用重启）。
+- **打分**：标题/歌手精确命中 100 > 前缀 88 > 包含 78−长度差 > difflib 相似度×60；歌手整串命中 +12；用户没提版本词时，带「伴奏/纯音乐/钢琴版/翻唱/remix…」的候选 −15；标题长度接近查询 +3。按分数降序返回，同分短标题优先。
+- 别名生效时**同时用纠正前后两个词各搜一次**再合并排序（别名表写错也不会搜不到），`/api/search` 响应多一个 `corrected` 字段，MCP 返回文本注明"已按别名纠正"。
+
+```bash
+# 精确版应排在钢琴版前面
+curl -s 'http://127.0.0.1:8766/api/search?q=晴天' | python -m json.tool | head -20
+# 别名纠正（先按示例建表）
+cp data/music_aliases.json.example data/music_aliases.json
+curl -s 'http://127.0.0.1:8766/api/search?q=青花磁'
+# 期望 {"query":"青花磁","corrected":"青花瓷",...}
+```
+
+`GW_SMART_SEARCH=0` 可关掉整层（回退成飞牛原始顺序），排查"是不是排序搞的鬼"时用。
+
 ## 已知限制
 
 - **播歌时设备断 WS**：`/api/play` 这条路服务端看不到播放状态，也发不出 stop。
@@ -365,5 +387,6 @@ environment:
   播放控制权在设备）。
 - 签名直链到 `self.music.play_url` 的端到端验收在固件 v2.6.0 上**还没做过**
   （见 `docs/merge_v2.6.0_assessment.md:97`），先用上面"直链自测"验通再上线。
+- **只支持 MP3**：固件 `self.music.play_url` 的播放任务硬编码 `ESP_AUDIO_SIMPLE_DEC_TYPE_MP3`（`application.cc:1909`），Ogg/Opus 直链放不了，所以网关不提供 `?fmt=opus`。
 - 无进度条/封面：固件只显示歌名、歌手和滚动歌词，没有封面图与进度条。
 - 网关单实例：缓存与签名密钥都在本地，多副本要共享 `/data`。

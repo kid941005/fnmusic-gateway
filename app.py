@@ -28,6 +28,7 @@ GET /api/status                               上一次播放
 
 依赖：Python 3.9+ 标准库 + ffmpeg 可执行文件。无第三方包。
 """
+import difflib
 import hashlib
 import hmac
 import json
@@ -40,12 +41,13 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -101,6 +103,10 @@ LRCLIB_TIMEOUT = max(1, _env_int("GW_LRCLIB_TIMEOUT", 6))
 LYRICS_RETRY = max(60, _env_int("GW_LYRICS_RETRY", 86400))
 LYRIC_MAX_BYTES = 64 * 1024
 os.makedirs(LYRICS_DIR, exist_ok=True)
+
+# 搜索：别名纠错 + 相关度打分（中文 ASR 常把歌名/歌手听成同音字）
+SMART_SEARCH = _env_bool("GW_SMART_SEARCH", True)
+ALIASES_FILE = _env("GW_ALIASES_FILE", os.path.join(DATA_DIR, "music_aliases.json"))
 
 
 def _log_level(name):
@@ -279,6 +285,131 @@ def dedupe(tracks):
         seen.add(g)
         out.append(t)
     return out
+
+
+# ---------------------------------------------------------------- 搜索排序
+# 中文 ASR 常把歌名/歌手听成同音字：别名表把「青花磁」纠正成「青花瓷」，再搜索并打分排序。
+# 文件格式 {"青花磁": "青花瓷", "周杰轮": "周杰伦"}；键值都按 _norm_text 归一化后匹配。
+_PUNCT_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+_ALIAS_CACHE = {"stamp": None, "table": {}}
+
+
+def _norm_text(s):
+    """归一化：全角转半角、大小写折叠、去掉空格/标点/书名号等。"""
+    if not s:
+        return ""
+    try:
+        s = unicodedata.normalize("NFKC", str(s))
+    except Exception:
+        s = str(s)
+    return _PUNCT_RE.sub("", s.casefold())
+
+
+def aliases():
+    """读取别名表；文件 mtime/size 变化时自动重载，坏文件退回空表。"""
+    if not ALIASES_FILE:
+        return {}
+    try:
+        st = os.stat(ALIASES_FILE)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _ALIAS_CACHE.update(stamp=None, table={})
+        return {}
+    if _ALIAS_CACHE["stamp"] == stamp:
+        return _ALIAS_CACHE["table"]
+    table = {}
+    try:
+        with open(ALIASES_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            src = raw.get("aliases") if isinstance(raw.get("aliases"), dict) else raw
+            for k, v in src.items():
+                nk, nv = _norm_text(k), _norm_text(v)
+                if nk and nv and not nk.startswith("_"):
+                    table[nk] = nv
+        LOG.info("loaded %d alias(es) from %s", len(table), ALIASES_FILE)
+    except Exception as e:
+        LOG.warning("load aliases failed: %s", e)
+    _ALIAS_CACHE.update(stamp=stamp, table=table)
+    return table
+
+
+def apply_aliases(text):
+    """最长匹配替换别名，返回 (纠正后的文本, 是否改动)。"""
+    t = _norm_text(text)
+    table = aliases()
+    if not t or not table:
+        return t, False
+    changed = False
+    for key in sorted(table, key=len, reverse=True):
+        if key in t:
+            t = t.replace(key, table[key])
+            changed = True
+    return t, changed
+
+
+# 版本词：用户没提这些词时，带这些词的候选要降权（翻唱/伴奏/钢琴版…）
+_VERSION_WORDS = ("伴奏", "纯音乐", "钢琴版", "吉他版", "翻唱", "dj版", "remix",
+                  "instrumental", "karaoke", "live", "现场", "女声版", "男声版",
+                  "加速版", "慢速版", "八音盒", "cover", "片段")
+
+
+def score_track(query, track):
+    """给候选打分：精确 > 前缀 > 包含 > 相似度；歌手命中加分，多版本降权。"""
+    q, _ = apply_aliases(query)
+    if not q:
+        return 0.0
+    title, _ = apply_aliases(track.get("title") or "")
+    artist, _ = apply_aliases(track.get("artist") or "")
+    fields = [x for x in (title,
+                          " ".join(y for y in (artist, title) if y),
+                          " ".join(y for y in (title, artist) if y)) if x]
+    best = 0.0
+    for cand in fields:
+        if cand == q:
+            best = max(best, 100.0)
+        elif cand.startswith(q):
+            best = max(best, 88.0)
+        elif q in cand:
+            best = max(best, 78.0 - min(12.0, (len(cand) - len(q)) * 1.5))
+        else:
+            best = max(best, difflib.SequenceMatcher(None, q, cand).ratio() * 60.0)
+    if artist and (artist == q or q in artist):
+        best += 12.0
+    if not any(w in q for w in _VERSION_WORDS):
+        for w in _VERSION_WORDS:
+            if w in title:
+                best -= 15.0
+                break
+    if title and len(title) <= len(q) + 4:
+        best += 3.0
+    return round(best, 3)
+
+
+def rank_tracks(query, rows, limit=10):
+    """按打分降序；同分时短标题、稳定 guid 优先。"""
+    scored = [(score_track(query, t), t) for t in rows]
+    scored.sort(key=lambda x: (-x[0], len(x[1].get("title") or ""), str(x[1].get("guid") or "")))
+    return [t for _, t in scored][:limit]
+
+
+def search_tracks(p, query, limit=10):
+    """搜索 + 别名纠正 + 打分排序；别名生效时同时用原词兜底（防别名表写错）。"""
+    q = (query or "").strip()
+    if not q:
+        return [], ""
+    fixed, changed = apply_aliases(q)
+    raw = []
+    try:
+        raw.extend(p.search(fixed, max(limit * 3, 20)))
+    except Exception as e:
+        LOG.warning("search %r failed: %s", fixed, e)
+    if changed:
+        try:
+            raw.extend(p.search(q, max(limit, 10)))
+        except Exception as e:
+            LOG.warning("search %r failed: %s", q, e)
+    return rank_tracks(fixed, dedupe(raw), limit), fixed
 
 
 # ---------------------------------------------------------------- 状态
@@ -581,9 +712,14 @@ def pick_tracks(p, query="", mood="", playlist="", limit=10):
     if mood:
         return mood_tracks(p, mood, limit), "心情「%s」" % mood
     if query:
-        rows = p.search(query, limit)
+        if SMART_SEARCH:
+            rows, fixed = search_tracks(p, query, limit)
+        else:
+            rows, fixed = p.search(query, limit), ""
         if not rows:
             raise BadRequest("没有搜到「%s」" % query)
+        if fixed and fixed != _norm_text(query):
+            return rows, "搜索「%s」（已纠正为「%s」）" % (query, fixed)
         return rows, "搜索「%s」" % query
     raise BadRequest("需要 query / mood / playlist 之一")
 
@@ -705,7 +841,7 @@ def lyric_url_for(base, track, ttl=None):
 TOOLS = [
     {
         "name": "music_search",
-        "description": "在飞牛音乐库里搜歌。返回带序号的曲目列表。",
+        "description": "在飞牛音乐库里搜歌（自动纠正同音字/错字，按相关度排序）。返回带序号的曲目列表。",
         "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string", "description": "歌名或歌手"},
             "limit": {"type": "integer", "description": "最多返回几首，默认 10"}},
@@ -773,8 +909,12 @@ def call_tool(name, args, base):
         q = str(args.get("query") or "").strip()
         if not q:
             raise BadRequest("query 不能为空")
-        rows = p.search(q, limit)
-        return "搜索「%s」找到 %d 首：\n%s" % (q, len(rows), fmt_tracks(rows, limit))
+        if SMART_SEARCH:
+            rows, fixed = search_tracks(p, q, limit)
+        else:
+            rows, fixed = p.search(q, limit), ""
+        tail = ("（已按别名纠正为「%s」）" % fixed) if fixed and fixed != _norm_text(q) else ""
+        return "搜索「%s」%s找到 %d 首：\n%s" % (q, tail, len(rows), fmt_tracks(rows, limit))
 
     if name == "music_browse":
         cat = str(args.get("category") or "track")
@@ -953,8 +1093,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not q:
                     raise BadRequest("参数 q 不能为空")
                 limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
-                rows = provider().search(q, limit)
-                return self._json({"query": q, "count": len(rows), "tracks": rows})
+                p = provider()
+                if SMART_SEARCH:
+                    rows, fixed = search_tracks(p, q, limit)
+                else:
+                    rows, fixed = p.search(q, limit), ""
+                out = {"query": q, "count": len(rows), "tracks": rows}
+                if fixed and fixed != _norm_text(q):
+                    out["corrected"] = fixed
+                return self._json(out)
             if path == "/api/playlists":
                 return self._json({"playlists": provider().playlists()})
             if path == "/api/playlist":

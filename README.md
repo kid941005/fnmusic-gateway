@@ -370,7 +370,7 @@ GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768,lxmusic@http://127.0.0.1:8772"
 | 宿主机端口 | 8766 / 8767 / 8768 / 8770 / 8772 / 8774 | 仅 8766 / 8767 |
 | 音源容器端口 | 4 个映射 | 0 个（内部网络 `fnmusic-sources:8001`） |
 | 音源镜像 | `fnos_music_ext:latest` 1.96 GB | `fnos_music_ext:musicdl` 827 MB（拉取压缩约 184 MB） |
-| 音源 WebUI | 有（8774，完整镜像） | 默认无；叠加 `docker-compose.webui.yml` 用 `:musicdl-webui`（约 900 MB，只监听 127.0.0.1:8774） |
+| 音源 WebUI | 有（8774，完整镜像） | 默认无；叠加 `docker-compose.webui.yml` 用 `:musicdl-webui`（906 MB，只监听 127.0.0.1:8774） |
 | 多音源切换 | 支持（musicdl/网易/洛雪） | 只有 musicdl |
 
 ```bash

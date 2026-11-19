@@ -8,11 +8,10 @@
 #   访问 http://127.0.0.1:8774   （只绑本机回环，不对外）
 services:
   fnmusic-sources:
-    image: ${FNMUSIC_SOURCES_IMAGE:-ghcr.io/kid941005/fnos_music_ext:musicdl-webui}
+    image: ${FNMUSIC_WEBUI_IMAGE:-ghcr.io/kid941005/fnos_music_ext:musicdl-webui}
     ports:
       - "127.0.0.1:8774:8004"
     volumes:
-      - ./sources-data:/data
       - ./sources-repo:/repo
     environment:
       FNMUSIC_MUSICDL_ENABLED: "true"

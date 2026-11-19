@@ -370,7 +370,7 @@ GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768,lxmusic@http://127.0.0.1:8772"
 | 宿主机端口 | 8766 / 8767 / 8768 / 8770 / 8772 / 8774 | 仅 8766 / 8767 |
 | 音源容器端口 | 4 个映射 | 0 个（内部网络 `fnmusic-sources:8001`） |
 | 音源镜像 | `fnos_music_ext:latest` 1.96 GB | `fnos_music_ext:musicdl` 827 MB（拉取压缩约 184 MB） |
-| 音源 WebUI | 有（8774） | 无；需要时叠加 `docker-compose.webui.yml` |
+| 音源 WebUI | 有（8774，完整镜像） | 默认无；叠加 `docker-compose.webui.yml` 用 `:musicdl-webui`（约 900 MB，只监听 127.0.0.1:8774） |
 | 多音源切换 | 支持（musicdl/网易/洛雪） | 只有 musicdl |
 
 ```bash
@@ -381,16 +381,19 @@ ss -ltnp | grep -E '876[0-9]'      # 只应看到 8766/8767
 
 为什么能零端口：容器不再用 `network_mode: host`。三个容器同处内部 bridge 网络 `fnmusic`，网关用服务名 `http://fnmusic-sources:8001` 访问音源；只有网关把 8766/8767 发布到宿主机。设备、Lucky 反代照旧指向网关这两个端口。
 
-要临时开 WebUI（会切回完整镜像，只监听 127.0.0.1:8774）：
+要 WebUI 管理页、又不想回到 1.96 GB 完整镜像：叠加 `docker-compose.webui.yml`，音源换成 `:musicdl-webui`（musicdl 单源 + WebUI，复用上游 supervisor/entrypoint/healthcheck，体积约为完整镜像一半）：
 
 ```bash
+mkdir -p sources-repo
+printf 'FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\nMUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient\n' > sources-repo/.env
+chown -R 1000:1000 sources-repo sources-data
 docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
-# 改完切回轻量镜像：
-docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml down
-docker compose -f docker-compose.slim.yml up -d
+# 访问 http://127.0.0.1:8774 （只绑本机回环，不对外）
 ```
 
-轻量镜像由本仓库 `.github/workflows/publish-musicdl.yml` 构建（多架构，tag `:musicdl`），源码为 `musicdl-service/`（搜索/探活/坏流防护都在，只去掉 Node、ffmpeg 与另外三个音源）。
+限制：该镜像里没有 Node / 洛雪 / 网易运行时，WebUI 只能管理 musicdl；网易云、洛雪相关按钮会显示不可用。需要三源全开就改用完整镜像 `docker-compose.full.yml`。
+
+轻量镜像由本仓库 `.github/workflows/publish-musicdl.yml` 构建（多架构），产出两个 tag：`:musicdl`（无 WebUI）与 `:musicdl-webui`（带 WebUI）；源码只含 `musicdl-service/`、`webui-service/` 与 WebUI 需要的 `proxy/` 模块，去掉 Node、ffmpeg 与另外三个音源。
 
 ## 心情映射
 

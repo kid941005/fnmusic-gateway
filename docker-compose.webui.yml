@@ -1,14 +1,20 @@
-# 临时叠加：需要网页改音源时用，用完切回轻量镜像。
-# 它会把握源切回完整镜像 :latest（轻量镜像无 WebUI），并只在本机回环开放 8774。
+# 叠加：给轻量音源镜像加回 WebUI（管理页）。
+# 用 :musicdl-webui 镜像（musicdl 单源 + WebUI，约为完整镜像一半体积），
+# 不是完整 5 进程镜像；因此 WebUI 里只能管理 musicdl，网易/洛雪相关按钮不可用。
 #
+#   mkdir -p sources-repo && printf 'FNMUSIC_MUSICDL_ENABLED=true\nFNMUSIC_WEBUI_ENABLED=true\nMUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient\n' > sources-repo/.env
+#   chown -R 1000:1000 sources-repo sources-data
 #   docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
-#   访问 http://127.0.0.1:8774
-#   docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml down
-#   docker compose -f docker-compose.slim.yml up -d
+#   访问 http://127.0.0.1:8774   （只绑本机回环，不对外）
 services:
   fnmusic-sources:
-    image: ${FNMUSIC_FULL_IMAGE:-ghcr.io/kid941005/fnos_music_ext:latest}
+    image: ${FNMUSIC_SOURCES_IMAGE:-ghcr.io/kid941005/fnos_music_ext:musicdl-webui}
     ports:
       - "127.0.0.1:8774:8004"
+    volumes:
+      - ./sources-data:/data
+      - ./sources-repo:/repo
     environment:
+      FNMUSIC_MUSICDL_ENABLED: "true"
       FNMUSIC_WEBUI_ENABLED: "true"
+      MUSICDL_SOURCES: "${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}"

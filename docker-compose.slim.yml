@@ -5,7 +5,7 @@
 #   音源容器不映射任何端口，只在内部网络以 fnmusic-sources:8001 供网关访问
 #
 # 与 docker-compose.full.yml 的区别：
-#   - 音源用轻量镜像 :musicdl（只含 musicdl 单源，约 0.5 GB，无 WebUI/洛雪/网易/Node/ffmpeg）
+#   - 音源用轻量镜像 :musicdl（只含 musicdl 单源，827 MB，无 WebUI/洛雪/网易/Node/ffmpeg）
 #   - 三个容器同处内部 bridge 网络，音源端口不外露
 #   - 没有 WebUI；需要网页改音源时临时叠加 docker-compose.webui.yml
 #

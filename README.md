@@ -363,13 +363,13 @@ GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768,lxmusic@http://127.0.0.1:8772"
 
 ## 只开 2 个端口 + 轻量音源镜像
 
-音源容器原来要映射 8768/8770/8772/8774 四个端口，镜像 1.96 GB。只需要「搜索 / 下载 / 试听 / 在线播放」时用 `docker-compose.slim.yml`：
+音源容器原来要映射 8768/8770/8772/8774 四个端口，镜像 1.96 GB（压缩拉取约 600 MB）。只需要「搜索 / 下载 / 试听 / 在线播放」时用 `docker-compose.slim.yml`：
 
 | | 完整版 `docker-compose.full.yml` | 轻量版 `docker-compose.slim.yml` |
 |---|---|---|
 | 宿主机端口 | 8766 / 8767 / 8768 / 8770 / 8772 / 8774 | 仅 8766 / 8767 |
 | 音源容器端口 | 4 个映射 | 0 个（内部网络 `fnmusic-sources:8001`） |
-| 音源镜像 | `fnos_music_ext:latest` 1.96 GB | `fnos_music_ext:musicdl` 约 0.5 GB |
+| 音源镜像 | `fnos_music_ext:latest` 1.96 GB | `fnos_music_ext:musicdl` 827 MB（拉取压缩约 184 MB） |
 | 音源 WebUI | 有（8774） | 无；需要时叠加 `docker-compose.webui.yml` |
 | 多音源切换 | 支持（musicdl/网易/洛雪） | 只有 musicdl |
 

@@ -395,6 +395,8 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 
 轻量镜像由本仓库 `.github/workflows/publish-musicdl.yml` 构建（多架构），产出两个 tag：`:musicdl`（无 WebUI）与 `:musicdl-webui`（带 WebUI）；源码只含 `musicdl-service/`、`webui-service/` 与 WebUI 需要的 `proxy/` 模块，去掉 Node、ffmpeg 与另外三个音源。
 
+两个轻量镜像已同步上游 3.1.1（musicdl 双引擎 `search_engines.py`、WebUI 官方聚合开关与歌单拖动排序）。3.1.1 起 musicdl 新增实验开关 `FNMUSIC_MUSICDL_OFFICIAL_SEARCH`：本项目两份 compose 默认设为 `false`，继续用带熔断、自适应超时、逐首探活的旧版聚合，避免兜底链路行为变化；想试上游官方聚合，把它设为 `true`（或在 WebUI 里打开对应开关）即可。
+
 ## 心情映射
 
 飞牛 API 没有 genre/mood 维度，只有 `/search/track?q=`。所以心情靠 `data/moods.json`

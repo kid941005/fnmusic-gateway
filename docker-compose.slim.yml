@@ -80,6 +80,8 @@ services:
     environment:
       MUSICDL_SOURCES: "${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}"
       MUSICDL_LIMIT_PER_SOURCE: "${MUSICDL_LIMIT_PER_SOURCE:-10}"
+      # 3.1.1 新增：官方聚合搜索实验开关；默认沿用旧版（带熔断/自适应超时/逐首探活）
+      FNMUSIC_MUSICDL_OFFICIAL_SEARCH: "${FNMUSIC_MUSICDL_OFFICIAL_SEARCH:-false}"
 
 networks:
   fnmusic:

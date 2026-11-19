@@ -39,6 +39,15 @@ FNMUSIC_MOCK=1 python app.py        # 离线模式，不需要 NAS，音频是�
 python app.py                       # 真实模式，需要 .env 里的飞牛地址和账号
 ```
 
+要连在线音源一起跑（**两个镜像、三个容器**），用 [`docker-compose.full.yml`](docker-compose.full.yml)；
+先建目录并放权给容器内的 uid 1000：
+
+```bash
+mkdir -p data sources-data sources-repo
+chown -R 1000:1000 sources-data sources-repo
+docker compose -f docker-compose.full.yml pull && docker compose -f docker-compose.full.yml up -d
+```
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |

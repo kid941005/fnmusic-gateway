@@ -1,0 +1,14 @@
+# 临时叠加：需要网页改音源时用，用完切回轻量镜像。
+# 它会把握源切回完整镜像 :latest（轻量镜像无 WebUI），并只在本机回环开放 8774。
+#
+#   docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
+#   访问 http://127.0.0.1:8774
+#   docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml down
+#   docker compose -f docker-compose.slim.yml up -d
+services:
+  fnmusic-sources:
+    image: ${FNMUSIC_FULL_IMAGE:-ghcr.io/kid941005/fnos_music_ext:latest}
+    ports:
+      - "127.0.0.1:8774:8004"
+    environment:
+      FNMUSIC_WEBUI_ENABLED: "true"

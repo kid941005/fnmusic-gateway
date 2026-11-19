@@ -54,7 +54,8 @@ def build_tools():
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string"}, "mood": {"type": "string"},
                 "playlist": {"type": "string"}, "index": {"type": "integer"},
-                "quality": QUALITY_PROP}, "required": []},
+                "quality": QUALITY_PROP},
+                "anyOf": [{"required": ["query"]}, {"required": ["mood"]}, {"required": ["playlist"]}]},
         },
         {
             "name": "music_favorite",
@@ -73,7 +74,8 @@ def build_tools():
             "description": "把在线歌曲下载/保存到本地曲库（GW_DOWNLOAD_DIR）。guid 或 query 二选一；quality=lossless 时保存原始文件。",
             "inputSchema": {"type": "object", "properties": {
                 "guid": {"type": "string"}, "query": {"type": "string"},
-                "quality": QUALITY_PROP}, "required": []},
+                "quality": QUALITY_PROP},
+                "anyOf": [{"required": ["guid"]}, {"required": ["query"]}]},
         },
         {
             "name": "music_sources",

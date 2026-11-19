@@ -101,7 +101,7 @@ GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合本地 build
 镜像包默认 private：要么在 GitHub 包设置里改成 public，要么在 NAS 上
 `docker login ghcr.io -u kid941005` 用 PAT（read:packages）登录。
 
-> 需要把密码写进文件时，在 compose 同目录手工建 `.env`（键名见下面的环境变量表），
+> 需要把密码写进文件时，把仓库里的 `.env.example` 复制成 `.env` 再填值（`cp .env.example .env && chmod 600 .env`，键名见下面的环境变量表），
 > compose 里已用 `${VAR:-默认值}` 形式读取，不建也能跑（密码留空则首次登录失败）。
 
 ## 多音源部署
@@ -165,7 +165,7 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 | `GW_HOST` | 0.0.0.0 | 监听地址 |
 | `GW_PORT` | 8766 | 管理端口（REST + MCP，**只留内网**） |
 | `GW_PUBLIC_PORT` | 0=关闭（compose 设 8767） | 公网专用端口：**只开放 `/play/` 与 `/lyrics/`**，其余路径 404 |
-| `GW_PUBLIC_BASE` | 空=按请求 Host 推导 | **设备能访问的地址**，如 `http://192.168.50.100:8766` |
+| `GW_PUBLIC_BASE` | 空=按请求 Host 推导 | **设备能访问的地址**，如 `http://192.168.50.100:8767`（公网播放口） |
 | `GW_URL_TTL` | 900 | 直链有效期（秒） |
 | `GW_SIGN_SECRET` | 空=自动生成 `/data/sign.key` | 签名密钥，多副本部署要一致 |
 | `GW_DATA` | `./data` | 状态/密钥/token/歌词落盘目录 |
@@ -240,7 +240,7 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 
 把 `examples/mcp_server_settings.snippet.json` 的内容并进
 `main/xiaozhi-server/data/.mcp_server_settings.json`，重启服务端。
-`mcp_manager.py` 启动时读这个文件，把网关的 9 个 `music_*` 工具挂到所有智能体上。
+`mcp_manager.py` 启动时读这个文件，把网关的 12 个 `music_*` 工具挂到所有智能体上。
 
 ### 方式 B：插件调 REST（推荐，能一次调用完成“查歌 + 播放”）
 
@@ -487,13 +487,13 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 53 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
+python tests/test_gateway.py -v   # 60 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
 `test_gateway.py` 进程内起服务，不需要 NAS 也不需要 Docker；有 ffmpeg 时还会验转码缓存不留残片。
 
-分级验收记录见 [docs/acceptance-2.0.md](docs/acceptance-2.0.md)（P0→P2 逐项自测与结论）。
+分级验收记录见 [docs/acceptance-2.0.md](docs/acceptance-2.0.md)（P0→P2 逐项自测与结论）；2026-11-19 全项目审计与修复记录见 [docs/audit-2026-11-19.md](docs/audit-2026-11-19.md)。
 
 ### 已验证（2026-11-19，mock + 真实 LRCLIB）
 
@@ -510,7 +510,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（53 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（60 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
 
 真实飞牛曲库仍需在 NAS 同网段按上面的「直链自测」验收一次（开发机到 `192.168.50.100:59820` 不通）。
 
@@ -535,7 +535,7 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（53 用例）、bridge_selftest.py
+tests/                    test_gateway.py（60 用例）、bridge_selftest.py
 docker-compose.yml        单网关（host 网络）
 docker-compose.full.yml   网关 + 全量音源 + WebUI
 docker-compose.slim.yml   网关 + 轻量音源（只开 2 个端口）

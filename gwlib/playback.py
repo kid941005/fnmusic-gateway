@@ -66,7 +66,11 @@ class PlaybackService:
         preview = bool(duration and duration < self.preview_min_seconds)
 
         url = self.make_url(base, current["guid"], ttl=ttl, quality=profile["name"])
-        lyric_url = self.lyric_url_for(base, current, ttl=ttl)
+        try:
+            lyric_url = self.lyric_url_for(base, current, ttl=ttl)
+        except Exception as exc:
+            LOG.info("lyric lookup failed for %s: %s", current.get("guid"), exc)
+            lyric_url = ""
         saving = False
         if save and self.tee_save and is_ext_guid(current.get("guid")) and self.library.enabled():
             saving = self.library.save_async(provider, current, profile["name"])

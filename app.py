@@ -47,10 +47,10 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from gwlib.errors import BadRequest, GatewayError, NotFound, UpstreamError, as_payload
-from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, get_profile, normalize_quality
+from gwlib.errors import BadRequest, GatewayError, as_payload
+from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, normalize_quality
 from gwlib.storage import LibraryStore, MediaCache, audio_seconds
-from gwlib.sources import (ExtProvider, FallbackProvider, ext_split, is_ext_guid,
+from gwlib.sources import (FallbackProvider, is_ext_guid,
                            parse_spec as _parse_spec, fallback_services as _fallback_services,
                            source_status)
 from gwlib.playback import PlaybackService
@@ -75,7 +75,7 @@ def _env_int(k, d):
 
 def _env_bool(k, d=False):
     v = os.environ.get(k)
-    if v is None:
+    if v is None or not v.strip():
         return d
     return v.strip().lower() in ("1", "true", "yes", "on")
 
@@ -592,6 +592,7 @@ def provider():
                             search_limit=FALLBACK_SEARCH_LIMIT,
                             download_dir_getter=lambda: DOWNLOAD_DIR,
                             scan_cmd_getter=lambda: LIBRARY_SCAN_CMD,
+                            max_bytes=LIBRARY_MAX_BYTES,
                             parallel=SOURCE_SEARCH_PARALLEL)
                         LOG.info("fallback enabled: %s", ", ".join(fallback_services()))
                 _PROVIDER_ERR = None
@@ -603,6 +604,21 @@ def provider():
 
 def provider_error():
     return _PROVIDER_ERR
+
+
+class _LazyProvider:
+    """按需构造 provider，避免 music_sources/music_storage/music_status 依赖飞牛可用性。"""
+
+    def __init__(self):
+        self._p = None
+
+    def _get(self):
+        if self._p is None:
+            self._p = provider()
+        return self._p
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
 
 
 # ---------------------------------------------------------------- 选曲
@@ -747,6 +763,8 @@ def _as_lrc(text):
 
 def lyrics_for(track):
     """取（必要时抓取并缓存）一首歌的 LRC 文件路径；空文件表示查不到。"""
+    if not LYRICS_ENABLED:
+        return ""
     guid = str(track.get("guid") or "")
     if not guid:
         return ""
@@ -760,7 +778,8 @@ def lyrics_for(track):
     text = ""
     if is_ext_guid(guid):
         try:
-            text = provider().lyrics_text(guid) if hasattr(provider(), "lyrics_text") else ""
+            p = provider()
+            text = p.lyrics_text(guid) if hasattr(p, "lyrics_text") else ""
         except Exception:
             text = ""
         text = _as_lrc(text)
@@ -819,7 +838,7 @@ TOOLS = build_tools()
 
 def call_tool(name, args, base):
     args = args or {}
-    p = provider()
+    p = _LazyProvider()
     limit = clamp_limit(args.get("limit"), 10)
     quality = args.get("quality")
 
@@ -942,8 +961,8 @@ def call_tool(name, args, base):
         rows = source_status(FALLBACK_URLS)
         lines = ["在线音源 %d 个：" % len(rows)]
         for item in rows:
-            lines.append("%s（%s）%s" % (item.get("service"), item.get("url"),
-                                        " 正常" if item.get("ok") else " 不可用"))
+            lines.append("%s（%s）%s" % (item.get("source"), item.get("url"),
+                                        " 正常" if item.get("healthy") else " 不可用"))
         return "\n".join(lines)
 
     if name == "music_storage":
@@ -1099,8 +1118,6 @@ class Handler(BaseHTTPRequestHandler):
         except GatewayError as e:
             body, code = as_payload(e)
             self._json(body, code)
-        except BadRequest as e:
-            self._json({"error": str(e)}, 400)
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -1170,8 +1187,6 @@ class Handler(BaseHTTPRequestHandler):
         except GatewayError as e:
             body, code = as_payload(e)
             self._json(body, code)
-        except BadRequest as e:
-            self._json({"error": str(e)}, 400)
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -1221,7 +1236,7 @@ class Handler(BaseHTTPRequestHandler):
         mood = (qs.get("mood") or [""])[0]
         playlist = (qs.get("playlist") or [""])[0]
         index = self._qs_int(qs, "index", 1)
-        quality = (qs.get("quality") or qs.get("q_quality") or [""])[0] or None
+        quality = (qs.get("quality") or [""])[0] or None
         p = provider()
         rows, label = pick_tracks(p, query, mood, playlist, 20)
         if index < 1 or index > len(rows):

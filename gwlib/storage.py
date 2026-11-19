@@ -1,17 +1,29 @@
 # -*- coding: utf-8 -*-
 """存储层：质量感知的 MP3 转码缓存 + 本地曲库保存（边播边存 / 收藏下载）。"""
 import hashlib
+import inspect
 import logging
 import os
 import re
 import subprocess
 import threading
-import time
 
 from .errors import BadRequest, StorageError
 from .quality import get_profile
 
 LOG = logging.getLogger("fnmusic-gw.storage")
+
+
+def _call_stream(provider, guid, quality=None):
+    """按 provider.stream 是否接受 quality 关键字调用，避免用 TypeError 探测签名。"""
+    fn = provider.stream
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = None
+    accepts_quality = params is None or "quality" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return fn(guid, quality=quality) if accepts_quality else fn(guid)
 
 
 def audio_seconds(path):
@@ -71,10 +83,7 @@ class MediaCache:
             return lock
 
     def _stream(self, provider, guid, quality):
-        try:
-            return provider.stream(guid, quality=quality)
-        except TypeError:
-            return provider.stream(guid)
+        return _call_stream(provider, guid, quality)
 
     def ensure(self, guid, provider, timeout=180, quality=None):
         profile = get_profile(quality)
@@ -128,6 +137,8 @@ class MediaCache:
                 except OSError:
                     continue
                 items.append((st.st_atime, st.st_size, fp))
+            if self.max <= 0:
+                return
             total = sum(x[1] for x in items)
             if total <= self.max:
                 return
@@ -199,17 +210,21 @@ class LibraryStore:
                else ".wav" if "wav" in low else ".bin")
         fp = self.target_path(track, ext)
         tmp = fp + ".part"
-        with open(tmp, "wb") as fh:
-            fh.write(raw)
-        os.replace(tmp, fp)
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(raw)
+            os.replace(tmp, fp)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
         self.run_scan()
         return fp, len(raw)
 
     def save_from_provider(self, provider, track, quality=None):
-        try:
-            ctype, raw = provider.stream(track["guid"], quality=quality)
-        except TypeError:
-            ctype, raw = provider.stream(track["guid"])
+        ctype, raw = _call_stream(provider, track["guid"], quality)
         return self.save_bytes(track, ctype, raw)
 
     def save_async(self, provider, track, quality=None):
@@ -232,6 +247,9 @@ class LibraryStore:
             self.save_from_provider(provider, track, quality)
         except Exception as exc:
             self.log.info("library save %s failed: %s", track.get("guid"), exc)
+        finally:
+            with self._lock:
+                self._jobs.pop(track.get("guid"), None)
 
     def run_scan(self):
         cmd = str(self._scan_getter() or "").strip()
@@ -249,6 +267,8 @@ class LibraryStore:
         if directory and os.path.isdir(directory):
             try:
                 for name in os.listdir(directory):
+                    if os.path.splitext(name)[1].lower() not in (".mp3", ".flac", ".wav", ".m4a", ".ogg", ".ape"):
+                        continue
                     fp = os.path.join(directory, name)
                     if os.path.isfile(fp):
                         files += 1

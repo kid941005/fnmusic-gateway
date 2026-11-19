@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 未发布（2.0.0 之后的审计修复，2026-11-19）
+
+### 修复：全项目审计发现的功能、安全与健壮性问题
+- 管理类 MCP 工具不再强依赖飞牛可用：`call_tool` 使用惰性 provider，`music_sources` / `music_storage` / `music_status` 在 NAS 掉线时仍可用。
+- `music_sources` 改用 `source_status` 实际返回的 `source` / `healthy` 字段，修复永远显示“不可用”的字段错配。
+- `FallbackProvider` 内部的 `LibraryStore` 现在继承 `GW_LIBRARY_MAX_BYTES`，修复收藏下载绕过本地曲库容量上限。
+- `_env_bool` 将空字符串视为未设置（沿用默认值），避免 `GW_TEE_SAVE=""` 意外关闭边播边存。
+- `lyrics_for` 在入口统一受 `GW_LYRICS` 控制，关闭歌词后不再请求在线音源歌词。
+- `ExtProvider.health` 使用真值判断，修复 `ok=0` 被误报为健康。
+- `MediaCache.evict` 在 `max<=0`（不限容量）时直接返回，避免误删全部缓存。
+- `PlaybackService` 歌词直链生成失败时降级为空歌词继续播放，不再让整次播放失败。
+- `LibraryStore` / `MediaCache` 改用 `inspect.signature` 判断 `provider.stream` 是否接受 `quality`，避免用 `TypeError` 探测签名误吞真实异常。
+- `save_bytes` 写入失败时清理 `.part` 残留；`_jobs` 完成后移除；容量统计只计音频扩展名。
+- `parse_spec` 先识别 `http(s)://`，修复 URL 含 `@` 时被误当 `type@url` 拆分。
+- `fnmusic_client` 的协议常量支持环境变量覆盖；TLS 默认校验证书，仅 `FNMUSIC_INSECURE_TLS=1` 时关闭。
+- `music_play` / `music_download` 的 JSON Schema 增加 `anyOf` 必填约束；清理未使用 import、死 `except BadRequest` 与无文档 `q_quality` 别名。
+- 文档同步：`music_*` 工具数 9→12、新增 `.env.example`、compose 的 `GW_PUBLIC_BASE` 默认改 8767（公网播放口）。
+- 测试 53 → **60 个用例**（新增审计回归：空环境变量、source/healthy、NAS 掉线下的 status/storage、URL 含 @、缓存 0 不限、曲库上限、FallbackProvider 上限传递）。
+
 ## 2.0.0 (2026-11-19)
 
 ### 重构：分层解耦 + 音质 / 下载 / 边播边存

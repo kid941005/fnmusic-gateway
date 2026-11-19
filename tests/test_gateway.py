@@ -25,6 +25,8 @@ os.environ["GW_LYRICS"] = "0"  # 单测不联网查歌词
 os.environ.pop("GW_PUBLIC_BASE", None)
 
 import app  # noqa: E402
+import gwlib.sources as gw_sources  # noqa: E402
+import gwlib.storage as gw_storage  # noqa: E402
 
 
 class Base(unittest.TestCase):
@@ -401,7 +403,7 @@ class TestFallback(unittest.TestCase):
     def test_ext_guid_helpers(self):
         self.assertTrue(app.is_ext_guid("ext:musicdl:123"))
         self.assertFalse(app.is_ext_guid("mock-1"))
-        self.assertEqual(app.ext_split("ext:lxmusic:ab:cd"), ("lxmusic", "ab:cd"))
+        self.assertEqual(gw_sources.ext_split("ext:lxmusic:ab:cd"), ("lxmusic", "ab:cd"))
 
     def test_spec_svc(self):
         self.assertEqual(app._spec_svc("musicdl@http://x:1"), "musicdl")
@@ -512,14 +514,14 @@ class TestExtProviderHttp(unittest.TestCase):
         cls.srv.server_close()
 
     def test_search_norm_and_guid(self):
-        e = app.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
+        e = gw_sources.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
         rows = e.search("晴天", 5)
         self.assertEqual(rows[0]["guid"], "ext:musicdl:s1")
         self.assertEqual(rows[0]["title"], "晴天")
         self.assertEqual(rows[0]["source"], "musicdl")
 
     def test_stream_and_lyrics(self):
-        e = app.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
+        e = gw_sources.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
         ctype, body = e.stream("ext:musicdl:s1")
         self.assertIn("mpeg", ctype)
         self.assertGreater(len(body), 100)
@@ -681,6 +683,72 @@ class TestV2Api(Base):
             self.assertIn("本地曲库", st)
         finally:
             app.DOWNLOAD_DIR = old
+
+
+class TestAuditFixes(unittest.TestCase):
+    """本轮审计修复的回归用例。"""
+
+    def test_env_bool_blank_uses_default(self):
+        old = os.environ.get("GW_TEE_SAVE")
+        os.environ["GW_TEE_SAVE"] = ""
+        try:
+            self.assertTrue(app._env_bool("GW_TEE_SAVE", True))
+            self.assertFalse(app._env_bool("GW_TEE_SAVE", False))
+        finally:
+            if old is None:
+                os.environ.pop("GW_TEE_SAVE", None)
+            else:
+                os.environ["GW_TEE_SAVE"] = old
+
+    def test_music_sources_uses_source_healthy_fields(self):
+        old_status, old_urls = app.source_status, app.FALLBACK_URLS
+        app.source_status = lambda urls: [{"source": "musicdl", "url": "http://x", "healthy": True}]
+        app.FALLBACK_URLS = ["musicdl@http://x"]
+        try:
+            out = app.call_tool("music_sources", {}, "http://h")
+            self.assertIn("musicdl（http://x） 正常", out)
+        finally:
+            app.source_status, app.FALLBACK_URLS = old_status, old_urls
+
+    def test_status_and_storage_do_not_need_provider(self):
+        old = app.provider
+        app.provider = lambda: (_ for _ in ()).throw(RuntimeError("nas down"))
+        try:
+            self.assertIsInstance(app.call_tool("music_status", {}, "http://h"), str)
+            self.assertIn("播放缓存", app.call_tool("music_storage", {}, "http://h"))
+            old_urls = app.FALLBACK_URLS
+            app.FALLBACK_URLS = []
+            try:
+                out = app.call_tool("music_sources", {}, "http://h")
+                self.assertIn("没有配置在线音源", out)
+            finally:
+                app.FALLBACK_URLS = old_urls
+        finally:
+            app.provider = old
+
+    def test_parse_spec_url_with_at(self):
+        svc, url = gw_sources.parse_spec("http://user@host:8772")
+        self.assertEqual(svc, "lxmusic")
+        self.assertEqual(url, "http://user@host:8772")
+
+    def test_media_cache_zero_means_unlimited(self):
+        d = tempfile.mkdtemp(prefix="gw-cache-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 0)
+        fp = os.path.join(d, "a.mp3")
+        with open(fp, "wb") as fh:
+            fh.write(b"x" * 2048)
+        cache.evict()
+        self.assertTrue(os.path.exists(fp))
+
+    def test_library_max_bytes_enforced(self):
+        d = tempfile.mkdtemp(prefix="gw-lib-", dir=DATA)
+        lib = gw_storage.LibraryStore(lambda: d, lambda: "", max_bytes=8)
+        with self.assertRaises(gw_storage.StorageError):
+            lib.save_bytes({"guid": "g", "title": "t", "artist": "a"}, "audio/mpeg", b"0123456789")
+
+    def test_fallback_library_gets_max_bytes(self):
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"], max_bytes=123)
+        self.assertEqual(fp.library.max_bytes, 123)
 
 
 if __name__ == "__main__":

@@ -34,13 +34,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-API_SECRET = "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh"
-API_KEY = "6D5602D4-A342-4799-A0F0-BB795E7167D0"
+# 飞牛音乐前端协议使用的固定常量（不是用户密码），允许部署方覆盖。
+API_SECRET = os.environ.get("FNMUSIC_API_SECRET", "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh")
+API_KEY = os.environ.get("FNMUSIC_API_KEY", "6D5602D4-A342-4799-A0F0-BB795E7167D0")
 SUCCESS_CODES = (0, 200)
 API_PREFIX = "/music/api/v1"
-DEFAULT_BASE = "http://192.168.50.100:59820"
-DEFAULT_USERNAME = "KID"
-DEFAULT_DEVICE_ID = "7bcec31d00cb7d9ba2e1ad5279ff5812"
+DEFAULT_BASE = os.environ.get("FNMUSIC_DEFAULT_BASE", "http://192.168.50.100:59820")
+DEFAULT_USERNAME = os.environ.get("FNMUSIC_DEFAULT_USERNAME", "KID")
+DEFAULT_DEVICE_ID = os.environ.get("FNMUSIC_DEFAULT_DEVICE_ID", "7bcec31d00cb7d9ba2e1ad5279ff5812")
 
 
 class FnMusicError(Exception):
@@ -94,8 +95,10 @@ class FnMusicClient:
         self.timeout = timeout
         self._lock = threading.Lock()
         self._ssl = ssl.create_default_context()
-        self._ssl.check_hostname = False
-        self._ssl.verify_mode = ssl.CERT_NONE
+        # 默认校验证书；内网自签 HTTPS 才显式设置 FNMUSIC_INSECURE_TLS=1。
+        if os.environ.get("FNMUSIC_INSECURE_TLS", "").strip().lower() in ("1", "true", "yes", "on"):
+            self._ssl.check_hostname = False
+            self._ssl.verify_mode = ssl.CERT_NONE
         if not self.token and token_file:
             self._load_token()
 

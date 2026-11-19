@@ -36,7 +36,7 @@ services:
     environment:
       GW_PORT: "8766"
       GW_PUBLIC_PORT: "8767"
-      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8766}"
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8767}"
       GW_URL_TTL: "900"
       GW_CACHE_MAX_BYTES: "8589934592"
       GW_MP3_BITRATE: "128k"

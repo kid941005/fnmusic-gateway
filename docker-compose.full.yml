@@ -34,7 +34,7 @@ services:
     environment:
       GW_PORT: "8766"
       GW_PUBLIC_PORT: "${GW_PUBLIC_PORT:-8767}"          # 公网只反代这个端口（只放 /play/ 与 /lyrics/）
-      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8766}"
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-http://192.168.50.100:8767}"
       GW_URL_TTL: "900"
       GW_CACHE_MAX_BYTES: "8589934592"
       GW_MP3_BITRATE: "128k"
@@ -61,7 +61,7 @@ services:
       - ./data:/data
 
   # ----
-  # 2) 桥接器：把 9 个音乐工具挂到小智「MCP 接入点」（wss）。同一镜像，换 command。
+  # 2) 桥接器：把 12 个音乐工具挂到小智「MCP 接入点」（wss）。同一镜像，换 command。
   #    不用接入点（走全局 MCP 配置或插件直连 REST）可以整段删掉。
   # ----
   fnmusic-bridge:

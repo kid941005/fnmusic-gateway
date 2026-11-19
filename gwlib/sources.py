@@ -10,15 +10,12 @@ import json
 import logging
 import os
 import re
-import threading
-import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .errors import BadRequest
 from .quality import get_profile
-from .storage import LibraryStore
+from .storage import LibraryStore, _call_stream
 
 LOG = logging.getLogger("fnmusic-gw.sources")
 VERSION = "2.0.0"
@@ -95,9 +92,13 @@ def guess_service(base):
 
 
 def parse_spec(spec):
-    svc, _, url = str(spec or "").partition("@")
-    if not url:
-        svc, url = "", spec
+    text = str(spec or "").strip()
+    # URL 本身可能含 @（如 http://user@host:8001），先按 URL 处理
+    if re.match(r"^https?://", text):
+        return guess_service(text) or "musicdl", text
+    svc, sep, url = text.partition("@")
+    if not sep or not url:
+        svc, url = "", text
     svc = svc.strip().lower()
     svc = SERVICE_ALIASES.get(svc, svc) if svc else (guess_service(url) or "musicdl")
     return svc, str(url or "").strip()
@@ -107,7 +108,7 @@ def fallback_services(urls):
     return [parse_spec(spec)[0] for spec in urls]
 
 
-def _http_json(url, timeout, timeout_error=None):
+def _http_json(url, timeout):
     req = urllib.request.Request(url, headers={
         "User-Agent": "fnmusic-gateway/" + VERSION,
         "Accept": "application/json",
@@ -134,7 +135,7 @@ class ExtProvider:
     def health(self):
         try:
             data = _http_json(self.base + "/healthz", min(3, self.timeout))
-            return data.get("ok", True) is not False if isinstance(data, dict) else bool(data)
+            return bool(data.get("ok", True)) if isinstance(data, dict) else bool(data)
         except Exception:
             return False
 
@@ -233,7 +234,8 @@ class FallbackProvider:
     """本地曲库优先；本地不足时并行问所有在线音源并按标题/歌手去重补齐。"""
 
     def __init__(self, base, urls, timeout=8, search_limit=10,
-                 download_dir_getter=None, scan_cmd_getter=None, parallel=True):
+                 download_dir_getter=None, scan_cmd_getter=None, parallel=True,
+                 max_bytes=0):
         self.base = base
         self.exts = [ExtProvider(url, svc, timeout=timeout) for svc, url in
                      (parse_spec(spec) for spec in urls)]
@@ -243,6 +245,7 @@ class FallbackProvider:
             download_dir_getter or (lambda: os.environ.get("GW_DOWNLOAD_DIR", "")),
             scan_cmd_getter or (lambda: os.environ.get("GW_LIBRARY_SCAN_CMD", "")),
             LOG,
+            max_bytes=max_bytes,
         )
 
     def list_tracks(self, limit=20):
@@ -319,14 +322,8 @@ class FallbackProvider:
             ext = self._ext(guid)
             if not ext:
                 raise RuntimeError("在线音源未配置")
-            try:
-                return ext.stream(guid, quality=quality)
-            except TypeError:
-                return ext.stream(guid)
-        try:
-            return self.base.stream(guid, quality=quality)
-        except TypeError:
-            return self.base.stream(guid)
+            return _call_stream(ext, guid, quality)
+        return _call_stream(self.base, guid, quality)
 
     def lyrics_text(self, guid):
         if not is_ext_guid(guid):

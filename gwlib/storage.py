@@ -1,0 +1,259 @@
+# -*- coding: utf-8 -*-
+"""存储层：质量感知的 MP3 转码缓存 + 本地曲库保存（边播边存 / 收藏下载）。"""
+import hashlib
+import logging
+import os
+import re
+import subprocess
+import threading
+import time
+
+from .errors import BadRequest, StorageError
+from .quality import get_profile
+
+LOG = logging.getLogger("fnmusic-gw.storage")
+
+
+def audio_seconds(path):
+    """ffprobe 读时长（秒，float）；失败返回 None。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15).stdout
+        return float(out.decode("utf-8", "replace").strip())
+    except Exception:
+        return None
+
+
+class MediaCache:
+    """按 guid + 音质档位缓存 MP3；大小按 atime LRU 淘汰。"""
+
+    def __init__(self, directory, max_bytes, logger=None, transcode_slots=None,
+                 bitrate=None, sample_rate=None, channels=None):
+        self.dir = directory
+        self.max = max_bytes
+        self.log = logger or LOG
+        self._legacy_bitrate = bitrate
+        self._legacy_sample_rate = sample_rate
+        self._legacy_channels = channels
+        os.makedirs(directory, exist_ok=True)
+        self._locks = {}
+        self._guard = threading.Lock()
+        self._slots = transcode_slots or threading.BoundedSemaphore(2)
+        self._cleanup_stale()
+
+    def _cleanup_stale(self):
+        try:
+            for name in os.listdir(self.dir):
+                if name.endswith(".part") or ".src" in name:
+                    try:
+                        os.remove(os.path.join(self.dir, name))
+                    except OSError:
+                        pass
+        except Exception as exc:
+            self.log.warning("cache cleanup failed: %s", exc)
+
+    def key(self, guid, quality=None):
+        profile = get_profile(quality)
+        raw = "%s|%s" % (guid, profile["name"])
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def path(self, guid, quality=None):
+        return os.path.join(self.dir, self.key(guid, quality) + ".mp3")
+
+    def _lock(self, key):
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+            return lock
+
+    def _stream(self, provider, guid, quality):
+        try:
+            return provider.stream(guid, quality=quality)
+        except TypeError:
+            return provider.stream(guid)
+
+    def ensure(self, guid, provider, timeout=180, quality=None):
+        profile = get_profile(quality)
+        dst = self.path(guid, profile["name"])
+        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            return dst
+        with self._lock(os.path.basename(dst)):
+            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+                return dst
+            ctype, raw = self._stream(provider, guid, profile["name"])
+            if not raw:
+                raise StorageError("empty audio for %s" % guid)
+            low = (ctype or "").lower()
+            ext = ".flac" if "flac" in low else (".mp3" if "mpeg" in low else ".wav" if "wav" in low else ".bin")
+            src = dst + ".src" + ext
+            tmp = dst + ".part"
+            try:
+                with open(src, "wb") as fh:
+                    fh.write(raw)
+                bitrate = profile["bitrate"] or self._legacy_bitrate or "128k"
+                sample_rate = profile["sample_rate"] or self._legacy_sample_rate or 44100
+                channels = profile["channels"] or self._legacy_channels or 2
+                cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", src,
+                       "-vn", "-map_metadata", "-1",
+                       "-ac", str(channels), "-ar", str(sample_rate),
+                       "-c:a", "libmp3lame", "-b:a", bitrate, "-f", "mp3", tmp]
+                with self._slots:
+                    subprocess.run(cmd, check=True, timeout=timeout,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
+                    raise StorageError("ffmpeg 转码失败: %s" % guid)
+                os.replace(tmp, dst)
+            finally:
+                for leftover in (src, tmp):
+                    try:
+                        os.remove(leftover)
+                    except Exception:
+                        pass
+            self.evict()
+            return dst
+
+    def evict(self):
+        try:
+            items = []
+            for name in os.listdir(self.dir):
+                if not name.endswith(".mp3"):
+                    continue
+                fp = os.path.join(self.dir, name)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                items.append((st.st_atime, st.st_size, fp))
+            total = sum(x[1] for x in items)
+            if total <= self.max:
+                return
+            items.sort()
+            for _, size, fp in items:
+                if total <= self.max * 0.9:
+                    break
+                try:
+                    os.remove(fp)
+                    total -= size
+                except Exception:
+                    pass
+            self.log.info("cache evicted to %.1f MiB", total / 1048576.0)
+        except Exception as exc:
+            self.log.warning("cache evict failed: %s", exc)
+
+    def stats(self):
+        files = 0
+        total = 0
+        try:
+            for name in os.listdir(self.dir):
+                if not name.endswith(".mp3"):
+                    continue
+                try:
+                    size = os.path.getsize(os.path.join(self.dir, name))
+                except OSError:
+                    continue
+                files += 1
+                total += size
+        except Exception:
+            pass
+        return {"files": files, "bytes": total, "limit_bytes": self.max,
+                "used_percent": round((total / self.max) * 100, 1) if self.max else 0}
+
+
+class LibraryStore:
+    """把在线音源原始文件落到飞牛曲库目录。保存原始文件而不是转码 MP3。"""
+
+    def __init__(self, directory_getter, scan_cmd_getter=None, logger=None, max_bytes=0):
+        self._dir_getter = directory_getter or (lambda: "")
+        self._scan_getter = scan_cmd_getter or (lambda: "")
+        self.max_bytes = max(0, int(max_bytes or 0))
+        self.log = logger or LOG
+        self._jobs = {}
+        self._lock = threading.Lock()
+
+    def enabled(self):
+        return bool(str(self._dir_getter() or "").strip())
+
+    def target_path(self, track, ext):
+        directory = str(self._dir_getter() or "").strip()
+        if not directory:
+            raise BadRequest("保存到本地曲库需要先配置 GW_DOWNLOAD_DIR")
+        name = "%s - %s" % (track.get("title") or track.get("guid") or "unknown",
+                            track.get("artist") or "未知")
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()[:150] or "unknown"
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, name + ext)
+
+    def save_bytes(self, track, ctype, raw):
+        if not raw:
+            raise BadRequest("在线音源返回空音频")
+        if self.max_bytes:
+            current = self.stats().get("bytes", 0)
+            if current + len(raw) > self.max_bytes:
+                raise StorageError("本地曲库已达容量上限（%.0f MB）" % (self.max_bytes / 1048576.0))
+        low = (ctype or "").lower()
+        ext = ".flac" if "flac" in low else (".mp3" if ("mpeg" in low or "mp3" in low)
+               else ".wav" if "wav" in low else ".bin")
+        fp = self.target_path(track, ext)
+        tmp = fp + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, fp)
+        self.run_scan()
+        return fp, len(raw)
+
+    def save_from_provider(self, provider, track, quality=None):
+        try:
+            ctype, raw = provider.stream(track["guid"], quality=quality)
+        except TypeError:
+            ctype, raw = provider.stream(track["guid"])
+        return self.save_bytes(track, ctype, raw)
+
+    def save_async(self, provider, track, quality=None):
+        if not self.enabled():
+            return False
+        guid = str(track.get("guid") or "")
+        if not guid:
+            return False
+        with self._lock:
+            if guid in self._jobs and self._jobs[guid].is_alive():
+                return False
+            job = threading.Thread(target=self._run_job, args=(provider, track, quality),
+                                   name="library-save", daemon=True)
+            self._jobs[guid] = job
+            job.start()
+            return True
+
+    def _run_job(self, provider, track, quality):
+        try:
+            self.save_from_provider(provider, track, quality)
+        except Exception as exc:
+            self.log.info("library save %s failed: %s", track.get("guid"), exc)
+
+    def run_scan(self):
+        cmd = str(self._scan_getter() or "").strip()
+        if not cmd:
+            return
+        try:
+            subprocess.run(cmd, shell=True, check=False, timeout=120)
+        except Exception as exc:
+            self.log.warning("library scan failed: %s", exc)
+
+    def stats(self):
+        directory = str(self._dir_getter() or "").strip()
+        files = 0
+        total = 0
+        if directory and os.path.isdir(directory):
+            try:
+                for name in os.listdir(directory):
+                    fp = os.path.join(directory, name)
+                    if os.path.isfile(fp):
+                        files += 1
+                        total += os.path.getsize(fp)
+            except Exception:
+                pass
+        return {"dir": directory, "enabled": bool(directory), "files": files, "bytes": total,
+                "limit_bytes": self.max_bytes}

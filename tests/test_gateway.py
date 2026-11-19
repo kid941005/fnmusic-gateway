@@ -246,7 +246,7 @@ class TestHttp(Base):
         self.assertTrue(r.getheader("Mcp-Session-Id"))
         self.assertEqual(d["result"]["serverInfo"]["name"], "fnmusic-gateway")
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(d["result"]["tools"]), 9)
+        self.assertEqual(len(d["result"]["tools"]), 12)
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                          "params": {"name": "music_status", "arguments": {}}})
         self.assertIn("content", d["result"])
@@ -437,7 +437,8 @@ class TestFallback(unittest.TestCase):
     @unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg")
     def test_ext_cache_and_download(self):
         _ct, wav = app.MockProvider().stream("x")
-        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"],
+                                   download_dir_getter=lambda: app.DOWNLOAD_DIR)
         fp.exts = [_FakeExt(wav=wav)]
         path = app.CACHE.ensure("ext:musicdl:e9", fp)
         self.assertGreater(os.path.getsize(path), 1024)
@@ -451,7 +452,8 @@ class TestFallback(unittest.TestCase):
             app.DOWNLOAD_DIR = old
 
     def test_download_requires_dir(self):
-        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"],
+                                   download_dir_getter=lambda: app.DOWNLOAD_DIR)
         fp.exts = [_FakeExt(wav=b"x")]
         old = app.DOWNLOAD_DIR
         app.DOWNLOAD_DIR = ""
@@ -554,5 +556,72 @@ class TestSearchApi(Base):
         self.assertEqual(body["guid"], "mock-1")
 
 
+class TestV2Quality(unittest.TestCase):
+    def test_normalize(self):
+        self.assertEqual(app.normalize_quality(""), "standard")
+        self.assertEqual(app.normalize_quality("128"), "standard")
+        self.assertEqual(app.normalize_quality("192k"), "high")
+        self.assertEqual(app.normalize_quality("320"), "exhigh")
+        self.assertEqual(app.normalize_quality("flac"), "lossless")
+        self.assertEqual(app.normalize_quality("无损"), "lossless")
+        self.assertEqual(len(app.describe_quality()), 4)
+
+    def test_make_url_quality(self):
+        url = app.make_url("http://h:1", "g", 60, quality="high")
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        self.assertEqual(qs["q"][0], "high")
+        self.assertEqual(app.make_url("http://h:1", "g", 60), app.make_url("http://h:1", "g", 60, quality="standard"))
+
+    def test_tool_catalog(self):
+        names = [t["name"] for t in app.TOOLS]
+        self.assertEqual(len(names), 12)
+        for n in ("music_download", "music_sources", "music_storage"):
+            self.assertIn(n, names)
+        play = [t for t in app.TOOLS if t["name"] == "music_play"][0]
+        self.assertIn("quality", play["inputSchema"]["properties"])
+
+    def test_cache_key_separates_quality(self):
+        self.assertNotEqual(app.CACHE.key("g", "standard"), app.CACHE.key("g", "high"))
+        self.assertEqual(app.CACHE.key("g", "flac"), app.CACHE.key("g", "lossless"))
+
+
+class TestV2Api(Base):
+    def test_quality_and_storage_endpoints(self):
+        r, d = self.req("GET", "/api/quality")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(d["default"], "standard")
+        self.assertEqual(len(d["profiles"]), 4)
+        r, d = self.req("GET", "/api/storage")
+        self.assertEqual(r.status, 200)
+        self.assertIn("cache", d)
+        self.assertIn("library", d)
+        r, d = self.req("GET", "/api/sources")
+        self.assertEqual(r.status, 200)
+        self.assertIn("sources", d)
+
+    def test_api_play_quality(self):
+        r, d = self.req("GET", "/api/play?query=%E6%99%B4%E5%A4%A9&quality=high")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(d["quality"], "high")
+        self.assertEqual(d["bitrate"], "192k")
+        self.assertIn("q=high", d["url"])
+        self.assertIn("title", d["device_args"])
+        self.assertIn("lyric_url", d["device_args"])
+
+    def test_api_download_and_tool(self):
+        old = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = os.path.join(DATA, "dl-v2")
+        try:
+            r, d = self.req("POST", "/api/download", {"query": "晴天", "quality": "standard"})
+            self.assertEqual(r.status, 200, d)
+            self.assertTrue(os.path.exists(d["path"]))
+            out = app.call_tool("music_download", {"query": "晴天"}, "http://h")
+            self.assertIn("已保存到本地曲库", out)
+            st = app.call_tool("music_storage", {}, "http://h")
+            self.assertIn("本地曲库", st)
+        finally:
+            app.DOWNLOAD_DIR = old
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

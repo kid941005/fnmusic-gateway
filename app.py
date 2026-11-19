@@ -47,7 +47,16 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.0"
+from gwlib.errors import BadRequest, GatewayError, NotFound, UpstreamError, as_payload
+from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, get_profile, normalize_quality
+from gwlib.storage import LibraryStore, MediaCache, audio_seconds
+from gwlib.sources import (ExtProvider, FallbackProvider, ext_split, is_ext_guid,
+                           parse_spec as _parse_spec, fallback_services as _fallback_services,
+                           source_status)
+from gwlib.playback import PlaybackService
+from gwlib.mcp_tools import build_tools
+
+VERSION = "2.0.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -114,6 +123,12 @@ DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
 LIBRARY_SCAN_CMD = _env("GW_LIBRARY_SCAN_CMD", "")
 PREVIEW_MIN_SECONDS = max(1, _env_int("GW_PREVIEW_MIN_SECONDS", 35))
 
+# 音质与存储策略
+QUALITY_DEFAULT = normalize_quality(_env("GW_QUALITY_DEFAULT", DEFAULT_QUALITY))
+TEE_SAVE = _env_bool("GW_TEE_SAVE", True)
+SOURCE_SEARCH_PARALLEL = _env_bool("GW_SOURCES_SEARCH_PARALLEL", True)
+LIBRARY_MAX_BYTES = _env_int("GW_LIBRARY_MAX_BYTES", 0)
+
 # 搜索：别名纠错 + 相关度打分（中文 ASR 常把歌名/歌手听成同音字）
 SMART_SEARCH = _env_bool("GW_SMART_SEARCH", True)
 ALIASES_FILE = _env("GW_ALIASES_FILE", os.path.join(DATA_DIR, "music_aliases.json"))
@@ -129,10 +144,6 @@ LOG = logging.getLogger("fnmusic-gw")
 
 # 同时最多几个 ffmpeg：防止多台设备同时点播把 NAS 的 CPU 打满
 _TRANSCODE_SLOTS = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
-
-
-class BadRequest(Exception):
-    """调用方参数错误：HTTP 映射为 400，MCP 侧原样回文本。"""
 
 
 # ---------------------------------------------------------------- 签名
@@ -446,105 +457,9 @@ def save_state(d):
 
 
 # ---------------------------------------------------------------- 转码缓存
-class Mp3Cache:
-    def __init__(self, d, max_bytes):
-        self.dir = d
-        self.max = max_bytes
-        os.makedirs(d, exist_ok=True)
-        self._locks = {}
-        self._guard = threading.Lock()
-        self._cleanup_stale()
-
-    def _cleanup_stale(self):
-        """清掉上次进程被 kill 时留下的 .part / .src 半成品。"""
-        try:
-            for n in os.listdir(self.dir):
-                if n.endswith(".part") or ".src" in n:
-                    try:
-                        os.remove(os.path.join(self.dir, n))
-                    except OSError:
-                        pass
-        except Exception as e:
-            LOG.warning("cache cleanup failed: %s", e)
-
-    def path(self, guid):
-        return os.path.join(self.dir, hashlib.sha1(guid.encode("utf-8")).hexdigest() + ".mp3")
-
-    def _lock(self, guid):
-        with self._guard:
-            l = self._locks.get(guid)
-            if l is None:
-                l = threading.Lock()
-                self._locks[guid] = l
-            return l
-
-    def ensure(self, guid, prov, timeout=180):
-        dst = self.path(guid)
-        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
-            return dst
-        with self._lock(guid):
-            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
-                return dst
-            ctype, raw = prov.stream(guid)
-            if not raw:
-                raise RuntimeError("empty audio for %s" % guid)
-            ctype = (ctype or "").lower()
-            ext = ".flac" if "flac" in ctype else (".mp3" if "mpeg" in ctype else ".wav" if "wav" in ctype else ".bin")
-            src = dst + ".src" + ext
-            tmp = dst + ".part"     # 不以 .mp3 结尾：不会被当成缓存条目统计或淘汰
-            try:
-                with open(src, "wb") as f:
-                    f.write(raw)
-                cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", src,
-                       "-vn", "-map_metadata", "-1",
-                       "-ac", str(MP3_CHANNELS), "-ar", str(MP3_SR),
-                       "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", tmp]
-                with _TRANSCODE_SLOTS:
-                    subprocess.run(cmd, check=True, timeout=timeout,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
-                    raise RuntimeError("ffmpeg 转码失败: %s" % guid)
-                os.replace(tmp, dst)
-            finally:
-                # 失败路径不留垃圾：.src 与 .part 一律清掉（成功时已被 replace/删除）
-                for leftover in (src, tmp):
-                    try:
-                        os.remove(leftover)
-                    except Exception:
-                        pass
-            self.evict()
-            return dst
-
-    def evict(self):
-        try:
-            items = []
-            for n in os.listdir(self.dir):
-                if not n.endswith(".mp3"):
-                    continue
-                fp = os.path.join(self.dir, n)
-                try:
-                    st = os.stat(fp)
-                except OSError:
-                    continue
-                items.append((st.st_atime, st.st_size, fp))
-            total = sum(i[1] for i in items)
-            if total <= self.max:
-                return
-            items.sort()
-            for _, sz, fp in items:
-                if total <= self.max * 0.9:
-                    break
-                try:
-                    os.remove(fp)
-                    total -= sz
-                except Exception:
-                    pass
-            LOG.info("cache evicted to %.1f MiB", total / 1048576.0)
-        except Exception as e:
-            LOG.warning("cache evict failed: %s", e)
-
-
-CACHE = Mp3Cache(CACHE_DIR, CACHE_MAX)
+CACHE = MediaCache(CACHE_DIR, CACHE_MAX, LOG, transcode_slots=_TRANSCODE_SLOTS)
+LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, lambda: LIBRARY_SCAN_CMD, LOG,
+                       max_bytes=LIBRARY_MAX_BYTES)
 
 
 # ---------------------------------------------------------------- provider
@@ -672,7 +587,12 @@ def provider():
                 else:
                     _PROVIDER = FnProvider()
                     if FALLBACK_URLS:
-                        _PROVIDER = FallbackProvider(_PROVIDER, FALLBACK_URLS)
+                        _PROVIDER = FallbackProvider(
+                            _PROVIDER, FALLBACK_URLS, timeout=FALLBACK_TIMEOUT,
+                            search_limit=FALLBACK_SEARCH_LIMIT,
+                            download_dir_getter=lambda: DOWNLOAD_DIR,
+                            scan_cmd_getter=lambda: LIBRARY_SCAN_CMD,
+                            parallel=SOURCE_SEARCH_PARALLEL)
                         LOG.info("fallback enabled: %s", ", ".join(fallback_services()))
                 _PROVIDER_ERR = None
             except Exception as e:
@@ -740,10 +660,12 @@ def pick_tracks(p, query="", mood="", playlist="", limit=10):
     raise BadRequest("需要 query / mood / playlist 之一")
 
 
-def make_url(base, guid, ttl=None):
+def make_url(base, guid, ttl=None, quality=None):
     exp = int(time.time()) + (ttl or URL_TTL)
     g = urllib.parse.quote(guid, safe="")
-    return "%s/play/%s.mp3?exp=%d&sig=%s" % (base, g, exp, sign(guid, exp))
+    q = normalize_quality(quality or QUALITY_DEFAULT)
+    return "%s/play/%s.mp3?exp=%d&sig=%s&q=%s" % (
+        base, g, exp, sign(guid, exp), urllib.parse.quote(q, safe=""))
 
 
 def make_lyric_url(base, guid, ttl=None):
@@ -873,331 +795,33 @@ def lyric_url_for(base, track, ttl=None):
     return make_lyric_url(base, track["guid"], ttl)
 
 
+PLAYBACK = PlaybackService(CACHE, LIBRARY, make_url, lyric_url_for, audio_seconds,
+                           save_state, default_quality=QUALITY_DEFAULT, ttl=URL_TTL,
+                           prewarm=PREWARM, preview_min_seconds=PREVIEW_MIN_SECONDS,
+                           tee_save=TEE_SAVE)
+
+
 # ---------------------------------------------------------------- MCP 工具
-# ==== 在线音源兜底（fnos_music_ext：musicdl / lxmusic / musicbox / neteasefree） ====
+# 在线音源兼容别名（历史测试/脚本仍可使用这些名字）
 EXT_PREFIX = "ext:"
-_SVC_PORTS = {"8768": "musicdl", "8770": "musicbox", "8772": "lxmusic", "8776": "neteasefree"}
-_SVC_ALIASES = {"musicdl": "musicdl", "lx": "lxmusic", "lxmusic": "lxmusic",
-                "musicbox": "musicbox", "netease": "musicbox", "neteasefree": "neteasefree"}
-
-
-def is_ext_guid(guid):
-    return str(guid or "").startswith(EXT_PREFIX)
-
-
-def ext_split(guid):
-    """ext:<svc>:<原始id> → (svc, id)；原始 id 可能带冒号，只切前两段。"""
-    svc, _, eid = str(guid)[len(EXT_PREFIX):].partition(":")
-    return svc, eid
-
-
-def _guess_svc(base):
-    try:
-        port = urllib.parse.urlparse(base).port
-    except Exception:
-        port = None
-    return _SVC_PORTS.get(str(port), "")
 
 
 def _spec_svc(spec):
-    svc, _, url = spec.partition("@")
-    if not url:
-        svc, url = "", spec
-    svc = svc.strip().lower()
-    return _SVC_ALIASES.get(svc, svc) if svc else (_guess_svc(url) or "musicdl")
+    return _parse_spec(spec)[0]
 
 
 def fallback_services():
-    return [_spec_svc(s) for s in FALLBACK_URLS]
+    return _fallback_services(FALLBACK_URLS)
 
 
-def audio_seconds(path):
-    """ffprobe 读时长（秒，float）；失败返回 None。"""
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15).stdout
-        return float(out.decode("utf-8", "replace").strip())
-    except Exception:
-        return None
-
-
-class ExtProvider:
-    """fnos_music_ext 音源容器的只读客户端（内网 127.0.0.1，无鉴权）。
-
-    上游契约取自项目源码，字段仍需线上实测（待核实）：
-      musicdl     GET /search?keyword=&limit=   GET /stream?id=&proxy=true   GET /info?id=
-      lxmusic     GET /api/v1/search?keyword=    GET /api/v1/track/url?id=    GET /api/v1/track/lyric?id=
-      musicbox    GET /api/v1/search?keyword=    GET /api/v1/song/{id}/url    GET /api/v1/song/{id}/lyric
-      neteasefree 同上（musicbox 形态）
-    """
-
-    def __init__(self, base, svc=""):
-        self.base = (base or "").rstrip("/")
-        self.svc = svc or _guess_svc(self.base) or "musicdl"
-        self.timeout = FALLBACK_TIMEOUT
-
-    def health(self):
-        try:
-            j = _http_json(self.base + "/healthz", min(3, self.timeout))
-            return j.get("ok", True) is not False if isinstance(j, dict) else bool(j)
-        except Exception:
-            return False
-
-    def _get(self, url):
-        return _http_json(url, self.timeout)
-
-    def search(self, q, limit=10):
-        q = urllib.parse.quote(str(q or ""))
-        limit = max(1, int(limit))
-        try:
-            if self.svc == "musicdl":
-                j = self._get("%s/search?keyword=%s&limit=%d" % (self.base, q, limit))
-            else:
-                j = self._get("%s/api/v1/search?keyword=%s&limit=%d" % (self.base, q, limit))
-        except Exception as e:
-            LOG.warning("ext %s search failed: %s", self.svc, e)
-            return []
-        return self._norm_rows(j, limit)
-
-    def _norm_rows(self, j, limit):
-        out = []
-        for row in _rows(j)[: max(limit, 1) * 2]:
-            if not isinstance(row, dict):
-                continue
-            eid = _first(row, "id", "songId", "song_id", "songmid", "songMid", "mid", "hash")
-            if not eid:
-                continue
-            t = norm_track(row)
-            t["guid"] = "%s%s:%s" % (EXT_PREFIX, self.svc, eid)
-            t["source"] = self.svc
-            t["ext_id"] = str(eid)
-            if not t.get("title"):
-                t["title"] = str(_first(row, "name", "songName", default=str(eid)))
-            out.append(t)
-        return dedupe(out)[:limit]
-
-    def _resolve_url(self, eid):
-        eid_q = urllib.parse.quote(str(eid), safe="")
-        if self.svc == "musicdl":
-            return "%s/stream?id=%s&proxy=true" % (self.base, eid_q)
-        if self.svc == "lxmusic":
-            j = self._get("%s/api/v1/track/url?id=%s&quality=lossless" % (self.base, eid_q))
-        else:
-            j = self._get("%s/api/v1/song/%s/url?quality=exhigh" % (self.base, eid_q))
-        d = j.get("data") if isinstance(j, dict) else None
-        url = (d or {}).get("url") if isinstance(d, dict) else None
-        if not url and isinstance(j, dict):
-            url = j.get("url")
-        return str(url or "")
-
-    def stream(self, guid):
-        _svc, eid = ext_split(guid)
-        url = self._resolve_url(eid)
-        if not url:
-            raise RuntimeError("在线音源未返回可播放地址（%s）" % self.svc)
-        req = urllib.request.Request(url, headers={"User-Agent": "fnmusic-gateway/" + VERSION})
-        with urllib.request.urlopen(req, timeout=max(20, self.timeout * 3)) as resp:
-            ctype = resp.headers.get("Content-Type") or "application/octet-stream"
-            return ctype, resp.read()
-
-    def lyrics(self, guid):
-        _svc, eid = ext_split(guid)
-        eid_q = urllib.parse.quote(str(eid), safe="")
-        try:
-            if self.svc == "musicdl":
-                j = self._get("%s/info?id=%s" % (self.base, eid_q))
-            elif self.svc == "lxmusic":
-                j = self._get("%s/api/v1/track/lyric?id=%s" % (self.base, eid_q))
-            else:
-                j = self._get("%s/api/v1/song/%s/lyric" % (self.base, eid_q))
-        except Exception:
-            return ""
-        for holder in (j, (j or {}).get("data") if isinstance(j, dict) else None):
-            if isinstance(holder, dict):
-                for k in ("lyric", "lrc", "lyrics", "text"):
-                    v = holder.get(k)
-                    if isinstance(v, str) and v.strip():
-                        return v
-        return ""
-
-
-class FallbackProvider:
-    """本地曲库优先；本地不够时才问在线音源（歌单/心情仍只走本地）。"""
-
-    def __init__(self, base, urls):
-        self.base = base
-        self.exts = []
-        for spec in urls:
-            svc, _, url = spec.partition("@")
-            if not url:
-                svc, url = "", spec
-            svc = _SVC_ALIASES.get(svc.strip().lower(), svc.strip().lower()) if svc.strip() else ""
-            self.exts.append(ExtProvider(url.strip(), svc))
-
-    def list_tracks(self, limit=20):
-        return self.base.list_tracks(limit)
-
-    def playlists(self):
-        return self.base.playlists()
-
-    def playlist_tracks(self, guid, limit=200):
-        return self.base.playlist_tracks(guid, limit)
-
-    def albums(self, limit=20):
-        return self.base.albums(limit)
-
-    def artists(self, limit=20):
-        return self.base.artists(limit)
-
-    def favorites(self, limit=100):
-        return self.base.favorites(limit)
-
-    def add_favorite(self, guid):
-        return self.base.add_favorite(guid)
-
-    def remove_favorite(self, guid):
-        return self.base.remove_favorite(guid)
-
-    def search(self, q, limit=10):
-        try:
-            rows = self.base.search(q, limit)
-        except Exception as e:
-            LOG.warning("local search failed: %s", e)
-            rows = []
-        if len(rows) >= limit or not self.exts:
-            return rows
-        have = set((_norm_text(t.get("title")), _norm_text(t.get("artist"))) for t in rows)
-        need = limit - len(rows)
-        for e in self.exts:
-            if need <= 0:
-                break
-            for t in e.search(q, max(need, FALLBACK_SEARCH_LIMIT)):
-                key = (_norm_text(t.get("title")), _norm_text(t.get("artist")))
-                if key in have:
-                    continue
-                have.add(key)
-                rows.append(t)
-                need -= 1
-                if need <= 0:
-                    break
-        return rows[:limit]
-
-    def _ext(self, guid):
-        svc, _ = ext_split(guid)
-        for e in self.exts:
-            if e.svc == svc:
-                return e
-        return self.exts[0] if self.exts else None
-
-    def stream(self, guid):
-        if is_ext_guid(guid):
-            e = self._ext(guid)
-            if not e:
-                raise RuntimeError("在线音源未配置")
-            return e.stream(guid)
-        return self.base.stream(guid)
-
-    def lyrics_text(self, guid):
-        if not is_ext_guid(guid):
-            return ""
-        e = self._ext(guid)
-        return e.lyrics(guid) if e else ""
-
-    def download_ext(self, track):
-        """收藏即下载：把在线歌曲按最高音质落盘到 GW_DOWNLOAD_DIR。"""
-        if not DOWNLOAD_DIR:
-            raise BadRequest("收藏下载需要先配置 GW_DOWNLOAD_DIR（指向飞牛曲库目录）")
-        e = self._ext(track["guid"])
-        if not e:
-            raise BadRequest("在线音源未配置")
-        ctype, raw = e.stream(track["guid"])
-        if not raw:
-            raise BadRequest("在线音源返回空音频")
-        low = (ctype or "").lower()
-        ext = ".flac" if "flac" in low else (".mp3" if ("mpeg" in low or "mp3" in low) else ".bin")
-        name = "%s - %s" % (track.get("title") or track["guid"], track.get("artist") or "未知")
-        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()[:150] or track["guid"]
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        fp = os.path.join(DOWNLOAD_DIR, name + ext)
-        with open(fp + ".part", "wb") as f:
-            f.write(raw)
-        os.replace(fp + ".part", fp)
-        if LIBRARY_SCAN_CMD:
-            try:
-                subprocess.run(LIBRARY_SCAN_CMD, shell=True, check=False, timeout=120)
-            except Exception as e:
-                LOG.warning("library scan failed: %s", e)
-        return fp, len(raw)
-
-
-TOOLS = [
-    {
-        "name": "music_search",
-        "description": "在本地曲库优先搜歌（自动纠正同音字/错字，按相关度排序）；本地没有时会自动到在线音源兜底（GW_FALLBACK_URLS 开启时）。返回带序号的曲目列表。",
-        "inputSchema": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "歌名或歌手"},
-            "limit": {"type": "integer", "description": "最多返回几首，默认 10"}},
-            "required": ["query"]},
-    },
-    {
-        "name": "music_browse",
-        "description": "浏览飞牛音乐库：category=track 全部歌曲 / album 专辑 / artist 歌手 / playlist 歌单。",
-        "inputSchema": {"type": "object", "properties": {
-            "category": {"type": "string", "enum": ["track", "album", "artist", "playlist"]},
-            "limit": {"type": "integer"}}, "required": ["category"]},
-    },
-    {
-        "name": "music_playlists",
-        "description": "列出我的自建歌单。",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "music_playlist_tracks",
-        "description": "按歌单名列出里面的曲目。",
-        "inputSchema": {"type": "object", "properties": {
-            "name": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["name"]},
-    },
-    {
-        "name": "music_favorites",
-        "description": "列出我收藏的歌曲。",
-        "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
-    },
-    {
-        "name": "music_mood",
-        "description": "按心情/场景选曲，返回候选列表。mood 例如：安静、放松、睡前、开心、伤感、运动、工作、下雨。",
-        "inputSchema": {"type": "object", "properties": {
-            "mood": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["mood"]},
-    },
-    {
-        "name": "music_play",
-        "description": ("拿一首歌的可播放直链，同时给出歌名、歌手和歌词直链（设备屏显要用）。"
-                        "query/mood/playlist 三选一，index 从 1 开始。"
-                        "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url 四个参数都填上。"),
-        "inputSchema": {"type": "object", "properties": {
-            "query": {"type": "string"}, "mood": {"type": "string"},
-            "playlist": {"type": "string"}, "index": {"type": "integer"}}, "required": []},
-    },
-    {
-        "name": "music_favorite",
-        "description": "收藏或取消收藏一首歌。action=add|remove，query 是歌名。在线歌曲 add 时会按最高音质下载到本地曲库（需配置 GW_DOWNLOAD_DIR）。",
-        "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["add", "remove"]},
-            "query": {"type": "string"}}, "required": ["action", "query"]},
-    },
-    {
-        "name": "music_status",
-        "description": "上一次播放的是什么。",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-]
+TOOLS = build_tools()
 
 
 def call_tool(name, args, base):
     args = args or {}
     p = provider()
     limit = clamp_limit(args.get("limit"), 10)
+    quality = args.get("quality")
 
     if name == "music_search":
         q = str(args.get("query") or "").strip()
@@ -1255,37 +879,21 @@ def call_tool(name, args, base):
         idx = _to_int(args.get("index"), 1)
         if idx < 1 or idx > len(rows):
             raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
-        t = rows[idx - 1]
-        if PREWARM:
-            try:
-                CACHE.ensure(t["guid"], p)
-            except Exception as e:
-                LOG.warning("prewarm %s failed: %s", t["guid"], e)
-        dur = None
-        try:
-            cached = CACHE.path(t["guid"])
-            if os.path.exists(cached):
-                dur = audio_seconds(cached)
-        except Exception:
-            dur = None
-        preview = bool(dur and dur < PREVIEW_MIN_SECONDS)
-        url = make_url(base, t["guid"])
-        lurl = lyric_url_for(base, t)
-        save_state({"guid": t["guid"], "title": t["title"], "artist": t["artist"],
-                    "source": t.get("source") or "local", "preview": preview,
-                    "duration": dur, "at": int(time.time()), "url": url})
-        src_line = ("\n来源：在线音源 %s" % t["source"]) if t.get("source") else ""
+        info = PLAYBACK.prepare(rows[idx - 1], p, base, quality=quality)
+        src_line = ("\n来源：在线音源 %s" % info["source"]) if info["source"] != "local" else ""
         prev_line = ""
-        if preview:
-            prev_line = ("\n注意：在线音源只给到试听片段（约 %d 秒）；想听完整版就说「收藏」，会按最高音质下载到本地曲库。" % int(dur))
-        return ("准备播放：%s%s\n%s 第 %d 首%s%s\n直链（%d 分钟内有效）：%s\n"
+        if info["preview"]:
+            prev_line = ("\n注意：在线音源只给到试听片段（约 %d 秒）；说「下载」可保存完整版到本地曲库。" % int(info["duration"] or 0))
+        save_line = "，正在后台保存到本地曲库" if info["saving"] else ""
+        return ("准备播放：%s%s\n%s 第 %d 首，音质 %s（%s kbps）%s%s\n直链（%d 分钟内有效）：%s\n"
                 "歌词直链：%s\n"
                 "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
                 "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空）。" % (
-                    t["title"], (" - " + t["artist"]) if t["artist"] else "", label, idx,
-                    src_line, prev_line,
-                    max(1, URL_TTL // 60), url, lurl or "（这首歌查不到歌词，留空即可）",
-                    t["title"], t["artist"] or ""))
+                    info["title"], (" - " + info["artist"]) if info["artist"] else "", label, idx,
+                    info["quality_label"], info["bitrate"], src_line, prev_line + save_line,
+                    max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
+                    info["lyric_url"] or "（这首歌查不到歌词，留空即可）",
+                    info["title"], info["artist"] or ""))
 
     if name == "music_favorite":
         action = str(args.get("action") or "").lower()
@@ -1298,7 +906,7 @@ def call_tool(name, args, base):
         t = rows[0]
         if action == "add":
             if is_ext_guid(t["guid"]) and hasattr(p, "download_ext"):
-                fp, n = p.download_ext(t)
+                fp, n = p.download_ext(t, quality or "lossless")
                 return "已收藏并下载到本地曲库：%s（%s，%.1f MB）" % (
                     t["title"], fp, n / 1048576.0)
             p.add_favorite(t["guid"])
@@ -1308,14 +916,53 @@ def call_tool(name, args, base):
             return "已取消收藏：%s" % t["title"]
         raise BadRequest("action 只能是 add 或 remove")
 
+    if name == "music_download":
+        guid = str(args.get("guid") or "").strip()
+        q = str(args.get("query") or "").strip()
+        if not LIBRARY.enabled():
+            raise BadRequest("未配置 GW_DOWNLOAD_DIR，无法保存到本地")
+        if guid:
+            st = load_state()
+            track = {"guid": guid, "title": (st.get("title") if st.get("guid") == guid else "") or guid,
+                     "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
+                     "source": "ext"}
+        elif q:
+            rows = p.search(q, 5)
+            if not rows:
+                raise BadRequest("没找到「%s」" % q)
+            track = rows[0]
+        else:
+            raise BadRequest("guid 或 query 至少给一个")
+        fp, n = LIBRARY.save_from_provider(p, track, quality or DEFAULT_QUALITY)
+        return "已保存到本地曲库：%s（%s，%.1f MB）" % (track.get("title") or track["guid"], fp, n / 1048576.0)
+
+    if name == "music_sources":
+        if not FALLBACK_URLS:
+            return "没有配置在线音源（GW_FALLBACK_URLS 为空），只用本地曲库。"
+        rows = source_status(FALLBACK_URLS)
+        lines = ["在线音源 %d 个：" % len(rows)]
+        for item in rows:
+            lines.append("%s（%s）%s" % (item.get("service"), item.get("url"),
+                                        " 正常" if item.get("ok") else " 不可用"))
+        return "\n".join(lines)
+
+    if name == "music_storage":
+        c = CACHE.stats()
+        lib = LIBRARY.stats()
+        return ("播放缓存：%d 个文件，%.1f MB（上限 %.1f MB）\n本地曲库：%s，%d 个文件，%.1f MB" % (
+            c.get("files", 0), c.get("bytes", 0) / 1048576.0,
+            c.get("limit_bytes", 0) / 1048576.0,
+            lib.get("dir") or "未配置", lib.get("files", 0), lib.get("bytes", 0) / 1048576.0))
+
     if name == "music_status":
         st = load_state()
         if not st.get("title"):
             return "还没播放过。"
         at = _to_int(st.get("at"))
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)) if at > 0 else "时间未知"
-        return "上一次播放：%s%s（%s）" % (
-            st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", when)
+        qn = ("（音质 %s）" % st.get("quality")) if st.get("quality") else ""
+        return "上一次播放：%s%s%s（%s）" % (
+            st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", qn, when)
 
     raise RuntimeError("未知工具：%s" % name)
 
@@ -1392,6 +1039,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "version": VERSION, "mock": MOCK,
                                    "provider_error": provider_error(),
                                    "fallback": fallback_services(),
+                                   "quality_default": QUALITY_DEFAULT,
+                                   "quality_profiles": describe_quality(),
                                    "cache_mb": round(self._cache_mb(), 1),
                                    "moods": sorted(MOODS.keys())})
             if path == "/readyz":
@@ -1437,10 +1086,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_api_play(qs)
             if path == "/api/status":
                 return self._json(load_state() or {"title": None})
+            if path == "/api/sources":
+                return self._json({"sources": source_status(FALLBACK_URLS) if FALLBACK_URLS else []})
+            if path == "/api/storage":
+                return self._json({"cache": CACHE.stats(), "library": LIBRARY.stats()})
+            if path == "/api/quality":
+                return self._json({"default": QUALITY_DEFAULT, "profiles": describe_quality()})
             if path == "/mcp":
                 return self._json({"error": "use POST /mcp (streamable-http)"}, 405,
                                   [("Allow", "POST, OPTIONS")])
             return self._json({"error": "not found", "path": path}, 404)
+        except GatewayError as e:
+            body, code = as_payload(e)
+            self._json(body, code)
         except BadRequest as e:
             self._json({"error": str(e)}, 400)
         except BrokenPipeError:
@@ -1482,9 +1140,36 @@ class Handler(BaseHTTPRequestHandler):
                 guid = str(body.get("guid") or "").strip()
                 if not guid:
                     raise BadRequest("guid 不能为空")
-                path = CACHE.ensure(guid, provider())
-                return self._json({"ok": True, "guid": guid, "bytes": os.path.getsize(path)})
+                path = CACHE.ensure(guid, provider(), quality=body.get("quality"))
+                return self._json({"ok": True, "guid": guid,
+                                   "bytes": os.path.getsize(path)})
+            if u.path == "/api/download":
+                body = self._body()
+                if not LIBRARY.enabled():
+                    raise BadRequest("未配置 GW_DOWNLOAD_DIR，无法保存到本地")
+                guid = str(body.get("guid") or "").strip()
+                query = str(body.get("query") or "").strip()
+                quality = body.get("quality")
+                p = provider()
+                if guid:
+                    st = load_state()
+                    track = {"guid": guid,
+                             "title": (st.get("title") if st.get("guid") == guid else "") or guid,
+                             "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
+                             "source": "ext"}
+                elif query:
+                    rows = p.search(query, 5)
+                    if not rows:
+                        return self._json({"error": "track not found"}, 404)
+                    track = rows[0]
+                else:
+                    raise BadRequest("guid 或 query 至少给一个")
+                fp, n = LIBRARY.save_from_provider(p, track, quality or DEFAULT_QUALITY)
+                return self._json({"ok": True, "guid": track["guid"], "path": fp, "bytes": n})
             return self._json({"error": "not found", "path": u.path}, 404)
+        except GatewayError as e:
+            body, code = as_payload(e)
+            self._json(body, code)
         except BadRequest as e:
             self._json({"error": str(e)}, 400)
         except BrokenPipeError:
@@ -1536,43 +1221,14 @@ class Handler(BaseHTTPRequestHandler):
         mood = (qs.get("mood") or [""])[0]
         playlist = (qs.get("playlist") or [""])[0]
         index = self._qs_int(qs, "index", 1)
+        quality = (qs.get("quality") or qs.get("q_quality") or [""])[0] or None
         p = provider()
         rows, label = pick_tracks(p, query, mood, playlist, 20)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)
-        t = rows[index - 1]
-        warm = None
-        if PREWARM:
-            try:
-                path = CACHE.ensure(t["guid"], p)
-                warm = os.path.getsize(path)
-            except Exception as e:
-                LOG.warning("prewarm %s failed: %s", t["guid"], e)
-                warm = None
-        dur = None
-        try:
-            cached = CACHE.path(t["guid"])
-            if os.path.exists(cached):
-                dur = audio_seconds(cached)
-        except Exception:
-            dur = None
-        preview = bool(dur and dur < PREVIEW_MIN_SECONDS)
-        base = self._base()
-        url = make_url(base, t["guid"])
-        lyric_url = lyric_url_for(base, t)
-        save_state({"guid": t["guid"], "title": t["title"], "artist": t["artist"],
-                    "source": t.get("source") or "local", "preview": preview,
-                    "duration": dur, "at": int(time.time()), "url": url})
-        return self._json({
-            "guid": t["guid"], "title": t["title"], "artist": t["artist"], "album": t["album"],
-            "url": url, "lyric_url": lyric_url, "expires_in": URL_TTL, "label": label,
-            "index": index, "count": len(rows), "warmed_bytes": warm,
-            "source": t.get("source") or "local", "preview": preview, "duration": dur,
-            "device_args": {"url": url, "title": t["title"], "artist": t["artist"] or "",
-                            "lyric_url": lyric_url},
-            "device_tool": "self.music.play_url",
-            "spoken": "%s%s" % (t["title"], ("，" + t["artist"]) if t["artist"] else ""),
-        })
+        info = PLAYBACK.prepare(rows[index - 1], p, self._base(), quality=quality)
+        info.update({"label": label, "index": index, "count": len(rows)})
+        return self._json(info)
 
     def _handle_lyrics(self, u, qs):
         """签名歌词直链：设备 self.music.play_url 的 lyric_url 会自己来拉 LRC。"""
@@ -1623,8 +1279,9 @@ class Handler(BaseHTTPRequestHandler):
         if not verify(guid, exp, sig):
             LOG.warning("bad signature for %s", guid)
             return self._json({"error": "invalid or expired signature"}, 403)
+        quality = (qs.get("q") or [""])[0] or None
         try:
-            path = CACHE.ensure(guid, provider())
+            path = CACHE.ensure(guid, provider(), quality=quality)
         except Exception as e:
             LOG.exception("transcode %s failed", guid)
             return self._json({"error": "transcode failed: %s" % e}, 502)

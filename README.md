@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.5.0**（2026-11-19） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.0.0**（2026-11-19） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐（fnOS Music）→ 小智 的播放网关。**一个进程，两个出口**：
 
@@ -24,7 +24,10 @@
 - **在线兜底**：本地没有的歌，按配置走在线音源（musicdl / 网易 / 洛雪），支持试听识别和“收藏即下载”。
 - **听得更准**：中文同音字/错字纠正 + 相关度排序（青花磁 → 青花瓷）。
 - **安全外网**：单独开一个只服务 `/play/` 与 `/lyrics/` 的公网端口，管理面不暴露。
-- **多种接入**：9 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
+- **多种接入**：12 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
+- **音质可选**：`standard / high / exhigh / lossless` 四档，设备始终拿 MP3，下载保留原始音质。
+- **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地曲库。
+- **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / mcp_tools 六层，新增音源或音质策略不改播放层与 MCP 层。
 
 ## 为什么需要这一层
 
@@ -32,6 +35,21 @@
 2. **飞牛 token 不能进 URL**（URL 会进设备日志、进 LLM 上下文）⇒ 直链用 HMAC 短时签名，token 留在网关里。
 3. **设备要求 URL ≤ 2048 字节、仅 http/https、禁空白与 `@`** ⇒ 不能把签名参数塞一堆。
 4. 首次点播就转码并落盘缓存，`/api/play` 返回前预热，设备连上就能满速读。
+
+## 2.0 的分层结构
+
+代码按职责拆成独立模块，互不越界；`app.py` 只做 HTTP/MCP 路由与装配：
+
+| 模块 | 职责 | 关键接口 |
+|---|---|---|
+| `gwlib/errors.py` | 统一错误码与 HTTP 状态映射 | `GatewayError` / `as_payload` |
+| `gwlib/quality.py` | 音质档位与转码参数 | `normalize_quality` / `get_profile` |
+| `gwlib/storage.py` | MP3 转码缓存 + 本地曲库落盘 | `MediaCache.ensure` / `LibraryStore.save_from_provider` |
+| `gwlib/sources.py` | 在线音源适配、探活、多源并行检索 | `ExtProvider` / `FallbackProvider` / `source_status` |
+| `gwlib/playback.py` | 选源→音质→缓存→直链→边播边存 | `PlaybackService.prepare` |
+| `gwlib/mcp_tools.py` | 12 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
+
+新增音源只需实现 `search/stream/lyrics` 并注册到 `sources.py`；新增音质只改 `quality.py` 的 `PROFILES`，播放层与 MCP 层无需改动。
 
 ## 部署形态怎么选
 
@@ -66,17 +84,17 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 镜像与版本
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64` 并推到 GHCR。
-以 `v1.5.0` 为例，会生成 `1.5.0`、`1.5`、`latest`、`sha-xxxxxxx` 四个标签。
+以 `v2.0.0` 为例，会生成 `2.0.0`、`2.0`、`latest`、`sha-xxxxxxx` 四个标签。
 
 ~~~bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.5.0   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:2.0.0   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ~~~
 
 两份 compose 默认跟 `latest`；想锁定版本或换本地镜像时用 `GW_IMAGE` 覆盖：
 
 ~~~bash
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.5.0 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.0.0 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合本地 build
 ~~~
 
@@ -161,6 +179,15 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 | `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把 NAS CPU 打满 |
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
 
+### 音质与本地存储
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GW_QUALITY_DEFAULT` | `standard` | 默认音质：`standard`(128k) / `high`(192k) / `exhigh`(320k) / `lossless`(下载原始音质，播放仍 320k MP3) |
+| `GW_TEE_SAVE` | 1 | 在线歌曲播放时是否边播边存到 `GW_DOWNLOAD_DIR`；0=关闭 |
+| `GW_LIBRARY_MAX_BYTES` | 0 | 本地曲库容量上限（字节，0=不限）；超出后下载报错 |
+| `GW_SOURCES_SEARCH_PARALLEL` | 1 | 多音源检索是否并行；0=串行 |
+
 ### 歌词（设备屏显）
 
 | 变量 | 默认 | 说明 |
@@ -178,7 +205,7 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 | `GW_FALLBACK_URLS` | 空=关闭 | 在线音源，逗号分隔，如 `musicdl@http://127.0.0.1:8768`；也可只写 URL，按端口推断类型 |
 | `GW_FALLBACK_TIMEOUT` | 8 | 在线音源请求超时（秒） |
 | `GW_FALLBACK_SEARCH_LIMIT` | 10 | 每个在线音源最多取几条 |
-| `GW_DOWNLOAD_DIR` | 空 | 收藏在线歌曲的落盘目录（指向飞牛曲库目录）；不配则“收藏即下载”会报错 |
+| `GW_DOWNLOAD_DIR` | 空 | 下载与边播边存的落盘目录（指向飞牛曲库目录）；不配则下载/边播边存关闭 |
 | `GW_LIBRARY_SCAN_CMD` | 空 | 下载完成后触发的曲库扫描命令（如 `fnmusic-ext scan`），可选 |
 | `GW_PREVIEW_MIN_SECONDS` | 35 | 转码后时长低于此值判为试听片段（很多在线源未登录只给 30 秒） |
 
@@ -252,7 +279,7 @@ bridge 已经打进同一个镜像（`bridge/mcp_pipe_http.py`，只依赖 `webs
 ~~~bash
 export MCP_ENDPOINT='wss://xxx:59826/mcp_endpoint/mcp/?token=...'
 docker compose up -d            # fnmusic-gateway + fnmusic-bridge
-docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 9 个工具" 即成功
+docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 12 个工具" 即成功
 ~~~
 
 不填 `MCP_ENDPOINT` 时桥接器会一直重连、不影响网关本体。
@@ -407,13 +434,17 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | GET | `/api/playlist?name=&limit=` | 按歌单名列出曲目 |
 | GET | `/api/favorites?limit=` | 列出收藏 |
 | GET | `/api/mood?mood=&limit=` | 按心情/场景选曲 |
-| GET | `/api/play?query=\|mood=\|playlist=&index=` | 取签名直链；主要字段 `url/title/artist/lyric_url/device_args/source/preview/duration` |
+| GET | `/api/play?query=\|mood=\|playlist=&index=&quality=` | 取签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
 | GET | `/api/status` | 上一次播放的是什么 |
+| GET | `/api/sources` | 各在线音源探活结果 |
+| GET | `/api/storage` | 缓存与本地曲库用量 |
+| GET | `/api/quality` | 可用音质档位 |
 | POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid`） |
-| POST | `/api/warm` | body `{"guid":"..."}`，预转码到缓存 |
+| POST | `/api/warm` | body `{"guid":"...","quality":"high"}`，预转码到缓存 |
+| POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地曲库 |
 | POST | `/mcp` | MCP streamable-http（JSON-RPC） |
 
-### MCP 工具（9 个）
+### MCP 工具（12 个）
 
 | 工具 | 用途 |
 |---|---|
@@ -423,9 +454,12 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | `music_playlist_tracks` | 按歌单名列出曲目 |
 | `music_favorites` | 列出收藏 |
 | `music_mood` | 按心情/场景选曲 |
-| `music_play` | 拿直链 + 歌名/歌手/歌词直链，提示调用设备 `self.music.play_url` |
+| `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；可选 `quality` |
 | `music_favorite` | 收藏/取消收藏；在线歌曲 add 时按最高音质下载 |
-| `music_status` | 上一次播放的是什么 |
+| `music_status` | 上一次播放的是什么（含音质） |
+| `music_download` | 显式下载在线歌曲到本地曲库，可指定音质 |
+| `music_sources` | 查看在线音源可用性 |
+| `music_storage` | 查看缓存与本地曲库用量 |
 
 ## 自检与验收
 
@@ -453,7 +487,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 44 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
+python tests/test_gateway.py -v   # 51 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -463,7 +497,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 
 | 项 | 结果 |
 |---|---|
-| 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 9 个工具、call_tool 正常 |
+| 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 12 个工具、call_tool 正常 |
 | `/api/play?query=晴天` | 返回签名直链 + 预热 65244 字节 |
 | 直链下载 | 200，`ffprobe`：mp3 / 44100 / 2ch / 128000 |
 | 篡改 sig / 过期 | 403 |
@@ -472,7 +506,9 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 公网面 `GW_PUBLIC_PORT` | `/play/` 200 / Range 206 / HEAD 200、`/lyrics/` 200 `text/plain`；`/healthz`、`/readyz`、`/api/*`、`POST /mcp`、`DELETE /mcp` 全部 404 |
 | 歌词链路（真实 LRCLIB） | `/api/play?query=晴天` → `lyric_url`；拉取 200 `text/plain; charset=utf-8`，首行 `[00:29.36] 故事的小黃花`（带 LRC 时间戳，固件才认） |
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
-| `tests/test_gateway.py`（44 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+9 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底 |
+| 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
+| 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
+| `tests/test_gateway.py`（51 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
 
 真实飞牛曲库仍需在 NAS 同网段按上面的「直链自测」验收一次（开发机到 `192.168.50.100:59820` 不通）。
 
@@ -490,11 +526,13 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 ## 仓库结构
 
 ~~~
-app.py                    网关主体（MCP + REST + 签名直链 + 歌词 + 多源兜底）
+app.py                    网关主体（HTTP/MCP 路由 + 依赖装配）
+gwlib/                    分层模块：errors/quality/storage/sources/playback/mcp_tools
 fnmusic_client.py         飞牛音乐客户端
 bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
-tests/                    test_gateway.py（44 用例）、bridge_selftest.py
+docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
+tests/                    test_gateway.py（51 用例）、bridge_selftest.py
 docker-compose.yml        单网关（host 网络）
 docker-compose.full.yml   网关 + 全量音源 + WebUI
 docker-compose.slim.yml   网关 + 轻量音源（只开 2 个端口）

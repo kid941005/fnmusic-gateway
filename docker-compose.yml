@@ -18,6 +18,9 @@ services:
       GW_MP3_BITRATE: "128k"
       GW_MAX_LIMIT: "${GW_MAX_LIMIT:-50}"
       GW_TRANSCODE_CONCURRENCY: "${GW_TRANSCODE_CONCURRENCY:-2}"
+      GW_QUALITY_DEFAULT: "${GW_QUALITY_DEFAULT:-standard}"
+      GW_TEE_SAVE: "${GW_TEE_SAVE:-true}"
+      GW_LIBRARY_MAX_BYTES: "${GW_LIBRARY_MAX_BYTES:-0}"
       # 不填则自动生成并持久化到 /data/sign.key
       GW_SIGN_SECRET: "${GW_SIGN_SECRET:-}"
       # 飞牛音乐

@@ -57,7 +57,7 @@ async def main():
     check("initialize 有 serverInfo", "serverInfo" in (init.get("result") or {}),
           json.dumps((init.get("result") or {}).get("serverInfo") or {}, ensure_ascii=False))
     tl = (got.get(1, {}).get("result") or {}).get("tools") or []
-    check("tools/list 返回 9 个工具", len(tl) == 9, "got %d" % len(tl))
+    check("tools/list 返回 12 个工具", len(tl) == 12, "got %d" % len(tl))
     check("ping 回空 result", got.get(2, {}).get("result") == {})
     call = got.get(10, {})
     text = ((call.get("result") or {}).get("content") or [{}])[0].get("text", "")

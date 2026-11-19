@@ -6,6 +6,7 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 COPY app.py fnmusic_client.py ./
+COPY gwlib/ ./gwlib/
 COPY bridge/ ./bridge/
 
 # 接入小智 MCP 接入点（WebSocket）用的桥接器依赖

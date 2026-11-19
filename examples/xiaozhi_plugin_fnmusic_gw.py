@@ -91,11 +91,13 @@ def _device(conn, tool, args, timeout=15):
                 "description": "播放方式",
             },
             "value": {"type": "string", "description": "歌名 / 心情 / 歌单名"},
+            "quality": {"type": "string", "enum": ["standard", "high", "exhigh", "lossless"],
+                        "description": "音质，默认 standard；lossless 仅影响下载，播放仍为 320k MP3"},
         },
         "required": ["mode"],
     },
 )
-def fnmusic_gw_play(conn, mode="search", value=""):
+def fnmusic_gw_play(conn, mode="search", value="", quality=""):
     if mode == "stop":
         try:
             _device(conn, DEVICE_STOP, {})
@@ -108,7 +110,10 @@ def fnmusic_gw_play(conn, mode="search", value=""):
     if not key or not value:
         return ActionResponse(action=Action.RESPONSE, result="bad args", response="要听什么？")
     try:
-        data = _gw("/api/play?" + urllib.parse.urlencode({key: value}))
+        params = {key: value}
+        if quality:
+            params["quality"] = quality
+        data = _gw("/api/play?" + urllib.parse.urlencode(params))
     except Exception as e:
         return ActionResponse(action=Action.RESPONSE, result=str(e), response="没找到这首歌。")
     url = data.get("url")

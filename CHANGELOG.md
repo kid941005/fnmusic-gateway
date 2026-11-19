@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 1.5.0 (2026-11-19)
+
+### 新增：多音源兜底（本地曲库优先，在线音源补齐）
+- 新增 `ExtProvider`：直连 fnos_music_ext 音源容器的 HTTP 契约（musicdl /search+/stream?proxy=true+/info、
+  lxmusic /api/v1/search+track/url+track/lyric、musicbox 与 neteasefree /api/v1/search+song/{id}/url+lyric），
+  按端口推断类型（8768 musicdl / 8770 musicbox / 8772 lxmusic / 8776 neteasefree），/healthz 探活。
+- 新增 `FallbackProvider`：本地库优先，结果不足才追加在线结果并按「歌名+歌手」跨源去重；
+  在线 guid 统一 `ext:<svc>:<id>`，`stream()` 按前缀分流，歌词先取上游、空则回退 LRCLIB。
+- 试听识别：转码后用 ffprobe 取时长，< `GW_PREVIEW_MIN_SECONDS`（默认 35 秒）判为试听片段，
+  `/api/play` 返回 `source/preview/duration`，MCP `music_play` 文本提示「想听完整版就说收藏」。
+- 收藏即下载：`music_favorite(action=add)` 对在线歌曲按最高音质原样落 `GW_DOWNLOAD_DIR`，
+  文件名 `歌名 - 歌手.<flac|mp3>`，可选 `GW_LIBRARY_SCAN_CMD` 触发曲库扫描。
+- 新增环境变量 `GW_FALLBACK_URLS`（默认空=关闭，支持 `type@url`）、`GW_FALLBACK_TIMEOUT`、`GW_FALLBACK_SEARCH_LIMIT`、
+  `GW_DOWNLOAD_DIR`、`GW_LIBRARY_SCAN_CMD`、`GW_PREVIEW_MIN_SECONDS`；`/healthz` 增 `fallback` 字段。
+- 测试 35 → **44 个用例**：ext guid 解析、端口推断、本地优先与去重、ext 流路由、试听时长、收藏下载、
+  假上游契约解析（search/stream/lyric）。
+- README 新增「多音源兜底（本地优先，在线兜底）」一节，环境变量表与已验证表同步。
+
 ## 1.4.0 (2026-11-18)
 
 ### 新增：搜索别名纠错 + 相关度排序

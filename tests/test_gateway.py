@@ -365,6 +365,165 @@ class TestRanking(unittest.TestCase):
         self.assertEqual(rows[0]["guid"], "mock-1")
 
 
+class _FakeExt:
+    svc = "musicdl"
+
+    def __init__(self, rows=None, wav=b"", lyric=""):
+        self._rows = rows or []
+        self._wav = wav
+        self._lyric = lyric
+
+    def search(self, q, limit=10):
+        return [t for t in self._rows if q in t.get("title", "")][:limit]
+
+    def stream(self, guid):
+        return "audio/wav", self._wav
+
+    def lyrics(self, guid):
+        return self._lyric
+
+
+class _FakeLocal:
+    def __init__(self, rows=None):
+        self._rows = rows or []
+
+    def search(self, q, limit=10):
+        return [t for t in self._rows if q in t.get("title", "")][:limit]
+
+    def list_tracks(self, limit=20):
+        return self._rows
+
+    def stream(self, guid):
+        return "audio/wav", b""
+
+
+class TestFallback(unittest.TestCase):
+    def test_ext_guid_helpers(self):
+        self.assertTrue(app.is_ext_guid("ext:musicdl:123"))
+        self.assertFalse(app.is_ext_guid("mock-1"))
+        self.assertEqual(app.ext_split("ext:lxmusic:ab:cd"), ("lxmusic", "ab:cd"))
+
+    def test_spec_svc(self):
+        self.assertEqual(app._spec_svc("musicdl@http://x:1"), "musicdl")
+        self.assertEqual(app._spec_svc("http://127.0.0.1:8772"), "lxmusic")
+        self.assertEqual(app._spec_svc("http://127.0.0.1:8776"), "neteasefree")
+
+    def test_local_first_then_ext(self):
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        ext = _FakeExt([{"guid": "ext:musicdl:e1", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
+                        {"guid": "ext:musicdl:e2", "title": "七里香", "artist": "周杰伦", "source": "musicdl"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [ext]
+        rows = fp.search("晴天", 5)
+        self.assertEqual(rows[0]["guid"], "l1")
+        self.assertNotIn("ext:musicdl:e1", [r["guid"] for r in rows])
+        rows2 = fp.search("七里香", 5)
+        self.assertEqual(rows2[0]["guid"], "ext:musicdl:e2")
+
+    def test_stream_routes_ext(self):
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
+        fp.exts = [_FakeExt(wav=b"RIFFxxxx")]
+        self.assertEqual(fp.stream("ext:musicdl:abc"), ("audio/wav", b"RIFFxxxx"))
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg")
+    def test_audio_seconds(self):
+        _ct, wav = app.MockProvider().stream("x")
+        fp = os.path.join(DATA, "tone.wav")
+        with open(fp, "wb") as f:
+            f.write(wav)
+        sec = app.audio_seconds(fp)
+        self.assertTrue(sec and 3.0 < sec < 6.0)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg")
+    def test_ext_cache_and_download(self):
+        _ct, wav = app.MockProvider().stream("x")
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
+        fp.exts = [_FakeExt(wav=wav)]
+        path = app.CACHE.ensure("ext:musicdl:e9", fp)
+        self.assertGreater(os.path.getsize(path), 1024)
+        old = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = os.path.join(DATA, "dl")
+        try:
+            out, n = fp.download_ext({"guid": "ext:musicdl:e9", "title": "晴天", "artist": "周杰伦"})
+            self.assertTrue(os.path.exists(out))
+            self.assertGreater(n, 1024)
+        finally:
+            app.DOWNLOAD_DIR = old
+
+    def test_download_requires_dir(self):
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
+        fp.exts = [_FakeExt(wav=b"x")]
+        old = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = ""
+        try:
+            with self.assertRaises(app.BadRequest):
+                fp.download_ext({"guid": "ext:musicdl:e", "title": "t", "artist": "a"})
+        finally:
+            app.DOWNLOAD_DIR = old
+
+
+class TestExtProviderHttp(unittest.TestCase):
+    """本地假上游，验证 ExtProvider 的契约解析（不依赖 NAS）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from http.server import BaseHTTPRequestHandler
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                u = urllib.parse.urlparse(self.path)
+                if u.path == "/healthz":
+                    body = b'{"ok": true}'
+                elif u.path == "/search":
+                    body = json.dumps({"data": [{"id": "s1", "name": "晴天", "artist": "周杰伦"}]}).encode()
+                elif u.path == "/info":
+                    body = json.dumps({"lyric": "[00:01.00]hello"}).encode()
+                elif u.path == "/stream":
+                    body = b"ID3fakeaudio" * 100
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/mpeg")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        cls.srv = app.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_search_norm_and_guid(self):
+        e = app.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
+        rows = e.search("晴天", 5)
+        self.assertEqual(rows[0]["guid"], "ext:musicdl:s1")
+        self.assertEqual(rows[0]["title"], "晴天")
+        self.assertEqual(rows[0]["source"], "musicdl")
+
+    def test_stream_and_lyrics(self):
+        e = app.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
+        ctype, body = e.stream("ext:musicdl:s1")
+        self.assertIn("mpeg", ctype)
+        self.assertGreater(len(body), 100)
+        self.assertIn("hello", e.lyrics("ext:musicdl:s1"))
+
+
 class TestSearchApi(Base):
     """REST 搜索走排序与别名纠正。"""
 

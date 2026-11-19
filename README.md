@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **1.4.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
+> 当前版本 **1.5.0**（见 [`CHANGELOG.md`](CHANGELOG.md)）
 
 飞牛音乐（fnOS Music）→ 小智 的一层网关。**一个进程，两个出口**：
 
@@ -60,6 +60,12 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 | `GW_LRCLIB_URL` | `https://lrclib.net/api/get` | 歌词源（LRCLIB 免费无 key，可自建） |
 | `GW_LYRICS_DIR` | `$GW_DATA/lyrics` | LRC 缓存目录 |
 | `GW_LYRICS_RETRY` | 86400 | 查不到歌词的重试间隔（秒） |
+| `GW_FALLBACK_URLS` | 空=关闭 | 在线音源兜底，逗号分隔，如 `musicdl@http://127.0.0.1:8768`（`type@url` 或裸 URL，按端口推断类型） |
+| `GW_FALLBACK_TIMEOUT` | 8 | 在线音源请求超时（秒） |
+| `GW_FALLBACK_SEARCH_LIMIT` | 10 | 每个在线音源最多取几条 |
+| `GW_DOWNLOAD_DIR` | 空 | 收藏在线歌曲的落盘目录（指向飞牛曲库目录）；不配则「收藏即下载」会报错 |
+| `GW_LIBRARY_SCAN_CMD` | 空 | 下载完成后触发的曲库扫描命令（如 `fnmusic-ext scan`），可选 |
+| `GW_PREVIEW_MIN_SECONDS` | 35 | 转码后时长低于此值判为试听片段（很多在线源未登录只给 30 秒） |
 | `GW_SMART_SEARCH` | 1 | 搜索是否做别名纠错 + 相关度排序；0=沿用飞牛原始顺序 |
 | `GW_ALIASES_FILE` | `$GW_DATA/music_aliases.json` | ASR 同音字/错字纠正表（示例见 `data/music_aliases.json.example`，改完自动重载） |
 | `GW_MOODS_FILE` | `$GW_DATA/moods.json` | 心情映射表 |
@@ -74,10 +80,10 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 直接用 CI 构建好的镜像（不用自己 build）
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64`
-并推到 GHCR（`v1.4.0` 这类 tag 会生成 `1.4.0`、`1.2`、`latest`、`sha-xxxxxxx` 四个标签）：
+并推到 GHCR（`v1.5.0` 这类 tag 会生成 `1.5.0`、`1.5`、`latest`、`sha-xxxxxxx` 四个标签）：
 
 ```bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:1.4.0   # 生产建议锁定版本（compose 默认用 latest）
+docker pull ghcr.io/kid941005/fnmusic-gateway:1.5.0   # 生产建议锁定版本（compose 默认用 latest）
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ```
 
@@ -85,7 +91,7 @@ docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 
 ```bash
 # 生产建议显式锁定版本，避免 latest 漂移
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.4.0 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:1.5.0 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合 docker compose build
 ```
 
@@ -111,10 +117,10 @@ curl -s http://127.0.0.1:8766/healthz
 不在 NAS 上构建（本地构建后搬运）：
 
 ```bash
-docker build -t fnmusic-gateway:1.4.0 .
-docker save fnmusic-gateway:1.4.0 | gzip > fnmusic-gateway-1.4.0.tgz
+docker build -t fnmusic-gateway:1.5.0 .
+docker save fnmusic-gateway:1.5.0 | gzip > fnmusic-gateway-1.5.0.tgz
 # 传到 NAS 后
-GW_IMAGE=fnmusic-gateway:1.4.0 docker load -i fnmusic-gateway-1.4.0.tgz && GW_IMAGE=fnmusic-gateway:1.4.0 docker compose up -d
+GW_IMAGE=fnmusic-gateway:1.5.0 docker load -i fnmusic-gateway-1.5.0.tgz && GW_IMAGE=fnmusic-gateway:1.5.0 docker compose up -d
 ```
 
 ### 和小智服务端怎么组网
@@ -273,7 +279,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 | `GET /readyz` | 就绪：真访问一次曲库 | 返回 503 + 原因（NAS 不通 / 账号错 / token 失效） |
 
 ```bash
-python tests/test_gateway.py -v   # 35 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名，全离线（mock）
+python tests/test_gateway.py -v   # 44 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ```
 
@@ -284,7 +290,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 固件 `self.music.play_url` 不只接受 `url`，还接受 `title` / `artist` / `lyric_url`
 （见 `xiaozhi-esp32-zhj` 的 `main/mcp_server.cc`）。只传 `url` 时屏幕上是 `unknown`、没有歌词。
 
-网关 1.4.0 起：`/api/play` 的 JSON 多了 `lyric_url` 与 `device_args`，MCP `music_play` 也会把
+网关 1.3.0 起：`/api/play` 的 JSON 多了 `lyric_url` 与 `device_args`，MCP `music_play` 也会把
 歌名、歌手、歌词直链一起吐给 LLM，要求它调 `self.music.play_url` 时四个参数都带上。
 
 歌词来源与格式：
@@ -314,6 +320,38 @@ curl -s "http://127.0.0.1:8766/api/play?query=%E6%99%B4%E5%A4%A9" \
 curl -s "<上一步的 lyric_url>" | head -3   # 期望 [00:29.36] 故事的小黃花 ...
 ```
 
+## 多音源兜底（本地优先，在线兜底）
+
+飞牛库里没有的歌，可以接到在线音源。默认**关闭**，设置 `GW_FALLBACK_URLS` 才启用：
+
+```bash
+# 单源：type@url；type 省略时按端口推断
+GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768"
+# 多源逗号分隔，按顺序探测（/healthz 不通的自动跳过）
+GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768,lxmusic@http://127.0.0.1:8772"
+```
+
+上游就是 [fnos_music_ext](https://github.com/12hgl/fnos_music_ext)（或自建 fork）的**音源容器**，
+端口与类型对应：musicdl `8768→8001`、musicbox `8770→8002`、lxmusic `8772→8003`、neteasefree `8776→8005`。
+`/healthz` 的 `fallback` 字段会列出当前配置的源。
+
+行为：
+
+- **搜索**：本地曲库结果优先；条数不够才追加在线结果，并按「歌名+歌手」跨源去重。
+  在线结果的 `guid` 形如 `ext:<svc>:<原始 id>`，`source` 标明来自哪个源。
+- **播放**：`/api/play` / MCP `music_play` 对在线歌曲同样出签名直链，`source` 为在线源名；
+  网关按需拉流 → ffmpeg 转 MP3 → 落缓存，设备端无感。
+- **试听识别**：转码后时长 < `GW_PREVIEW_MIN_SECONDS`（默认 35 秒）判为试听片段，
+  `preview=true`、`duration=N`，`music_play` 会提示「这是试听片段，想听完整版就说收藏」。
+- **收藏即下载**：对在线歌曲 `music_favorite(action=add)` 会按源给的最高音质原样落到
+  `GW_DOWNLOAD_DIR`（指向飞牛曲库目录），文件名 `歌名 - 歌手.<flac|mp3>`；
+  配了 `GW_LIBRARY_SCAN_CMD` 就顺手触发曲库扫描，之后这首歌就走本地库了。
+- **歌词**：在线源自带歌词优先（musicdl `/info`、lx `/api/v1/track/lyric`、其余 `/api/v1/song/{id}/lyric`），
+  没有再回退 LRCLIB，仍然走同一套签名 `/lyrics/` 直链。
+
+注意：在线源的 `id` 有 TTL（进程内存缓存），解析失败时网关会用「歌名+歌手」重搜一次；
+单源同一时刻通常只能跑一个（supervisor 互斥），多源配置时靠 `/healthz` 探测选活的。
+
 ## 心情映射
 
 飞牛 API 没有 genre/mood 维度，只有 `/search/track?q=`。所以心情靠 `data/moods.json`
@@ -332,7 +370,8 @@ curl -s "<上一步的 lyric_url>" | head -3   # 期望 [00:29.36] 故事的小�
 | 真实模式缺账号 | `/healthz` 200 且 `provider_error` 说明原因，`/api/play` 500 带同一错误，不崩 |
 | Docker 镜像构建 | 成功：alpine 261 MB / debian 805 MB，均带 HEALTHCHECK |
 | 容器内跑通（bridge + 端口映射） | `/healthz` healthy；容器内 ffmpeg 8.1.3 含 libmp3lame，直链 200 / 65245 字节；缓存落到 `/data/cache` |
-| `tests/test_gateway.py`（26 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片 |
+| `tests/test_gateway.py`（44 用例） | 全绿：签名/过期/篡改、直链下载与 Range 206、MCP initialize+9 工具+call_tool、空 q / 坏 limit / 坏 action → 400、`/playlists` → 404、转码不留残片、多音源兜底（guid/端口推断/本地优先去重/ext 流路由/试听时长/收藏下载） |
+| 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`（source=musicdl）；`/api/play` → source/preview=true/duration=4.0；直链 200 / 65244 字节；MCP `music_favorite` 落盘 `歌名 - 歌手.bin` |
 | `/healthz` 与 `/readyz` | 前者只报进程存活，后者真探曲库；NAS 异常时 `/readyz` 返回 503 |
 | `GW_PUBLIC_PORT` 公网面 | `/play/...` 200 / Range 206 / HEAD 200、`/lyrics/...` 200 text/plain；`/healthz`、`/readyz`、`/api/*`、`POST /mcp`、`DELETE /mcp` 全部 404；`GW_PORT` 管理面不受影响 |
 | 歌词链路（真实 LRCLIB） | `/api/play?query=晴天` → `lyric_url`；拉取 200 `text/plain; charset=utf-8`，首行 `[00:29.36] 故事的小黃花`（带 LRC 时间戳，固件才认） |

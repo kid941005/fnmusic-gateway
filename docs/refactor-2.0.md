@@ -205,7 +205,7 @@ curl -s http://127.0.0.1:8766/healthz | python -m json.tool
 | 文件 | 改动 |
 |---|---|
 | app.py | 版本 2.0.0；删除旧 BadRequest/Mp3Cache/ExtProvider/FallbackProvider/TOOLS；改用 gwlib；新增 /api/sources、/api/storage、/api/quality、POST /api/download；/api/play 支持 quality；/play 读取 q |
-| tests/test_gateway.py | 44 → 51 用例，新增音质、缓存分键、新 REST、新 MCP 工具测试 |
+| tests/test_gateway.py | 44 → 53 用例，新增音质、缓存分键、新 REST、新 MCP 工具测试 |
 | Dockerfile / Dockerfile.debian | 增加 COPY gwlib/ ./gwlib/ |
 | docker-compose.yml / .full.yml / .slim.yml | 增加 GW_QUALITY_DEFAULT、GW_TEE_SAVE、GW_LIBRARY_MAX_BYTES |
 | examples/xiaozhi_plugin_fnmusic_gw.py | 播放参数增加 quality |

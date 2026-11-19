@@ -487,11 +487,13 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 51 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
+python tests/test_gateway.py -v   # 53 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
 `test_gateway.py` 进程内起服务，不需要 NAS 也不需要 Docker；有 ffmpeg 时还会验转码缓存不留残片。
+
+分级验收记录见 [docs/acceptance-2.0.md](docs/acceptance-2.0.md)（P0→P2 逐项自测与结论）。
 
 ### 已验证（2026-11-19，mock + 真实 LRCLIB）
 
@@ -508,7 +510,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（51 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（53 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
 
 真实飞牛曲库仍需在 NAS 同网段按上面的「直链自测」验收一次（开发机到 `192.168.50.100:59820` 不通）。
 
@@ -532,7 +534,8 @@ fnmusic_client.py         飞牛音乐客户端
 bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
-tests/                    test_gateway.py（51 用例）、bridge_selftest.py
+docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
+tests/                    test_gateway.py（53 用例）、bridge_selftest.py
 docker-compose.yml        单网关（host 网络）
 docker-compose.full.yml   网关 + 全量音源 + WebUI
 docker-compose.slim.yml   网关 + 轻量音源（只开 2 个端口）

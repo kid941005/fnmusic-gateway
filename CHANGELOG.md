@@ -12,7 +12,7 @@
   `GET /api/sources` / `GET /api/storage` / `GET /api/quality` / `POST /api/download`。
 - 在线播放支持边播边存（`GW_TEE_SAVE`），本地曲库容量上限 `GW_LIBRARY_MAX_BYTES`。
 - 新增环境变量 `GW_QUALITY_DEFAULT`、`GW_TEE_SAVE`、`GW_LIBRARY_MAX_BYTES`、`GW_SOURCES_SEARCH_PARALLEL`。
-- 测试 44 → **51 个用例**；Dockerfile 两份均复制 `gwlib/`；四份 compose 增加新环境变量。
+- 测试 44 → **53 个用例**（含换源重试、边播边存专项）；Dockerfile 两份均复制 `gwlib/`；四份 compose 增加新环境变量。
 - README 增加「2.0 的分层结构」与音质/存储配置表，接口速查更新为 12 个 MCP 工具。
 
 ## 1.5.0 (2026-11-19)

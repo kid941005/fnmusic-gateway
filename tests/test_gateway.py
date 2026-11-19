@@ -585,6 +585,66 @@ class TestV2Quality(unittest.TestCase):
         self.assertEqual(app.CACHE.key("g", "flac"), app.CACHE.key("g", "lossless"))
 
 
+class TestV2Playback(unittest.TestCase):
+    class _Cache:
+        def __init__(self, fail_first=False):
+            self.calls = []
+            self.fail_first = fail_first
+
+        def ensure(self, guid, provider, timeout=180, quality=None):
+            self.calls.append((guid, quality))
+            if self.fail_first and guid == "ext:musicdl:bad":
+                raise RuntimeError("bad stream")
+            return "fake.mp3"
+
+    class _Library:
+        def __init__(self):
+            self.saved = []
+
+        def enabled(self):
+            return True
+
+        def save_async(self, provider, track, quality=None):
+            self.saved.append((track["guid"], quality))
+            return True
+
+    class _Provider:
+        def search(self, q, limit=10):
+            return [{"guid": "ext:musicdl:bad", "title": "晴天", "artist": "周杰伦"},
+                    {"guid": "ext:musicdl:good", "title": "晴天", "artist": "周杰伦"}]
+
+        def stream(self, guid, quality=None):
+            return "audio/mpeg", b"x"
+
+    def _svc(self, cache=None, library=None):
+        return app.PlaybackService(
+            cache=cache or self._Cache(), library=library or self._Library(),
+            make_url=lambda b, g, ttl=None, quality=None: "http://x/play/%s?q=%s" % (g, quality),
+            lyric_url_for=lambda b, t, ttl=None: "",
+            audio_seconds=lambda p: 100.0, save_state=lambda s: None,
+            default_quality="standard", tee_save=True)
+
+    def test_tee_save_only_for_online_source(self):
+        lib = self._Library()
+        info = self._svc(library=lib).prepare(
+            {"guid": "ext:musicdl:e1", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
+            self._Provider(), "http://h")
+        self.assertTrue(info["saving"])
+        self.assertEqual(lib.saved, [("ext:musicdl:e1", "standard")])
+        info2 = self._svc(library=lib).prepare(
+            {"guid": "mock-1", "title": "晴天", "artist": "周杰伦"}, self._Provider(), "http://h")
+        self.assertFalse(info2["saving"])
+
+    def test_failover_reselects_source(self):
+        cache = self._Cache(fail_first=True)
+        info = self._svc(cache=cache).prepare(
+            {"guid": "ext:musicdl:bad", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
+            self._Provider(), "http://h")
+        self.assertEqual(info["guid"], "ext:musicdl:good")
+        self.assertEqual(cache.calls[0][0], "ext:musicdl:bad")
+        self.assertEqual(cache.calls[-1][0], "ext:musicdl:good")
+
+
 class TestV2Api(Base):
     def test_quality_and_storage_endpoints(self):
         r, d = self.req("GET", "/api/quality")

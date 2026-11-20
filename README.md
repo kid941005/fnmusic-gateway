@@ -137,21 +137,40 @@ docker compose -f docker-compose.slim.yml up -d
 ss -ltnp | grep -E '876[0-9]'      # 只应看到 8766 / 8767
 ~~~
 
-### 单端口版：只发布 1 个端口
+### 单端口版：只发布 1 个端口（推荐）
 
 参考 Songloft / 柠檬音乐的单端口形态：音源容器不映射任何宿主机端口，网关只发布 **8766**，管理接口与播放接口共用一个端口。管理接口由 `GW_ADMIN_TOKEN` 保护；`/play/`、`/lyrics/`、`/healthz` 保持匿名。
 
+**步骤 1：准备目录和配置**
+
 ~~~bash
-mkdir -p data sources-data
-chown -R 1000:1000 sources-data
-cp .env.example .env && chmod 600 .env
-# 生成管理令牌（单端口版必填）
+cd /path/to/fnmusic-gateway
+mkdir -p data sources-data music
+chown -R 1000:1000 data sources-data music
+cp .env.example .env
+chmod 600 .env
+~~~
+
+**步骤 2：设置管理令牌（必填）**
+
+~~~bash
 TOKEN=$(openssl rand -hex 24)
 sed -i "s/^GW_ADMIN_TOKEN=.*/GW_ADMIN_TOKEN=$TOKEN/" .env
-docker compose -f docker-compose.oneport.yml pull
-docker compose -f docker-compose.oneport.yml up -d
+# 没有 openssl 时可用：python3 -c 'import secrets;print(secrets.token_hex(24))'
+~~~
 
-ss -ltnp | grep 8766          # 只应看到 8766
+**步骤 3：一条命令启动（可直接复制）**
+
+~~~bash
+docker compose -f docker-compose.oneport.yml up -d
+~~~
+
+等价写法：先 `export COMPOSE_FILE=docker-compose.oneport.yml`，之后直接执行 `docker compose up -d`。
+
+**步骤 4：验证**
+
+~~~bash
+ss -ltnp | grep 8766          # 只应看到 8766，不应出现 8767/8768/8770/8772/8774
 curl -s 127.0.0.1:8766/healthz
 curl -s -H "X-Admin-Token: $TOKEN" 127.0.0.1:8766/api/quality
 ~~~

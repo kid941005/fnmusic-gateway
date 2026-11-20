@@ -12,6 +12,15 @@ FIELDS = {
     "fnos": ("base", "username", "password", "device_id", "insecure_tls"),
     # 兜底在线音源，逗号分隔的 type@url 列表
     "fallback": ("urls",),
+    # 网页「高级设置」写入的运行参数（值统一按字符串保存）
+    "advanced": (
+        "quality_default", "max_limit", "preview_min_seconds", "url_ttl",
+        "cache_max_mb", "library_max_mb", "transcode_concurrency",
+        "smart_search", "tee_save", "lyrics_enabled", "lrclib_url",
+        "lyrics_retry", "fallback_timeout", "fallback_search_limit",
+        "fallback_total_limit", "fallback_total_timeout", "fnos_timeout",
+        "mcp_timeout",
+    ),
 }
 
 

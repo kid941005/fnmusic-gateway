@@ -31,6 +31,13 @@ pre.bad{background:#450a0a;color:#fecaca}
 .fb-row{display:flex;gap:8px;margin-top:10px}
 .fb-row input{flex:1}
 .fb-row button{padding:7px 12px;font-size:13px;white-space:nowrap}
+.adv-group{font-size:13px;font-weight:600;color:#374151;margin:18px 0 8px;padding-top:14px;border-top:1px solid #eef0f3}
+.adv-group:first-of-type{border-top:0;padding-top:0;margin-top:6px}
+.adv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 14px}
+.adv-grid label{margin:0;font-size:12.5px}
+.adv-grid input,.adv-grid select{width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font:14px ui-monospace,monospace;background:#fff;color:#111}
+.adv-grid .check{margin-top:0;padding-top:22px}
+.adv-help{font-size:12px;color:#9ca3af;margin-top:4px}
 a{color:#2563eb}
 </style></head><body><main>
 <h1>网关设置 · 飞牛音乐</h1>
@@ -66,6 +73,52 @@ a{color:#2563eb}
   </div>
   <pre id="fbOut"></pre>
   <div class="meta">在线音源的平台/账号/脚本请到 <a href="/">音乐管理台</a> 里配置。</div>
+</div>
+
+<div class="card">
+  <div style="font-size:14px;font-weight:600;margin-bottom:4px">高级设置</div>
+  <div class="meta">保存后立即生效；端口、数据目录、GW_ADMIN_TOKEN 等启动参数仍需在 .env 里设置。</div>
+  <div class="adv-group">播放</div>
+  <div class="adv-grid">
+    <label>默认音质
+      <select id="adv_quality_default">
+        <option value="standard">标准 128k</option>
+        <option value="high">高 192k</option>
+        <option value="exhigh">极高 320k</option>
+        <option value="lossless">无损（下载优先）</option>
+      </select>
+    </label>
+    <label>搜索返回上限（首）<input id="adv_max_limit" type="number" min="1" max="500"></label>
+    <label>直链有效期（秒）<input id="adv_url_ttl" type="number" min="60" max="86400"></label>
+    <label>试听判定阈值（秒）<input id="adv_preview_min_seconds" type="number" min="1" max="3600"></label>
+    <label class="check"><input type="checkbox" id="adv_tee_save">边播边存到本地曲库</label>
+  </div>
+  <div class="adv-group">缓存与转码</div>
+  <div class="adv-grid">
+    <label>播放缓存上限（MB，0=不限）<input id="adv_cache_max_mb" type="number" min="0"></label>
+    <label>本地曲库上限（MB，0=不限）<input id="adv_library_max_mb" type="number" min="0"></label>
+    <label>同时转码数<input id="adv_transcode_concurrency" type="number" min="1" max="8"></label>
+  </div>
+  <div class="adv-group">搜索与歌词</div>
+  <div class="adv-grid">
+    <label class="check"><input type="checkbox" id="adv_smart_search">智能搜索（别名纠错 + 相关度）</label>
+    <label class="check"><input type="checkbox" id="adv_lyrics_enabled">启用歌词</label>
+    <label>LRCLIB 地址<input id="adv_lrclib_url" placeholder="https://lrclib.net/api/get 或 off"></label>
+    <label>歌词重试间隔（秒）<input id="adv_lyrics_retry" type="number" min="60"></label>
+  </div>
+  <div class="adv-group">音源与超时</div>
+  <div class="adv-grid">
+    <label>音源单请求超时（秒）<input id="adv_fallback_timeout" type="number" min="1" max="120"></label>
+    <label>单音源搜索条数<input id="adv_fallback_search_limit" type="number" min="1" max="50"></label>
+    <label>聚合搜索总条数<input id="adv_fallback_total_limit" type="number" min="1" max="500"></label>
+    <label>聚合搜索总超时（秒）<input id="adv_fallback_total_timeout" type="number" min="1" max="300"></label>
+    <label>飞牛音乐请求超时（秒）<input id="adv_fnos_timeout" type="number" min="3" max="120"></label>
+    <label>MCP 上游超时（秒）<input id="adv_mcp_timeout" type="number" min="30" max="3600"></label>
+  </div>
+  <div class="row">
+    <button class="primary" id="advSave">保存高级设置</button>
+  </div>
+  <pre id="advOut"></pre>
 </div>
 </main>
 <script>
@@ -165,6 +218,42 @@ a{color:#2563eb}
       }).catch(function(e){ showAt($('fbOut'), false, String(e)); })
       .then(function(){ btn.disabled = false; btn.textContent = '测试'; });
   }
+  var ADV_TEXT = ['lrclib_url'];
+  var ADV_CHECK = ['tee_save','smart_search','lyrics_enabled'];
+  var ADV_NUMBER = ['max_limit','url_ttl','preview_min_seconds','cache_max_mb',
+                    'library_max_mb','transcode_concurrency','lyrics_retry',
+                    'fallback_timeout','fallback_search_limit','fallback_total_limit',
+                    'fallback_total_timeout','fnos_timeout','mcp_timeout'];
+  function advFill(d){
+    $('adv_quality_default').value = d.quality_default || 'standard';
+    ADV_CHECK.forEach(function(k){ $('adv_' + k).checked = !!d[k]; });
+    ADV_NUMBER.forEach(function(k){ $('adv_' + k).value = (d[k] === undefined ? '' : d[k]); });
+    ADV_TEXT.forEach(function(k){ $('adv_' + k).value = d[k] || ''; });
+  }
+  function advLoad(){
+    fetch('/api/settings/advanced', {credentials:'same-origin'})
+      .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(advFill)
+      .catch(function(e){ showAt($('advOut'), false, '读取高级设置失败：' + e); });
+  }
+  $('advSave').onclick = function(){
+    var btn = this; btn.disabled = true;
+    var body = {quality_default: $('adv_quality_default').value};
+    ADV_CHECK.forEach(function(k){ body[k] = $('adv_' + k).checked; });
+    ADV_NUMBER.forEach(function(k){
+      var v = parseInt($('adv_' + k).value, 10);
+      body[k] = isNaN(v) ? 0 : v;
+    });
+    ADV_TEXT.forEach(function(k){ body[k] = $('adv_' + k).value.trim(); });
+    fetch('/api/settings/advanced', {method:'PUT', credentials:'same-origin',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+      .then(function(r){ return r.json().then(function(d){ return [r.status, d]; }); })
+      .then(function(pair){
+        if (pair[0] === 200) { advFill(pair[1]); showAt($('advOut'), true, '已保存，运行参数已立即生效'); }
+        else { showAt($('advOut'), false, '保存失败：' + JSON.stringify(pair[1])); }
+      }).catch(function(e){ showAt($('advOut'), false, String(e)); })
+      .then(function(){ btn.disabled = false; });
+  };
   $('fbAdd').onclick = function(){ fbRows.push(''); renderFb(); };
   $('fbSave').onclick = function(){
     var btn = this; btn.disabled = true;
@@ -179,6 +268,7 @@ a{color:#2563eb}
       .then(function(){ btn.disabled = false; });
   };
   load();
+  advLoad();
 })();
 </script></body></html>
 """

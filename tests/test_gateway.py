@@ -603,6 +603,74 @@ class TestFnSettings(Base):
             srv.server_close()
 
 
+class TestAdvancedSettings(Base):
+    """高级设置：运行参数写入 config.json 并立即作用到全局/服务对象。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._old_token = app.ADMIN_TOKEN
+        cls._old_cfg = app.FNOS_CONFIG
+        cls.tmp = tempfile.mkdtemp(prefix="gwadv-http-")
+        app.ADMIN_TOKEN = "tok-adv"
+        app.FNOS_CONFIG = gw_config.ConfigStore(os.path.join(cls.tmp, "config.json"))
+
+    @classmethod
+    def tearDownClass(cls):
+        app.ADMIN_TOKEN = cls._old_token
+        app.FNOS_CONFIG = cls._old_cfg
+        app.apply_advanced_settings()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+        super().tearDownClass()
+
+    def _h(self):
+        return {"X-Admin-Token": "tok-adv"}
+
+    def test_advanced_requires_auth(self):
+        r, _ = self.req("GET", "/api/settings/advanced")
+        self.assertEqual(r.status, 401)
+
+    def test_advanced_roundtrip_applies_hot(self):
+        body = {"quality_default": "high", "max_limit": 30, "url_ttl": 600,
+                "cache_max_mb": 32, "library_max_mb": 64,
+                "transcode_concurrency": 3, "smart_search": False,
+                "tee_save": False, "lyrics_enabled": False,
+                "lrclib_url": "off", "lyrics_retry": 120,
+                "fallback_timeout": 5, "fallback_search_limit": 6,
+                "fallback_total_limit": 20, "fallback_total_timeout": 10,
+                "fnos_timeout": 8, "mcp_timeout": 120}
+        r, resp = self.req("PUT", "/api/settings/advanced", body=body, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(resp["quality_default"], "high")
+        self.assertEqual(resp["max_limit"], 30)
+        # 全局与服务对象都已生效
+        self.assertEqual(app.QUALITY_DEFAULT, "high")
+        self.assertEqual(app.MAX_LIMIT, 30)
+        self.assertEqual(app.URL_TTL, 600)
+        self.assertEqual(app.CACHE.max, 32 * 1024 ** 2)
+        self.assertEqual(app.LIBRARY.max_bytes, 64 * 1024 ** 2)
+        self.assertEqual(app.TRANSCODE_CONCURRENCY, 3)
+        self.assertEqual(app.PLAYBACK.default_quality, "high")
+        self.assertEqual(app.PLAYBACK.ttl, 600)
+        self.assertFalse(app.SMART_SEARCH)
+        self.assertFalse(app.TEE_SAVE)
+        self.assertFalse(app.LYRICS_ENABLED)
+        self.assertEqual(app.LRCLIB_URL, "")
+        self.assertEqual(app.FNOS_TIMEOUT, 8)
+        self.assertEqual(app.MCP_BRIDGE.timeout, 120)
+        self.assertEqual(app.FNOS_CONFIG.section("advanced").get("max_limit"), "30")
+        r, got = self.req("GET", "/api/settings/advanced", headers=self._h())
+        self.assertEqual(got["cache_max_mb"], 32)
+        self.assertEqual(got["lrclib_url"], "")
+
+    def test_advanced_rejects_bad_values(self):
+        for body in ({"quality_default": "bogus"}, {"max_limit": 0},
+                     {"mcp_timeout": 5}, {"lrclib_url": "ftp://x"},
+                     {"transcode_concurrency": "abc"}):
+            r, _ = self.req("PUT", "/api/settings/advanced", body=body, headers=self._h())
+            self.assertEqual(r.status, 400, body)
+
+
 class TestRanking(unittest.TestCase):
     """搜索排序 + alias 单测（不启服务）。"""
 

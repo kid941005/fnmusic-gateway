@@ -9,7 +9,11 @@
 - 设置页新增「使用自签 HTTPS 证书（跳过证书校验）」开关，存 `/data/config.json` 的 `fnos.insecure_tls`，运行期即时生效；`GW_FNOS_INSECURE_TLS` 仅作首次默认。
 - 设置页新增兜底音源编辑器：可增删改 `GW_FALLBACK_URLS` 列表、逐条「测试」探活，保存后立即热重建 provider。
 - 新增 REST：`GET/PUT /api/settings/fallback`、`POST /api/settings/fallback/test`；配置存 `/data/config.json` 的 `fallback.urls`，环境变量 `GW_FALLBACK_URLS` 仅作兜底。
-- 版本 2.5.0 → **2.6.0**；测试 84 → **89** 个用例（删除心情用例，新增 TLS 开关、兜底音源增删改/校验/逐条测试）。
+### 新功能：设置页高级参数（运行期热生效）
+- 设置页新增「高级设置」卡片：默认音质、搜索上限、直链有效期、试听阈值、边播边存、播放缓存/本地曲库上限、转码并发、智能搜索、歌词开关/LRCLIB 地址/重试间隔、音源/飞牛/MCP 超时。
+- 新增 REST：`GET/PUT /api/settings/advanced`；值存 `/data/config.json` 的 `advanced` 段，保存后同步模块全局与已创建的缓存/播放/桥接对象，无需重启。
+- 环境变量仍作首次启动默认值；端口、路径、`GW_ADMIN_TOKEN` 等启动/安全参数不进入网页。
+- 版本 2.5.0 → **2.6.0**；测试 84 → **92** 个用例（删除心情用例，新增 TLS 开关、兜底音源增删改/校验/逐条测试、高级参数读写与热生效/非法值校验）。
 
 ## 2.5.0 (2026-11-20)
 

@@ -156,6 +156,162 @@ LIBRARY_MAX_BYTES = _env_int("GW_LIBRARY_MAX_BYTES", 0)
 SMART_SEARCH = _env_bool("GW_SMART_SEARCH", True)
 ALIASES_FILE = _env("GW_ALIASES_FILE", os.path.join(DATA_DIR, "music_aliases.json"))
 
+# ---------------------------------------------------------------- 高级设置
+_MIB = 1024 * 1024
+# 网页「高级设置」可在线调整的运行参数；环境变量只作为首次启动默认值。
+# 注意：端口、路径、GW_ADMIN_TOKEN 等启动参数不在此列，仍需在 .env 里设置。
+ADVANCED_SPEC = {
+    "quality_default": {
+        "label": "默认音质", "kind": "enum",
+        "values": ["standard", "high", "exhigh", "lossless"],
+        "default": QUALITY_DEFAULT, "help": "standard/high/exhigh/lossless",
+    },
+    "max_limit": {"label": "搜索返回上限", "kind": "int", "default": MAX_LIMIT,
+                  "min": 1, "max": 500, "unit": "首"},
+    "preview_min_seconds": {"label": "试听判定阈值", "kind": "int",
+                            "default": PREVIEW_MIN_SECONDS, "min": 1, "max": 3600, "unit": "秒"},
+    "url_ttl": {"label": "直链有效期", "kind": "int", "default": URL_TTL,
+                "min": 60, "max": 86400, "unit": "秒"},
+    "cache_max_mb": {"label": "播放缓存上限", "kind": "int", "default": CACHE_MAX // _MIB,
+                     "min": 0, "max": 1048576, "unit": "MB", "help": "0 表示不限制"},
+    "library_max_mb": {"label": "本地曲库上限", "kind": "int", "default": LIBRARY_MAX_BYTES // _MIB,
+                       "min": 0, "max": 1048576, "unit": "MB", "help": "0 表示不限制"},
+    "transcode_concurrency": {"label": "同时转码数", "kind": "int",
+                              "default": TRANSCODE_CONCURRENCY, "min": 1, "max": 8, "unit": "个"},
+    "smart_search": {"label": "智能搜索（别名纠错 + 相关度）", "kind": "bool", "default": SMART_SEARCH},
+    "tee_save": {"label": "边播边存到本地曲库", "kind": "bool", "default": TEE_SAVE},
+    "lyrics_enabled": {"label": "启用歌词", "kind": "bool", "default": LYRICS_ENABLED},
+    "lrclib_url": {"label": "LRCLIB 地址", "kind": "str", "default": LRCLIB_URL,
+                   "help": "留空或 off 表示关闭在线歌词检索"},
+    "lyrics_retry": {"label": "歌词重试间隔", "kind": "int", "default": LYRICS_RETRY,
+                     "min": 60, "max": 31536000, "unit": "秒"},
+    "fallback_timeout": {"label": "音源单请求超时", "kind": "int",
+                         "default": FALLBACK_TIMEOUT, "min": 1, "max": 120, "unit": "秒"},
+    "fallback_search_limit": {"label": "单音源搜索条数", "kind": "int",
+                              "default": FALLBACK_SEARCH_LIMIT, "min": 1, "max": 50, "unit": "首"},
+    "fallback_total_limit": {"label": "聚合搜索总条数", "kind": "int",
+                             "default": FALLBACK_TOTAL_LIMIT, "min": 1, "max": 500, "unit": "首"},
+    "fallback_total_timeout": {"label": "聚合搜索总超时", "kind": "int",
+                               "default": FALLBACK_TOTAL_TIMEOUT, "min": 1, "max": 300, "unit": "秒"},
+    "fnos_timeout": {"label": "飞牛音乐请求超时", "kind": "int",
+                     "default": FNOS_TIMEOUT, "min": 3, "max": 120, "unit": "秒"},
+    "mcp_timeout": {"label": "MCP 上游超时", "kind": "int",
+                    "default": MCP_TIMEOUT, "min": 30, "max": 3600, "unit": "秒"},
+}
+_ADV_DEFAULTS = {k: v["default"] for k, v in ADVANCED_SPEC.items()}
+
+
+def _adv_parse(key, value):
+    """把网页/配置文件里的字符串值按类型校验，返回 Python 值。"""
+    spec = ADVANCED_SPEC[key]
+    kind = spec["kind"]
+    if kind == "bool":
+        return value if isinstance(value, bool) else _truthy(value)
+    if kind == "int":
+        if isinstance(value, bool):
+            raise BadRequest("%s 必须是整数" % spec["label"])
+        try:
+            n = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise BadRequest("%s 必须是整数" % spec["label"])
+        if n < spec["min"] or n > spec["max"]:
+            raise BadRequest("%s 需在 %d~%d 之间" % (spec["label"], spec["min"], spec["max"]))
+        return n
+    if kind == "enum":
+        v = str(value or "").strip().lower()
+        if v not in spec["values"]:
+            raise BadRequest("%s 取值必须是 %s" % (spec["label"], "/".join(spec["values"])))
+        return v
+    v = str(value or "").strip()
+    if key == "lrclib_url":
+        if v.lower() in ("off", "none", "-"):
+            return ""
+        if v and not re.match(r"^https?://", v):
+            raise BadRequest("LRCLIB 地址必须以 http:// 或 https:// 开头，留空或 off 表示关闭")
+        return v.rstrip("/")
+    return v
+
+
+def _adv_store_value(key, value):
+    kind = ADVANCED_SPEC[key]["kind"]
+    if kind == "bool":
+        return "1" if value else "0"
+    if kind == "str" and not value:
+        return "off"  # ConfigStore 用空串表示删除，这里用 off 表示显式关闭
+    return str(value)
+
+
+def advanced_settings():
+    """高级设置：data/config.json 优先，环境变量默认值兜底。"""
+    out = dict(_ADV_DEFAULTS)
+    cfg = FNOS_CONFIG.section("advanced")
+    for key in ADVANCED_SPEC:
+        raw = cfg.get(key)
+        if raw is None:
+            continue
+        try:
+            out[key] = _adv_parse(key, raw)
+        except BadRequest:
+            pass
+    return out
+
+
+def apply_advanced_settings():
+    """把高级设置同步到模块全局与已创建的服务对象，做到保存即生效。"""
+    global URL_TTL, MAX_LIMIT, TRANSCODE_CONCURRENCY, LYRICS_ENABLED, LRCLIB_URL
+    global LYRICS_RETRY, FALLBACK_TIMEOUT, FALLBACK_SEARCH_LIMIT, FALLBACK_TOTAL_LIMIT
+    global FALLBACK_TOTAL_TIMEOUT, FNOS_TIMEOUT, PREVIEW_MIN_SECONDS, QUALITY_DEFAULT
+    global TEE_SAVE, SMART_SEARCH
+    vals = advanced_settings()
+    URL_TTL = vals["url_ttl"]
+    MAX_LIMIT = vals["max_limit"]
+    TRANSCODE_CONCURRENCY = vals["transcode_concurrency"]
+    LYRICS_ENABLED = vals["lyrics_enabled"]
+    LRCLIB_URL = vals["lrclib_url"]
+    LYRICS_RETRY = vals["lyrics_retry"]
+    FALLBACK_TIMEOUT = vals["fallback_timeout"]
+    FALLBACK_SEARCH_LIMIT = vals["fallback_search_limit"]
+    FALLBACK_TOTAL_LIMIT = vals["fallback_total_limit"]
+    FALLBACK_TOTAL_TIMEOUT = vals["fallback_total_timeout"]
+    FNOS_TIMEOUT = vals["fnos_timeout"]
+    PREVIEW_MIN_SECONDS = vals["preview_min_seconds"]
+    QUALITY_DEFAULT = vals["quality_default"]
+    TEE_SAVE = vals["tee_save"]
+    SMART_SEARCH = vals["smart_search"]
+    cache = globals().get("CACHE")
+    if cache is not None:
+        cache.max = vals["cache_max_mb"] * _MIB
+        cache._slots = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
+    library = globals().get("LIBRARY")
+    if library is not None:
+        library.max_bytes = vals["library_max_mb"] * _MIB
+    playback = globals().get("PLAYBACK")
+    if playback is not None:
+        playback.default_quality = QUALITY_DEFAULT
+        playback.ttl = URL_TTL
+        playback.preview_min_seconds = PREVIEW_MIN_SECONDS
+        playback.tee_save = TEE_SAVE
+    bridge = globals().get("MCP_BRIDGE")
+    if bridge is not None:
+        bridge.timeout = vals["mcp_timeout"]
+    return vals
+
+
+def save_advanced_settings(patch):
+    """写 config.json 的 advanced 段并热应用；只处理提交上来的字段。"""
+    if not isinstance(patch, dict):
+        raise BadRequest("请求体必须是对象")
+    store = {}
+    for key, raw in patch.items():
+        if key not in ADVANCED_SPEC:
+            continue
+        store[key] = _adv_store_value(key, _adv_parse(key, raw))
+    if store:
+        FNOS_CONFIG.update("advanced", store)
+    apply_advanced_settings()
+    reset_provider()  # 超时/条数变化后按新配置重建 provider
+    return advanced_settings()
+
 
 def _log_level(name):
     return getattr(logging, str(name or "INFO").strip().upper(), logging.INFO)
@@ -448,8 +604,11 @@ def save_state(d):
 
 
 # ---------------------------------------------------------------- 转码缓存
-CACHE = MediaCache(CACHE_DIR, CACHE_MAX, LOG, transcode_slots=_TRANSCODE_SLOTS)
-LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG, max_bytes=LIBRARY_MAX_BYTES)
+_ADV_BOOT = advanced_settings()
+CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
+                   transcode_slots=_TRANSCODE_SLOTS)
+LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG,
+                       max_bytes=_ADV_BOOT["library_max_mb"] * _MIB)
 
 
 # ---------------------------------------------------------------- provider
@@ -859,9 +1018,11 @@ def lyric_url_for(base, track, ttl=None):
 
 
 PLAYBACK = PlaybackService(CACHE, LIBRARY, make_url, lyric_url_for, audio_seconds,
-                           save_state, default_quality=QUALITY_DEFAULT, ttl=URL_TTL,
-                           prewarm=PREWARM, preview_min_seconds=PREVIEW_MIN_SECONDS,
-                           tee_save=TEE_SAVE)
+                           save_state, default_quality=_ADV_BOOT["quality_default"],
+                           ttl=_ADV_BOOT["url_ttl"], prewarm=PREWARM,
+                           preview_min_seconds=_ADV_BOOT["preview_min_seconds"],
+                           tee_save=_ADV_BOOT["tee_save"])
+apply_advanced_settings()
 
 
 # ---------------------------------------------------------------- MCP 工具
@@ -1027,7 +1188,7 @@ def call_tool(name, args, base):
 # 对外仍走 8766 的 /mcp，官方 ASGI 应用只监听 127.0.0.1 随机端口。
 MCP_SERVICE = McpService(call_tool, VERSION,
                          lambda: PUBLIC_BASE or ("http://127.0.0.1:%d" % PORT), logger=LOG)
-MCP_BRIDGE = McpHttpBridge(MCP_SERVICE, timeout=MCP_TIMEOUT, logger=LOG)
+MCP_BRIDGE = McpHttpBridge(MCP_SERVICE, timeout=advanced_settings()["mcp_timeout"], logger=LOG)
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1233,6 +1394,15 @@ class Handler(BaseHTTPRequestHandler):
         reset_provider()
         return self._json({"ok": True, "token_cached": False})
 
+    def _handle_advanced_get(self):
+        return self._json(advanced_settings())
+
+    def _handle_advanced_put(self):
+        body = self._body()
+        vals = save_advanced_settings(body)
+        LOG.info("高级设置已更新：%s", json.dumps(vals, ensure_ascii=False))
+        return self._json(vals)
+
     def _handle_fallback_get(self):
         return self._json({"urls": fallback_urls(), "services": fallback_services()})
 
@@ -1437,6 +1607,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_settings_get()
             if path == "/api/settings/fallback":
                 return self._handle_fallback_get()
+            if path == "/api/settings/advanced":
+                return self._handle_advanced_get()
             if path == "/readyz":
                 # 就绪探针：真探一次数据面，音源全挂时回 503
                 return self._handle_readyz()
@@ -1589,12 +1761,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         u, _ = self._qs()
-        if u.path in ("/api/settings/fnos", "/api/settings/fallback"):
+        if u.path in ("/api/settings/fnos", "/api/settings/fallback", "/api/settings/advanced"):
             try:
                 if not self._admin_ok(u.path):
                     return self._unauthorized()
                 if u.path == "/api/settings/fallback":
                     return self._handle_fallback_put()
+                if u.path == "/api/settings/advanced":
+                    return self._handle_advanced_put()
                 return self._handle_settings_put()
             except GatewayError as e:
                 body, code = as_payload(e)

@@ -116,7 +116,7 @@ http://NAS_IP:8766/?token=<GW_ADMIN_TOKEN>
 `http://NAS_IP:8766/` 即可。WebUI 里的管理 API 由网关注入管理员身份，不需要在浏览器里手工加 Header。
 （上游管理台前端固化了 `/app/fnmusic-ext/static|api` 前缀，网关仍保留该前缀的反代供其资源与 API 使用，但浏览地址就是根路径。）
 
-### 网关设置（飞牛音乐 + 兜底音源）
+### 网关设置（飞牛音乐 + 兜底音源 + 高级参数）
 
 WebUI 首页右下角有「**网关设置 · 飞牛音乐**」入口，也可以直接访问 `http://NAS_IP:8766/settings`（首次带 `?token=<GW_ADMIN_TOKEN>` 换 Cookie）。页面上：
 
@@ -125,7 +125,8 @@ WebUI 首页右下角有「**网关设置 · 飞牛音乐**」入口，也可以
 - 点「保存」写入 `/data/config.json`（权限 0600），并立即生效，无需重启；
 - 勾选「**使用自签 HTTPS 证书**」可跳过证书校验（内网自签场景）；
 - 点「清除登录令牌」删掉缓存 token（换账号或密码后建议清一次）；
-- 「**兜底在线音源**」卡片可增删改音源列表（格式 `类型@地址`），每条可单独「测试」探活，保存后立即热重建，无需重启。
+- 「**兜底在线音源**」卡片可增删改音源列表（格式 `类型@地址`），每条可单独「测试」探活，保存后立即热重建，无需重启；
+- 「**高级设置**」卡片可在线调整默认音质、搜索上限、直链有效期、试听阈值、边播边存、缓存/曲库上限、转码并发、智能搜索、歌词开关与 LRCLIB 地址、歌词重试间隔、各音源/飞牛/MCP 超时。保存写入 `/data/config.json` 的 `advanced` 段，并立即作用到运行中的服务对象。
 
 配置优先级：网页保存的值 > 环境变量 `GW_FNOS_*` / `GW_FALLBACK_URLS`。密码只保存在本地，接口只回 `password_set`，保存时留空表示不修改。
 没配飞牛时，网关自动用「兜底在线音源」播放。
@@ -154,6 +155,9 @@ docker compose up -d
 ## 环境变量
 
 > `docker-compose.yml` 只透传常用几项（令牌、WebUI 上游、飞牛账号、兜底音源、下载目录）。下面其它参数都有默认值，需要调时把它们加到 compose 的 `environment` 里即可。
+>
+> 其中**运行参数**也可以直接在网页 `/settings` 的「高级设置」里改，保存即生效，不需要改 compose：`GW_QUALITY_DEFAULT`、`GW_MAX_LIMIT`、`GW_URL_TTL`、`GW_PREVIEW_MIN_SECONDS`、`GW_TEE_SAVE`、`GW_CACHE_MAX_BYTES`、`GW_LIBRARY_MAX_BYTES`、`GW_TRANSCODE_CONCURRENCY`、`GW_SMART_SEARCH`、`GW_LYRICS`、`GW_LRCLIB_URL`、`GW_LYRICS_RETRY`、`GW_FALLBACK_TIMEOUT`、`GW_FALLBACK_SEARCH_LIMIT`、`GW_FALLBACK_TOTAL_LIMIT`、`GW_FALLBACK_TOTAL_TIMEOUT`、`GW_FNOS_TIMEOUT`、`GW_MCP_TIMEOUT`。环境变量只作首次启动默认值。
+> 端口、路径、`GW_ADMIN_TOKEN` 等启动/安全参数仍只能走环境变量。
 
 ### 网关与缓存
 
@@ -451,6 +455,8 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | GET | `/api/settings/fallback` | 读取兜底音源列表 |
 | PUT | `/api/settings/fallback` | 保存兜底音源（body `{"urls":["musicdl@http://host:8001"]}`），立即热重建 provider |
 | POST | `/api/settings/fallback/test` | 逐条测试音源（body `{"spec":"musicdl@http://host:8001"}`），返回 `{ok,ms,service\|error}` |
+| GET | `/api/settings/advanced` | 读取高级运行参数（config 优先，环境变量默认） |
+| PUT | `/api/settings/advanced` | 保存高级运行参数并立即生效（只提交需要改的字段） |
 | POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid`）；在线歌曲 add 时按最高音质下载到本地下载目录 |
 | POST | `/api/warm` | body `{"guid":"...","quality":"high"}`，预转码到缓存 |
 | POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地下载目录 |
@@ -498,7 +504,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 89 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/飞牛设置持久化与测试连接/自签证书开关/兜底音源增删改与逐条测试/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 92 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/飞牛设置持久化与测试连接/自签证书开关/兜底音源增删改与逐条测试/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -522,7 +528,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（89 用例，含官方 MCPServer 2.3、管理令牌、飞牛设置页与纯在线回退） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、飞牛配置读写/测试连接/登出、自签证书开关、兜底音源增删改与逐条测试、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（92 用例，含官方 MCPServer 2.3、管理令牌、飞牛设置页与纯在线回退） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、飞牛配置读写/测试连接/登出、自签证书开关、兜底音源增删改与逐条测试、音质档位与缓存分键、新 REST |
 
 真实音源容器与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（默认 compose 里的 `fnmusic-sources` 只在内网监听，开发机直连不到；飞牛可在网页「网关设置」里点测试连接确认）。
 
@@ -547,6 +553,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（89 用例）、bridge_selftest.py
+tests/                    test_gateway.py（92 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 桥接器 + 音源 + 同端口 WebUI（只发布 8766）
 ~~~

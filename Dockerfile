@@ -10,7 +10,7 @@ COPY gwlib/ ./gwlib/
 COPY bridge/ ./bridge/
 
 # 接入小智 MCP 接入点（WebSocket）用的桥接器依赖
-RUN pip install --no-cache-dir "websockets>=13"
+RUN pip install --no-cache-dir "websockets>=13" "mcp>=2.3,<3"
 
 ENV PYTHONUNBUFFERED=1 \
     GW_DATA=/data \

@@ -165,6 +165,8 @@ class TestHttp(Base):
         self.assertEqual(r.status, 200)
         self.assertTrue(d["ok"])
         self.assertTrue(d["mock"])
+        self.assertIn("mcp_server", d)
+        self.assertEqual(d["mcp_server"]["engine"], "mcp>=2.3")
 
     def test_readyz(self):
         r, d = self.req("GET", "/readyz")
@@ -766,7 +768,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.0.1")
+        self.assertEqual(app.VERSION, "2.1.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

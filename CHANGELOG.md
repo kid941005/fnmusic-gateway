@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2.1.0 (2026-11-20)
+
+### 升级：MCP 服务层迁移到官方 MCPServer 2.3
+- 新增 `gwlib/mcp_server.py`：用官方 `mcp>=2.3` 的 `MCPServer`（原 FastMCP）注册 12 个工具，工具参数 Schema 继续复用 `gwlib/mcp_tools.build_tools()`，保留 enum / anyOf / 中文描述。
+- `/mcp` 改为反向代理官方 streamable-http 应用：官方应用只监听 `127.0.0.1` 随机端口，不新增对外端口，部署仍只有 8766/8767。
+- 保留内置 JSON-RPC 作为兜底：官方依赖缺失或内部服务启动失败时自动回退，`/healthz` 的 `mcp_server` 字段会显示 `available/engine/error`。
+- 新增环境变量 `GW_MCP_TIMEOUT`（默认 300 秒）；Dockerfile 与 Dockerfile.debian 增加 `mcp>=2.3,<3` 依赖。
+- 版本 2.0.1 → **2.1.0**；测试保持 66 个用例全绿，bridge_selftest 4 项 PASS。
+
 ## 2.0.1 (2026-11-20)
 
 ### 优化：流式落盘、锁回收、单版本常量与检索预算

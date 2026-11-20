@@ -56,6 +56,7 @@ from gwlib.sources import (FallbackProvider, is_ext_guid,
                            source_status)
 from gwlib.playback import PlaybackService
 from gwlib.mcp_tools import build_tools
+from gwlib.mcp_server import McpHttpBridge, McpService
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -101,6 +102,7 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
 HTTP_BODY_CAP = 1024 * 1024
 MCP_BODY_CAP = 4 * 1024 * 1024
+MCP_TIMEOUT = max(30, _env_int("GW_MCP_TIMEOUT", 300))
 _HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$")
 TRANSCODE_CONCURRENCY = max(1, _env_int("GW_TRANSCODE_CONCURRENCY", 2))
 
@@ -990,6 +992,13 @@ def call_tool(name, args, base):
     raise RuntimeError("未知工具：%s" % name)
 
 
+# 官方 MCPServer 2.3：工具注册/Schema/校验/错误包装由官方库负责；
+# 对外仍走 8766 的 /mcp，官方 ASGI 应用只监听 127.0.0.1 随机端口。
+MCP_SERVICE = McpService(call_tool, VERSION,
+                         lambda: PUBLIC_BASE or ("http://127.0.0.1:%d" % PORT), logger=LOG)
+MCP_BRIDGE = McpHttpBridge(MCP_SERVICE, timeout=MCP_TIMEOUT, logger=LOG)
+
+
 # ---------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
     server_version = "fnmusic-gateway/" + VERSION
@@ -1002,6 +1011,16 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or []):
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _raw(self, body, code=200, content_type="application/octet-stream", headers=None):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or []):
             self.send_header(k, v)
@@ -1064,6 +1083,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "fallback": fallback_services(),
                                    "quality_default": QUALITY_DEFAULT,
                                    "quality_profiles": describe_quality(),
+                                   "mcp_server": {"available": MCP_SERVICE.available,
+                                                  "engine": "mcp>=2.3",
+                                                  "error": str(MCP_SERVICE.import_error) if MCP_SERVICE.import_error else None},
                                    "cache_mb": round(self._cache_mb(), 1),
                                    "moods": sorted(MOODS.keys())})
             if path == "/readyz":
@@ -1364,6 +1386,54 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"jsonrpc": "2.0", "id": None,
                                "error": {"code": -32600, "message": "payload too large"}}, 413)
         raw = self.rfile.read(n) if n else b""
+        # 优先走官方 MCPServer 2.3 的 streamable-http；它只监听 127.0.0.1 随机端口。
+        headers = {
+            "Content-Type": self.headers.get("Content-Type") or "application/json",
+            "Accept": self.headers.get("Accept") or "application/json, text/event-stream",
+            "X-GW-Base": self._base(),
+        }
+        for key in ("Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID"):
+            value = self.headers.get(key)
+            if value:
+                headers[key] = value
+        try:
+            status, _reason, rhdrs, data = MCP_BRIDGE.request("POST", "/mcp", raw, headers)
+        except Exception as exc:
+            LOG.warning("官方 MCPServer 不可用，回退内置 JSON-RPC：%s", exc)
+            return self._handle_mcp_legacy(raw)
+
+        out_headers = []
+        has_session = False
+        for key, value in rhdrs:
+            lower = key.lower()
+            if lower in ("content-length", "transfer-encoding", "connection", "date", "server", "content-type"):
+                continue
+            if lower == "mcp-session-id":
+                has_session = True
+            out_headers.append((key, value))
+        # 官方 stateless 模式不返回会话 id；为了兼容既有客户端，initialize 补一个。
+        if not has_session:
+            try:
+                payload = json.loads(raw.decode("utf-8")) if raw else None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("method") == "initialize":
+                out_headers.append(("Mcp-Session-Id", uuid.uuid4().hex))
+        if not data.strip():
+            return self._empty(status)
+        ctype = "application/json"
+        for key, value in rhdrs:
+            if key.lower() == "content-type":
+                ctype = value
+                break
+        if "application/json" in ctype.lower():
+            try:
+                return self._json(json.loads(data.decode("utf-8")), status, out_headers)
+            except Exception:
+                pass
+        return self._raw(data, status, ctype, out_headers)
+
+    def _handle_mcp_legacy(self, raw):
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else None
         except Exception:

@@ -22,5 +22,13 @@ jobs:
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
-      - name: Gateway tests (mock, in-process)
+      # 先验证「没有 mcp 2.3」时的内置 JSON-RPC 兜底仍可用
+      - name: Gateway tests (legacy JSON-RPC fallback)
+        run: python tests/test_gateway.py -q
+
+      - name: Install official MCP SDK
+        run: python -m pip install "mcp>=2.3,<3"
+
+      # 再验证官方 MCPServer 2.3 路径
+      - name: Gateway tests (official MCPServer 2.3)
         run: python tests/test_gateway.py -v

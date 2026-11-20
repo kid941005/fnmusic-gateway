@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.0.1**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.1.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐（fnOS Music）→ 小智 的播放网关。**一个进程，两个出口**：
 
@@ -27,7 +27,8 @@
 - **多种接入**：12 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
 - **音质可选**：`standard / high / exhigh / lossless` 四档，设备始终拿 MP3，下载保留原始音质。
 - **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地曲库。
-- **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / mcp_tools 六层，新增音源或音质策略不改播放层与 MCP 层。
+- **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / mcp_tools / mcp_server 七层，新增音源或音质策略不改播放层与 MCP 层。
+- **官方 MCP 2.3**：`/mcp` 由官方 `mcp>=2.3` 的 `MCPServer`（原 FastMCP）提供工具注册、参数校验与错误包装，旧 JSON-RPC 仅在依赖缺失时兜底。
 
 ## 为什么需要这一层
 
@@ -36,7 +37,7 @@
 3. **设备要求 URL ≤ 2048 字节、仅 http/https、禁空白与 `@`** ⇒ 不能把签名参数塞一堆。
 4. 首次点播就转码并落盘缓存，`/api/play` 返回前预热，设备连上就能满速读。
 
-## 2.0 的分层结构
+## 2.x 的分层结构
 
 代码按职责拆成独立模块，互不越界；`app.py` 只做 HTTP/MCP 路由与装配：
 
@@ -48,6 +49,7 @@
 | `gwlib/sources.py` | 在线音源适配、探活、多源并行检索 | `ExtProvider` / `FallbackProvider` / `source_status` |
 | `gwlib/playback.py` | 选源→音质→缓存→直链→边播边存 | `PlaybackService.prepare` |
 | `gwlib/mcp_tools.py` | 12 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
+| `gwlib/mcp_server.py` | 官方 MCPServer 2.3 工具注册 + 回环 HTTP 桥 | `McpService` / `McpHttpBridge` |
 
 新增音源只需实现 `search/stream/lyrics` 并注册到 `sources.py`；新增音质只改 `quality.py` 的 `PROFILES`，播放层与 MCP 层无需改动。
 
@@ -84,17 +86,17 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 镜像与版本
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64` 并推到 GHCR。
-以 `v2.0.1` 为例，会生成 `2.0.1`、`2.0`、`latest`、`sha-xxxxxxx` 四个标签。
+以 `v2.1.0` 为例，会生成 `2.1.0`、`2.1`、`latest`、`sha-xxxxxxx` 四个标签。
 
 ~~~bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:2.0.1   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:2.1.0   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ~~~
 
 两份 compose 默认跟 `latest`；想锁定版本或换本地镜像时用 `GW_IMAGE` 覆盖：
 
 ~~~bash
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.0.1 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.1.0 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合本地 build
 ~~~
 
@@ -178,6 +180,7 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 | `GW_MAX_LIMIT` | 50 | 单次查询返回条数上限（LLM 传再大也会被收敛） |
 | `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把 NAS CPU 打满 |
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
+| `GW_MCP_TIMEOUT` | 300 | 网关转发到官方 MCPServer 内部回环服务的超时（秒） |
 
 ### 音质与本地存储
 
@@ -495,13 +498,14 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 
 `test_gateway.py` 进程内起服务，不需要 NAS 也不需要 Docker；有 ffmpeg 时还会验转码缓存不留残片。
 
-分级验收记录见 [docs/acceptance-2.0.md](docs/acceptance-2.0.md)（P0→P2 逐项自测与结论）；2026-11-19 全项目审计与修复记录见 [docs/audit-2026-11-19.md](docs/audit-2026-11-19.md)。
+分级验收记录见 [docs/acceptance-2.0.md](docs/acceptance-2.0.md)（P0→P2 逐项自测与结论）；2026-11-19 全项目审计与修复记录见 [docs/audit-2026-11-19.md](docs/audit-2026-11-19.md)；2026-11-20 MCP 服务层迁移到官方 MCPServer 2.3 见 [docs/migration-mcp-2.3.md](docs/migration-mcp-2.3.md)。
 
 ### 已验证（2026-11-19，mock + 真实 LRCLIB）
 
 | 项 | 结果 |
 |---|---|
 | 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 12 个工具、call_tool 正常 |
+| 2.1.0 官方 MCPServer 2.3（mock） | 内部 uvicorn 随机回环端口启动成功；initialize / tools-list / tools-call / notification / 坏 JSON 全通过；66 用例全绿 |
 | `/api/play?query=晴天` | 返回签名直链 + 预热 65244 字节 |
 | 直链下载 | 200，`ffprobe`：mp3 / 44100 / 2ch / 128000 |
 | 篡改 sig / 过期 | 403 |
@@ -512,7 +516,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（60 用例） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（66 用例，含官方 MCPServer 2.3 路径） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
 
 真实飞牛曲库仍需在 NAS 同网段按上面的「直链自测」验收一次（开发机到 `192.168.50.100:59820` 不通）。
 
@@ -531,13 +535,13 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 
 ~~~
 app.py                    网关主体（HTTP/MCP 路由 + 依赖装配）
-gwlib/                    分层模块：errors/quality/storage/sources/playback/mcp_tools
+gwlib/                    分层模块：errors/quality/storage/sources/playback/mcp_tools/mcp_server
 fnmusic_client.py         飞牛音乐客户端
 bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（60 用例）、bridge_selftest.py
+tests/                    test_gateway.py（66 用例）、bridge_selftest.py
 docker-compose.yml        单网关（host 网络）
 docker-compose.full.yml   网关 + 全量音源 + WebUI
 docker-compose.slim.yml   网关 + 轻量音源（只开 2 个端口）

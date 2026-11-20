@@ -5,7 +5,7 @@ FROM python:3.12-alpine
 RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
-COPY app.py ./
+COPY app.py fnmusic_client.py ./
 COPY gwlib/ ./gwlib/
 COPY bridge/ ./bridge/
 

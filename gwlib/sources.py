@@ -251,7 +251,7 @@ class ExtProvider:
 class FallbackProvider:
     """在线音源聚合器。
 
-    base=None 表示纯在线模式（不登录飞牛账号）：没有本地曲库、歌单和收藏，
+    base=None 表示没配飞牛音乐：没有本地曲库、歌单和收藏，
     相关方法直接给出明确提示；搜索、播放、下载全部走在线音源。
     传入 base 时保持旧行为：本地曲库优先，本地不足再并行问在线音源补齐。
     """
@@ -273,9 +273,9 @@ class FallbackProvider:
         )
 
     def _local(self):
-        """取本地后端；纯在线模式下抛 BadRequest 而不是 AttributeError。"""
+        """取本地后端；未配置飞牛音乐时抛 BadRequest 而不是 AttributeError。"""
         if self.base is None:
-            raise BadRequest("在线音源模式没有本地曲库/歌单/收藏；直接按歌名搜索即可")
+            raise BadRequest("未配置飞牛音乐：没有本地曲库/歌单/收藏，直接按歌名搜索即可")
         return self.base
 
     def list_tracks(self, limit=20):

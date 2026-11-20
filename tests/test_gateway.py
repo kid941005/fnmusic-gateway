@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
@@ -30,6 +31,7 @@ os.environ.pop("GW_PUBLIC_BASE", None)
 import app  # noqa: E402
 import gwlib.sources as gw_sources  # noqa: E402
 import gwlib.storage as gw_storage  # noqa: E402
+import gwlib.config as gw_config  # noqa: E402
 
 
 class Base(unittest.TestCase):
@@ -435,6 +437,102 @@ class TestWebUI(Base):
         r, body = self.req("GET", "/healthz")
         self.assertEqual(r.status, 200)
         self.assertTrue(body["webui"]["enabled"])
+
+
+class TestConfigStore(unittest.TestCase):
+    """运行期配置存储：读写、空值删除、字段白名单。"""
+
+    def test_roundtrip_and_delete(self):
+        tmp = tempfile.mkdtemp(prefix="gwcfg-")
+        try:
+            store = gw_config.ConfigStore(os.path.join(tmp, "config.json"))
+            self.assertEqual(store.section("fnos"), {})
+            store.update("fnos", {"base": "http://a", "username": "u", "password": "p"})
+            self.assertEqual(store.section("fnos")["base"], "http://a")
+            # 重载（模拟重启）
+            store.reload()
+            self.assertEqual(store.section("fnos")["username"], "u")
+            # 空字符串删除该键，未知字段被忽略
+            store.update("fnos", {"password": "", "evil": "x"})
+            sec = store.section("fnos")
+            self.assertNotIn("password", sec)
+            self.assertNotIn("evil", sec)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestFnSettings(Base):
+    """网关设置页/接口：飞牛音乐地址与账号的读写、连通测试、令牌清理。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._old_token = app.ADMIN_TOKEN
+        cls._old_cfg = app.FNOS_CONFIG
+        cls._old_tokfile = app.FNOS_TOKEN_FILE
+        cls.tmp = tempfile.mkdtemp(prefix="gwcfg-http-")
+        app.ADMIN_TOKEN = "tok-settings"
+        app.FNOS_CONFIG = gw_config.ConfigStore(os.path.join(cls.tmp, "config.json"))
+        app.FNOS_TOKEN_FILE = os.path.join(cls.tmp, "fnmusic_token.json")
+
+    @classmethod
+    def tearDownClass(cls):
+        app.ADMIN_TOKEN = cls._old_token
+        app.FNOS_CONFIG = cls._old_cfg
+        app.FNOS_TOKEN_FILE = cls._old_tokfile
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+        super().tearDownClass()
+
+    def _h(self):
+        return {"X-Admin-Token": "tok-settings"}
+
+    def test_settings_requires_auth(self):
+        r, _ = self.req("GET", "/api/settings/fnos")
+        self.assertEqual(r.status, 401)
+
+    def test_settings_roundtrip_masks_password(self):
+        r, body = self.req("PUT", "/api/settings/fnos",
+                           body={"base": "http://127.0.0.1:59820", "username": "kid",
+                                 "password": "secret-pw"}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body["configured"])
+        self.assertTrue(body["password_set"])
+        self.assertNotIn("password", body)
+        self.assertNotIn("secret-pw", json.dumps(body))
+        r, body = self.req("GET", "/api/settings/fnos", headers=self._h())
+        self.assertEqual(body["base"], "http://127.0.0.1:59820")
+        self.assertNotIn("password", body)
+        # 空密码表示保持不变
+        r, body = self.req("PUT", "/api/settings/fnos", body={"password": ""}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body["password_set"])
+
+    def test_settings_rejects_bad_base(self):
+        r, _ = self.req("PUT", "/api/settings/fnos", body={"base": "ftp://x"}, headers=self._h())
+        self.assertEqual(r.status, 400)
+
+    def test_settings_test_connection_reports_failure(self):
+        started = time.time()
+        r, body = self.req("POST", "/api/settings/fnos/test",
+                           body={"base": "http://127.0.0.1:1", "username": "kid",
+                                 "password": "x"}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertFalse(body["ok"])
+        self.assertTrue(body.get("error"))
+        self.assertLess(time.time() - started, 15)
+
+    def test_settings_page_renders(self):
+        r, data = self.req("GET", "/settings", headers=self._h(), raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn("网关设置".encode("utf-8"), data)
+
+    def test_logout_clears_cached_token(self):
+        path = app.FNOS_TOKEN_FILE
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        r, body = self.req("POST", "/api/settings/fnos/logout", body={}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertFalse(os.path.exists(path))
 
 
 class TestRanking(unittest.TestCase):
@@ -890,7 +988,7 @@ class TestAuditFixes(unittest.TestCase):
             app.FALLBACK_URLS = []
             try:
                 out = app.call_tool("music_sources", {}, "http://h")
-                self.assertIn("没有配置在线音源", out)
+                self.assertIn("没有配置任何音源", out)
             finally:
                 app.FALLBACK_URLS = old_urls
         finally:
@@ -925,7 +1023,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.4.1")
+        self.assertEqual(app.VERSION, "2.5.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

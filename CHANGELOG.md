@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2.5.0 (2026-11-20)
+
+### 新功能：飞牛音乐优先 + 网页设置
+- 恢复飞牛音乐作为首选音源：新增 `FnProvider` 与 `fnmusic_client.py`（token 存 `/data/fnmusic_token.json`，绑定 base 地址），搜索/歌单/收藏/播放优先走飞牛，`GW_FALLBACK_URLS` 里的在线音源只作兜底。
+- 新增网页「网关设置」页 `/settings`（同样受 `GW_ADMIN_TOKEN` 保护，`?token=` 换 Cookie）：填写飞牛地址、账号、密码、设备 ID，可「测试连接」「保存」「清除登录令牌」，并显示当前在线兜底列表；配置存 `/data/config.json`（0600）。
+- 新增 REST：`GET/PUT /api/settings/fnos`（密码只回 `password_set`，空密码表示不修改；base 必须 http(s)）、`POST /api/settings/fnos/test`（真实登录 + 试取 1 首）、`POST /api/settings/fnos/logout`。
+- WebUI 首页右下角注入「网关设置 · 飞牛音乐」入口链接。
+- `/healthz` 新增 `mode`（`mock` / `fnos` / `fnos+online` / `online`）与 `fnos: {configured, source, token_cached}`；`/readyz` 优先真连飞牛，失败再看在线兜底。
+- 凭据来源优先级：网页保存的 `/data/config.json` > 环境变量 `GW_FNOS_BASE` / `GW_FNOS_USER` / `GW_FNOS_PASS` / `GW_FNOS_DEVICE_ID`。
+- 版本 2.4.1 → **2.5.0**；测试 77 → **84** 个用例。
+
 ## 2.4.1 (2026-11-20)
 
 ### 变更：WebUI 改为根路径直达

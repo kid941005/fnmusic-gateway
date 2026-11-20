@@ -54,12 +54,17 @@ services:
       GW_TEE_SAVE: "${GW_TEE_SAVE:-true}"
       GW_LIBRARY_MAX_BYTES: "${GW_LIBRARY_MAX_BYTES:-0}"
       GW_SIGN_SECRET: "${GW_SIGN_SECRET:-}"
+      # 飞牛音乐（可选，优先级最高）。也可以在网页「网关设置」里填，配置存 ./data/config.json
+      GW_FNOS_BASE: "${GW_FNOS_BASE:-}"
+      GW_FNOS_USER: "${GW_FNOS_USER:-}"
+      GW_FNOS_PASS: "${GW_FNOS_PASS:-}"
+      GW_FNOS_TIMEOUT: "${GW_FNOS_TIMEOUT:-12}"
       GW_FALLBACK_URLS: "${GW_FALLBACK_URLS:-musicdl@http://fnmusic-sources:8001}"
       GW_DOWNLOAD_DIR: "${GW_DOWNLOAD_DIR:-/music}"
       GW_PREVIEW_MIN_SECONDS: "${GW_PREVIEW_MIN_SECONDS:-35}"
     volumes:
       - ./data:/data
-      # 本地曲库（下载/边播边存落盘）。右侧必须与 GW_DOWNLOAD_DIR 一致
+      # 本地下载目录（在线歌曲落盘/边播边存）。右侧必须与 GW_DOWNLOAD_DIR 一致
       - "${GW_MUSIC_DIR:-./music}:/music"
 
   fnmusic-bridge:

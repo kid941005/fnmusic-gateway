@@ -60,6 +60,8 @@ from gwlib.sources import (FallbackProvider, is_ext_guid,
 from gwlib.playback import PlaybackService
 from gwlib.mcp_tools import build_tools
 from gwlib.mcp_server import McpHttpBridge, McpService
+from gwlib.config import ConfigStore
+from gwlib.settings_page import SETTINGS_HTML
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -129,13 +131,20 @@ os.makedirs(LYRICS_DIR, exist_ok=True)
 
 # 在线音源（fnos_music_ext 音源容器）。格式：逗号分隔，每项 "type@http://host:port"
 # 或只写 URL（按端口猜类型：8768 musicdl / 8770 musicbox / 8772 lxmusic / 8776 neteasefree）。
-# 网关不登录任何音乐账号，只通过这些音源搜索/播放/下载；为空则启动后请求会明确报错。
+# 在线音源只在这些地址里搜索/播放/下载，作为飞牛音乐之外的兜底；为空则只走飞牛。
 FALLBACK_URLS = [x.strip() for x in (_env("GW_FALLBACK_URLS", "") or "").split(",") if x.strip()]
 FALLBACK_TIMEOUT = max(1, _env_int("GW_FALLBACK_TIMEOUT", 8))
 FALLBACK_SEARCH_LIMIT = max(1, _env_int("GW_FALLBACK_SEARCH_LIMIT", 10))
 FALLBACK_TOTAL_LIMIT = max(1, _env_int("GW_FALLBACK_TOTAL_LIMIT", MAX_LIMIT))
 FALLBACK_TOTAL_TIMEOUT = max(1, _env_int("GW_FALLBACK_TOTAL_TIMEOUT", 15))
 DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
+# 飞牛音乐（可选，优先级最高的音源）。地址/账号/密码优先读 data/config.json（网页「网关设置」写入），
+# 环境变量只作为首次启动的默认值。留空则只走 GW_FALLBACK_URLS 里的在线音源。
+FNOS_TOKEN_FILE = os.path.join(DATA_DIR, "fnmusic_token.json")
+FNOS_TIMEOUT = max(3, _env_int("GW_FNOS_TIMEOUT", 12))
+if _env_bool("GW_FNOS_INSECURE_TLS", False):
+    os.environ.setdefault("FNMUSIC_INSECURE_TLS", "1")
+FNOS_CONFIG = ConfigStore(os.path.join(DATA_DIR, "config.json"))
 PREVIEW_MIN_SECONDS = max(1, _env_int("GW_PREVIEW_MIN_SECONDS", 35))
 
 # 音质与存储策略
@@ -156,6 +165,7 @@ def _log_level(name):
 logging.basicConfig(level=_log_level(_env("GW_LOG_LEVEL", "INFO")),
                     format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("fnmusic-gw")
+FNOS_CONFIG.log = LOG
 
 # 同时最多几个 ffmpeg：防止多台设备同时点播把宿主机 CPU 打满
 _TRANSCODE_SLOTS = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
@@ -534,6 +544,91 @@ class MockProvider:
     def remove_favorite(self, guid):
         return None
 
+class FnProvider:
+    """飞牛音乐后端：登录 NAS 上的音乐服务，读写曲库/歌单/收藏。"""
+
+    def __init__(self, cfg=None):
+        from fnmusic_client import FnMusicClient
+        s = cfg or fnos_settings()
+        if not s.get("base"):
+            raise RuntimeError("未配置飞牛音乐地址")
+        self.client = FnMusicClient(
+            base=s["base"], username=s.get("username") or "",
+            password=s.get("password") or None,
+            device_id=s.get("device_id") or None,
+            token_file=FNOS_TOKEN_FILE, timeout=FNOS_TIMEOUT)
+        self.client.ensure_token()
+
+    def search(self, q, limit=10):
+        return dedupe(norm_track(t) for t in _rows(self.client.search_track(q, 1, limit)))
+
+    def list_tracks(self, limit=20):
+        return dedupe(norm_track(t) for t in _rows(self.client.track_list(1, limit)))
+
+    def playlists(self):
+        return [norm_playlist(p) for p in _rows(self.client.playlist_list(1, 200))]
+
+    def playlist_tracks(self, guid, limit=200):
+        return dedupe(norm_track(t) for t in _rows(self.client.playlist_tracks(guid, 1, limit)))
+
+    def albums(self, limit=20):
+        rows = _rows(self.client.album_list(1, limit))
+        return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
+
+    def artists(self, limit=20):
+        rows = _rows(self.client.artist_list(1, limit))
+        return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
+
+    def favorites(self, limit=100):
+        return dedupe(norm_track(t) for t in _rows(self.client.favorite_list(1, limit)))
+
+    def stream(self, guid):
+        return self.client.stream_bytes(guid)
+
+    def add_favorite(self, guid):
+        self.client.favorite_add(guid)
+
+    def remove_favorite(self, guid):
+        self.client.favorite_remove(guid)
+
+
+def fnos_settings():
+    """飞牛音乐连接配置：data/config.json 优先，环境变量兜底。"""
+    cfg = FNOS_CONFIG.section("fnos")
+    base = (cfg.get("base") or (_env("GW_FNOS_BASE", "") or "")).strip()
+    user = (cfg.get("username") or (_env("GW_FNOS_USER", "") or "")).strip()
+    pwd = cfg.get("password") or (_env("GW_FNOS_PASS", "") or "")
+    dev = (cfg.get("device_id") or (_env("GW_FNOS_DEVICE_ID", "") or "")).strip()
+    if cfg:
+        source = "config"
+    elif base or user or pwd:
+        source = "env"
+    else:
+        source = "none"
+    return {"base": base, "username": user, "password": pwd, "device_id": dev,
+            "source": source, "token_cached": os.path.exists(FNOS_TOKEN_FILE)}
+
+
+def fnos_configured():
+    s = fnos_settings()
+    return bool(s["base"] and s["username"] and (s["password"] or s["token_cached"]))
+
+
+def gateway_mode():
+    if MOCK:
+        return "mock"
+    if fnos_configured():
+        return "fnos+online" if FALLBACK_URLS else "fnos"
+    return "online"
+
+
+def reset_provider():
+    """配置变更后丢弃 provider 单例，下一次请求按新配置重建。"""
+    global _PROVIDER, _PROVIDER_ERR
+    with _PROVIDER_LOCK:
+        _PROVIDER = None
+        _PROVIDER_ERR = None
+
 
 _PROVIDER = None
 _PROVIDER_ERR = None
@@ -541,7 +636,7 @@ _PROVIDER_LOCK = threading.Lock()
 
 
 def provider():
-    """惰性单例。纯在线音源模式：不登录任何音乐账号，只连 GW_FALLBACK_URLS。"""
+    """惰性单例。飞牛音乐优先，GW_FALLBACK_URLS 的在线音源兜底。"""
     global _PROVIDER, _PROVIDER_ERR
     p = _PROVIDER
     if p is not None:
@@ -551,20 +646,27 @@ def provider():
             try:
                 if MOCK:
                     _PROVIDER = MockProvider()
-                elif FALLBACK_URLS:
-                    _PROVIDER = FallbackProvider(
-                        None, FALLBACK_URLS, timeout=FALLBACK_TIMEOUT,
-                        search_limit=FALLBACK_SEARCH_LIMIT,
-                        download_dir_getter=lambda: DOWNLOAD_DIR,
-                        max_bytes=LIBRARY_MAX_BYTES,
-                        parallel=SOURCE_SEARCH_PARALLEL,
-                        total_limit=FALLBACK_TOTAL_LIMIT,
-                        total_timeout=FALLBACK_TOTAL_TIMEOUT)
-                    LOG.info("online sources enabled: %s", ", ".join(fallback_services()))
                 else:
-                    raise RuntimeError(
-                        "未配置在线音源：请设置 GW_FALLBACK_URLS"
-                        "（如 musicdl@http://fnmusic-sources:8001）")
+                    base = None
+                    if fnos_configured():
+                        base = FnProvider()
+                        LOG.info("飞牛音乐已连接：%s", fnos_settings()["base"])
+                    if FALLBACK_URLS:
+                        _PROVIDER = FallbackProvider(
+                            base, FALLBACK_URLS, timeout=FALLBACK_TIMEOUT,
+                            search_limit=FALLBACK_SEARCH_LIMIT,
+                            download_dir_getter=lambda: DOWNLOAD_DIR,
+                            max_bytes=LIBRARY_MAX_BYTES,
+                            parallel=SOURCE_SEARCH_PARALLEL,
+                            total_limit=FALLBACK_TOTAL_LIMIT,
+                            total_timeout=FALLBACK_TOTAL_TIMEOUT)
+                        LOG.info("在线音源兜底：%s", ", ".join(fallback_services()))
+                    elif base is not None:
+                        _PROVIDER = base
+                    else:
+                        raise RuntimeError(
+                            "未配置音源：请在网页「网关设置」填写飞牛音乐地址与账号，"
+                            "或设置 GW_FALLBACK_URLS（如 musicdl@http://fnmusic-sources:8001）")
                 _PROVIDER_ERR = None
             except Exception as e:
                 _PROVIDER_ERR = str(e)
@@ -927,7 +1029,7 @@ def call_tool(name, args, base):
 
     if name == "music_sources":
         if not FALLBACK_URLS:
-            return "没有配置在线音源（GW_FALLBACK_URLS 为空）。网关不登录音乐账号，请先配置音源地址。"
+            return "没有配置任何音源：请在网页「网关设置」填写飞牛音乐地址与账号，或设置 GW_FALLBACK_URLS。"
         rows = source_status(FALLBACK_URLS)
         lines = ["在线音源 %d 个：" % len(rows)]
         for item in rows:
@@ -1074,6 +1176,84 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.urlencode(pairs)
         return u.path + (("?" + q) if q else "")
 
+    def _handle_settings(self, u, qs):
+        """网关设置页：支持 ?token= 引导 Cookie，其余走 Cookie 鉴权。"""
+        token = (qs.get("token") or [""])[0]
+        if token and ADMIN_TOKEN:
+            if not hmac.compare_digest(token, ADMIN_TOKEN):
+                return self._unauthorized()
+            return self._redirect(self._strip_token(u) or "/settings", [self._admin_cookie_header()])
+        if not self._admin_credential_ok():
+            return self._unauthorized()
+        return self._raw(SETTINGS_HTML.encode("utf-8"), 200, "text/html; charset=utf-8")
+
+    def _handle_settings_get(self):
+        s = fnos_settings()
+        return self._json({
+            "base": s["base"], "username": s["username"],
+            "password_set": bool(s["password"]) or s["token_cached"],
+            "device_id": s["device_id"], "source": s["source"],
+            "token_cached": s["token_cached"], "configured": fnos_configured(),
+            "download_dir": DOWNLOAD_DIR, "fallback": fallback_services(),
+        })
+
+    def _handle_settings_put(self):
+        body = self._body()
+        patch = {}
+        for key in ("base", "username", "password", "device_id"):
+            if key not in body:
+                continue
+            if key == "password" and not str(body.get(key) or "").strip():
+                continue  # 密码留空表示不修改
+            patch[key] = body.get(key)
+        base = str(patch.get("base", fnos_settings()["base"]) or "").strip()
+        if base and not re.match(r"^https?://[^\s]+$", base):
+            raise BadRequest("地址必须以 http:// 或 https:// 开头")
+        FNOS_CONFIG.update("fnos", patch)
+        reset_provider()
+        s = fnos_settings()
+        LOG.info("飞牛音乐配置已更新：%s（用户 %s）", s["base"] or "-", s["username"] or "-")
+        return self._handle_settings_get()
+
+    def _handle_settings_test(self):
+        body = self._body()
+        s = fnos_settings()
+        password = body.get("password")
+        if password in (None, ""):
+            password = s["password"]
+        cfg = {"base": str(body.get("base") or s["base"]).strip(),
+               "username": str(body.get("username") or s["username"]).strip(),
+               "password": password or "",
+               "device_id": str(body.get("device_id") or s["device_id"]).strip()}
+        if not cfg["base"]:
+            raise BadRequest("请先填写飞牛音乐地址")
+        if not cfg["username"]:
+            raise BadRequest("请先填写账号")
+        from fnmusic_client import FnMusicClient
+        started = time.time()
+        try:
+            client = FnMusicClient(base=cfg["base"], username=cfg["username"],
+                                   password=cfg["password"] or None,
+                                   device_id=cfg["device_id"] or None,
+                                   token_file=None, timeout=min(FNOS_TIMEOUT, 10))
+            client.ensure_token()
+            tracks = _rows(client.track_list(1, 3))
+            return self._json({"ok": True, "ms": int((time.time() - started) * 1000),
+                               "tracks": len(tracks), "message": "连接成功"})
+        except Exception as e:
+            return self._json({"ok": False, "ms": int((time.time() - started) * 1000),
+                               "error": str(e), "message": "连接失败"})
+
+    def _handle_settings_logout(self):
+        try:
+            os.remove(FNOS_TOKEN_FILE)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            LOG.warning("删除登录令牌失败：%s", e)
+        reset_provider()
+        return self._json({"ok": True, "token_cached": False})
+
     def _handle_root(self, u, qs):
         if not WEBUI_ENABLED:
             return self._json({"service": "fnmusic-gateway", "version": VERSION,
@@ -1139,6 +1319,19 @@ class Handler(BaseHTTPRequestHandler):
             resp = conn.getresponse()
             data = resp.read()
             ctype = resp.getheader("Content-Type") or "application/octet-stream"
+            if ctype.startswith("text/html") and req_path.split("?")[0] in ("/", "/index.html"):
+                try:
+                    html = data.decode("utf-8")
+                    if 'id="gw-settings-link"' not in html:
+                        link = ('<a id="gw-settings-link" href="/settings" style="position:fixed;'
+                                'right:18px;bottom:18px;z-index:2147483647;background:#2563eb;color:#fff;'
+                                'padding:10px 16px;border-radius:999px;font:14px/1 system-ui,sans-serif;'
+                                'text-decoration:none;box-shadow:0 6px 18px rgba(0,0,0,.25)">'
+                                '网关设置 · 飞牛音乐</a>')
+                        html = html.replace("</body>", link + "</body>", 1) if "</body>" in html else html + link
+                        data = html.encode("utf-8")
+                except Exception as exc:
+                    LOG.debug("注入设置入口失败：%s", exc)
             out = []
             for key, value in resp.getheaders():
                 lower = key.lower()
@@ -1197,13 +1390,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_root(u, qs)
             if path == WEBUI_PREFIX or path.startswith(WEBUI_PREFIX + "/"):
                 return self._handle_webui_get(u, qs)
+            if path in ("/settings", "/settings/"):
+                return self._handle_settings(u, qs)
             if not self._admin_ok(path):
                 return self._unauthorized()
             if path == "/healthz":
                 # 存活探针：只证明进程活着，不探音源（音源掉线时缓存仍能服务）
                 return self._json({"ok": True, "version": VERSION,
-                                   "mode": "mock" if MOCK else "online",
+                                   "mode": gateway_mode(),
                                    "mock": MOCK,
+                                   "fnos": {"configured": fnos_configured(),
+                                            "source": fnos_settings()["source"],
+                                            "token_cached": fnos_settings()["token_cached"]},
                                    "provider_error": provider_error(),
                                    "fallback": fallback_services(),
                                    "quality_default": QUALITY_DEFAULT,
@@ -1215,6 +1413,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "webui": {"enabled": WEBUI_ENABLED},
                                    "cache_mb": round(self._cache_mb(), 1),
                                    "moods": sorted(MOODS.keys())})
+            if path == "/api/settings/fnos":
+                return self._handle_settings_get()
             if path == "/readyz":
                 # 就绪探针：真探一次数据面，音源全挂时回 503
                 return self._handle_readyz()
@@ -1292,6 +1492,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._proxy_webui()
             if not self._admin_ok(u.path):
                 return self._unauthorized()
+            if u.path == "/api/settings/fnos/test":
+                return self._handle_settings_test()
+            if u.path == "/api/settings/fnos/logout":
+                return self._handle_settings_logout()
             if u.path == "/mcp":
                 return self._handle_mcp()
             if u.path == "/api/favorite":
@@ -1365,6 +1569,18 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_PUT(self):
+        u, _ = self._qs()
+        if u.path == "/api/settings/fnos":
+            try:
+                if not self._admin_ok(u.path):
+                    return self._unauthorized()
+                return self._handle_settings_put()
+            except GatewayError as e:
+                body, code = as_payload(e)
+                return self._json(body, code)
+            except Exception as e:
+                LOG.exception("PUT %s failed", self.path)
+                return self._json({"error": str(e)}, 500)
         self._do_webui_write()
 
     def do_PATCH(self):
@@ -1399,15 +1615,31 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found", "path": u.path}, 404)
 
     def _handle_readyz(self):
-        """就绪探针：mock 探本地曲目，在线模式探所有音源健康状态。"""
+        """就绪探针：mock 探本地曲目；配了飞牛先真连一次飞牛，再汇总在线音源。"""
         try:
             if MOCK:
                 rows = provider().list_tracks(1)
                 return self._json({"ok": True, "mode": "mock", "tracks_probe": len(rows)})
-            rows = source_status(FALLBACK_URLS, timeout=3)
-            healthy = [r for r in rows if r.get("healthy")]
-            return self._json({"ok": bool(healthy), "mode": "online", "sources": rows},
-                              200 if healthy else 503)
+            fnos_cfg = fnos_configured()
+            out = {"mode": gateway_mode(), "fnos": None, "sources": []}
+            fnos_ok = False
+            if fnos_cfg:
+                started = time.time()
+                try:
+                    rows = FnProvider().list_tracks(1)
+                    fnos_ok = True
+                    out["fnos"] = {"ok": True, "ms": int((time.time() - started) * 1000),
+                                   "tracks_probe": len(rows)}
+                except Exception as e:
+                    out["fnos"] = {"ok": False, "ms": int((time.time() - started) * 1000),
+                                   "error": str(e)}
+            if FALLBACK_URLS:
+                out["sources"] = source_status(FALLBACK_URLS, timeout=3)
+            sources_ok = any(r.get("healthy") for r in out["sources"])
+            ok = bool(fnos_ok or sources_ok)
+            if not fnos_cfg and not FALLBACK_URLS:
+                out["error"] = "未配置任何音源"
+            return self._json(dict(ok=ok, **out), 200 if ok else 503)
         except Exception as e:
             return self._json({"ok": False, "mode": "mock" if MOCK else "online",
                                "error": str(e)}, 503)

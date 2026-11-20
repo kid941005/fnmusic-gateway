@@ -46,7 +46,7 @@ _JSON_TYPES = {
 }
 
 DEFAULT_INSTRUCTIONS = (
-    "这是音乐播放网关（在线音源模式，不登录任何音乐账号）。先用 music_search / music_mood 找到歌，"
+    "这是音乐播放网关（飞牛音乐优先，在线音源兜底）。先用 music_search / music_mood 找到歌，"
     "music_play 会返回签名直链；拿到直链后必须调用设备工具 self.music.play_url，"
     "并传入 url、title、artist、lyric_url 四个参数。"
 )

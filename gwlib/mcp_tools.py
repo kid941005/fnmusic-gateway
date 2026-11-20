@@ -11,7 +11,7 @@ def build_tools():
     return [
         {
             "name": "music_search",
-            "description": "在所有在线音源里搜歌（自动纠正同音字/错字，按相关度排序）。返回带序号的曲目列表。",
+            "description": "搜歌：飞牛音乐优先，本地不足再并行问在线音源（自动纠正同音字/错字，按相关度排序）。返回带序号的曲目列表。",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "歌名或歌手"},
                 "limit": {"type": "integer", "description": "最多返回几首，默认 10"}},
@@ -19,25 +19,25 @@ def build_tools():
         },
         {
             "name": "music_browse",
-            "description": "浏览本地曲库：category=track 全部歌曲 / album 专辑 / artist 歌手 / playlist 歌单。在线音源模式没有本地曲库，会返回提示。",
+            "description": "浏览飞牛音乐曲库：category=track 全部歌曲 / album 专辑 / artist 歌手 / playlist 歌单。未配置飞牛音乐时返回提示。",
             "inputSchema": {"type": "object", "properties": {
                 "category": {"type": "string", "enum": ["track", "album", "artist", "playlist"]},
                 "limit": {"type": "integer"}}, "required": ["category"]},
         },
         {
             "name": "music_playlists",
-            "description": "列出本地曲库里的自建歌单（在线音源模式不可用）。",
+            "description": "列出飞牛音乐里的歌单（未配置飞牛音乐时不可用）。",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "music_playlist_tracks",
-            "description": "按歌单名列出里面的曲目（在线音源模式不可用）。",
+            "description": "按歌单名列出飞牛音乐里的曲目（未配置飞牛音乐时不可用）。",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["name"]},
         },
         {
             "name": "music_favorites",
-            "description": "列出收藏的歌曲（在线音源模式没有收藏夹）。",
+            "description": "列出飞牛音乐的收藏（未配置飞牛音乐时不可用）。",
             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
         },
         {
@@ -59,7 +59,7 @@ def build_tools():
         },
         {
             "name": "music_favorite",
-            "description": "收藏或取消收藏一首歌。action=add|remove，query 是歌名。在线音源模式下 add 会把歌曲按最高音质下载到本地曲库（需配置 GW_DOWNLOAD_DIR）；remove 不可用。",
+            "description": "收藏或取消收藏一首歌。action=add|remove，query 是歌名。配了飞牛音乐时直接写飞牛收藏；在线音源曲目 add 会按最高音质下载到本地下载目录（需配置 GW_DOWNLOAD_DIR）。",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["add", "remove"]},
                 "query": {"type": "string"}, "quality": QUALITY_PROP}, "required": ["action", "query"]},
@@ -71,7 +71,7 @@ def build_tools():
         },
         {
             "name": "music_download",
-            "description": "把在线歌曲下载/保存到本地曲库（GW_DOWNLOAD_DIR）。guid 或 query 二选一；quality=lossless 时保存原始文件。",
+            "description": "把在线歌曲下载/保存到本地下载目录（GW_DOWNLOAD_DIR）。guid 或 query 二选一；quality=lossless 时保存原始文件。",
             "inputSchema": {"type": "object", "properties": {
                 "guid": {"type": "string"}, "query": {"type": "string"},
                 "quality": QUALITY_PROP},
@@ -79,7 +79,7 @@ def build_tools():
         },
         {
             "name": "music_sources",
-            "description": "查看已配置在线音源及健康状态。",
+            "description": "查看在线兜底音源及健康状态（飞牛音乐的连接状态见网关设置页）。",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {

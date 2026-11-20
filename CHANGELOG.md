@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2.3.0 (2026-11-20)
+
+### 破坏性变更：只保留单端口 + 同端口 WebUI
+- 移除 `GW_PUBLIC_PORT`、`PublicHandler` 与第二个监听端口，网关只监听一个端口（默认 8766）；REST、MCP、播放直链、WebUI 全部同端口。
+- WebUI 通过 `/app/fnmusic-ext/` 反代到音源容器（默认 `http://fnmusic-sources:8004`）：根路径 302；`?token=` 校验后写 HttpOnly Cookie 并 302 去掉 token；向上游注入 `X-Trim-IsAdmin: true`，浏览器不再需要手工加 Header。
+- 新增 `GW_WEBUI_URL`（空=关闭）、`GW_WEBUI_TIMEOUT`（默认 30 秒）、`GW_WEBUI_BODY_CAP`（默认 32 MiB）。
+- `docker-compose.yml` 合并为唯一部署文件：网关 + 桥接器 + 音源，只发布 8766；音源容器零宿主端口，默认镜像 `:musicdl-webui`。删除 `docker-compose.bridge.yml` / `full.yml` / `slim.yml` / `webui.yml` / `oneport.yml`。
+- `GW_ADMIN_TOKEN` 在默认 compose 中为必填；`/play/`、`/lyrics/`、`/healthz` 保持匿名。
+- 版本 2.2.0 → **2.3.0**；测试 70 → **72 个用例**（新增 WebUI 反代/Cookie/鉴权/POST/PUT，删除双端口用例）。
+
 ## 2.2.0 (2026-11-20)
 
 ### 新增：单端口部署模式（参考 Songloft / 柠檬音乐）

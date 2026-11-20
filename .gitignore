@@ -6,3 +6,6 @@ data/sign.key
 data/state.json
 data/moods.json
 data/.fnmusic_token.json
+sources-data/
+sources-repo/
+music/

@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """fnmusic-gateway —— 飞牛音乐(fnOS) → 小智 的一层网关。
 
-双栈出口
---------
+单端口出口（管理、MCP、播放、WebUI 全部走 GW_PORT）
+--------------------------------------------------
 1) MCP（streamable-http）  POST /mcp
    给服务端/云端 LLM 用：查歌单、收藏、按心情选曲、拿直链。
 2) 签名直链               GET /play/<guid>.mp3?exp=<ts>&sig=<hmac>
@@ -45,6 +45,8 @@ import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
+import http.client
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from gwlib import __version__ as VERSION
@@ -86,9 +88,15 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 HOST = _env("GW_HOST", "0.0.0.0")
 PORT = _env_int("GW_PORT", 8766)
-# 公网专用端口：只对外提供 /play/，其余路径 404（0 = 关闭）。用于整域名反代场景。
-PUBLIC_PORT = _env_int("GW_PUBLIC_PORT", 0)
+# 单端口：只监听 GW_PORT。PUBLIC_BASE 只影响返回给设备的直链前缀，不再额外开监听端口。
 PUBLIC_BASE = (_env("GW_PUBLIC_BASE", "") or "").rstrip("/")
+# WebUI 反向代理：留空则关闭；compose 内填 http://fnmusic-sources:8004
+WEBUI_URL = (_env("GW_WEBUI_URL", "") or "").rstrip("/")
+WEBUI_ENABLED = bool(WEBUI_URL)
+WEBUI_PREFIX = "/app/fnmusic-ext"
+WEBUI_TIMEOUT = max(3, _env_int("GW_WEBUI_TIMEOUT", 30))
+WEBUI_BODY_CAP = max(1024 * 1024, _env_int("GW_WEBUI_BODY_CAP", 32 * 1024 * 1024))
+WEBUI_COOKIE = "fnmusic_admin"
 URL_TTL = _env_int("GW_URL_TTL", 900)
 CACHE_DIR = _env("GW_CACHE_DIR", os.path.join(DATA_DIR, "cache"))
 CACHE_MAX = _env_int("GW_CACHE_MAX_BYTES", 8 * 1024 ** 3)
@@ -1045,23 +1053,145 @@ class Handler(BaseHTTPRequestHandler):
             host = "127.0.0.1:%d" % PORT
         return "http://" + host
 
+    def _admin_cookie_ok(self):
+        raw = self.headers.get("Cookie") or ""
+        if not raw:
+            return False
+        jar = SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            return False
+        morsel = jar.get(WEBUI_COOKIE)
+        return bool(morsel) and hmac.compare_digest(morsel.value, ADMIN_TOKEN)
+
+    def _admin_cookie_header(self):
+        jar = SimpleCookie()
+        jar[WEBUI_COOKIE] = ADMIN_TOKEN
+        morsel = jar[WEBUI_COOKIE]
+        morsel["path"] = "/"
+        morsel["httponly"] = True
+        morsel["samesite"] = "Lax"
+        if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+            morsel["secure"] = True
+        return ("Set-Cookie", morsel.OutputString())
+
     def _admin_ok(self, path):
-        """管理面鉴权：未配置令牌时保持旧行为；/play/ 与 /lyrics/ 永远放行。"""
+        """管理面鉴权：未配置令牌时保持旧行为；/play/ 与 /lyrics/ 永远放行。
+
+        浏览器访问 WebUI 时无法带自定义 Header，因此额外接受登录 Cookie；
+        Cookie 由首次访问 ?token=<GW_ADMIN_TOKEN> 时下发。
+        """
         if not ADMIN_TOKEN:
             return True
-        if (path == "/healthz" or path == "/play" or path.startswith("/play/")
+        if (path in ("/", "/healthz") or path == "/play" or path.startswith("/play/")
                 or path == "/lyrics" or path.startswith("/lyrics/")):
             return True
         supplied = (self.headers.get("X-Admin-Token") or "").strip()
         auth = (self.headers.get("Authorization") or "").strip()
         if not supplied and auth.lower().startswith("bearer "):
             supplied = auth[7:].strip()
-        return bool(supplied) and hmac.compare_digest(supplied, ADMIN_TOKEN)
+        if supplied and hmac.compare_digest(supplied, ADMIN_TOKEN):
+            return True
+        return self._admin_cookie_ok()
 
     def _unauthorized(self):
         return self._json(
             {"error": {"code": "unauthorized", "message": "需要管理令牌"}},
             401, [("WWW-Authenticate", 'Bearer realm="fnmusic-gateway"')])
+
+    def _redirect(self, location, headers=None):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        for k, v in (headers or []):
+            self.send_header(k, v)
+        self.end_headers()
+
+    @staticmethod
+    def _strip_token(u):
+        pairs = [(k, v) for k, v in urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+                 if k != "token"]
+        q = urllib.parse.urlencode(pairs)
+        return u.path + (("?" + q) if q else "")
+
+    def _handle_root(self, u, _qs):
+        if WEBUI_ENABLED:
+            q = ("?" + u.query) if u.query else ""
+            return self._redirect(WEBUI_PREFIX + "/" + q)
+        return self._json({"service": "fnmusic-gateway", "version": VERSION,
+                           "webui": False, "mcp": "/mcp"})
+
+    def _handle_webui_get(self, u, qs):
+        if u.path == WEBUI_PREFIX:
+            q = ("?" + u.query) if u.query else ""
+            return self._redirect(WEBUI_PREFIX + "/" + q)
+        token = (qs.get("token") or [""])[0]
+        if token and ADMIN_TOKEN:
+            if not hmac.compare_digest(token, ADMIN_TOKEN):
+                return self._unauthorized()
+            return self._redirect(self._strip_token(u), [self._admin_cookie_header()])
+        if not self._admin_ok(u.path):
+            return self._unauthorized()
+        return self._proxy_webui()
+
+    def _proxy_webui(self):
+        if not WEBUI_ENABLED:
+            return self._json({"error": {"code": "webui_disabled", "message": "未配置 WebUI"}}, 404)
+        target = urllib.parse.urlparse(WEBUI_URL)
+        if target.scheme not in ("http", "https") or not target.hostname:
+            return self._json({"error": {"code": "webui_bad_url", "message": "GW_WEBUI_URL 非法"}}, 503)
+        n = _to_int(self.headers.get("Content-Length"), 0)
+        if n < 0 or n > WEBUI_BODY_CAP:
+            return self._json({"error": {"code": "payload_too_large", "message": "请求体过大"}}, 413)
+        body = self.rfile.read(n) if n else b""
+        upath = (target.path.rstrip("/") + self.path) or "/"
+        conn = None
+        try:
+            port = target.port or (443 if target.scheme == "https" else 80)
+            cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+            conn = cls(target.hostname, port, timeout=WEBUI_TIMEOUT)
+            hdrs = {}
+            skip = {"host", "content-length", "x-trim-isadmin", "connection",
+                    "proxy-connection", "transfer-encoding", "upgrade"}
+            for key, value in self.headers.items():
+                if key.lower() not in skip:
+                    hdrs[key] = value
+            hdrs["X-Trim-IsAdmin"] = "true"
+            fwd_proto = (self.headers.get("X-Forwarded-Proto") or "http").strip()
+            hdrs["X-Forwarded-Proto"] = fwd_proto
+            if self.headers.get("Host"):
+                hdrs["X-Forwarded-Host"] = self.headers.get("Host")
+            if self.headers.get("X-Forwarded-For"):
+                hdrs["X-Forwarded-For"] = self.headers.get("X-Forwarded-For") + ", " + self.client_address[0]
+            else:
+                hdrs["X-Forwarded-For"] = self.client_address[0]
+            if self.command not in ("GET", "HEAD"):
+                hdrs["Content-Length"] = str(len(body))
+            conn.request(self.command, upath, body=body if self.command not in ("GET", "HEAD") else None,
+                         headers=hdrs)
+            resp = conn.getresponse()
+            data = resp.read()
+            ctype = resp.getheader("Content-Type") or "application/octet-stream"
+            out = []
+            for key, value in resp.getheaders():
+                lower = key.lower()
+                if lower in ("content-type", "content-length", "transfer-encoding",
+                             "connection", "date", "server"):
+                    continue
+                if lower == "location" and WEBUI_URL and value.startswith(WEBUI_URL):
+                    value = WEBUI_PREFIX + value[len(WEBUI_URL):]
+                out.append((key, value))
+            return self._raw(data, resp.status, ctype, out)
+        except Exception as exc:
+            LOG.warning("WebUI 反代失败：%s", exc)
+            return self._json({"error": {"code": "webui_unavailable", "message": "WebUI 不可用"}}, 502)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _qs(self):
         u = urllib.parse.urlparse(self.path)
@@ -1097,6 +1227,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             u, qs = self._qs()
             path = u.path
+            if path == "/":
+                return self._handle_root(u, qs)
+            if path == WEBUI_PREFIX or path.startswith(WEBUI_PREFIX + "/"):
+                return self._handle_webui_get(u, qs)
             if not self._admin_ok(path):
                 return self._unauthorized()
             if path == "/healthz":
@@ -1110,6 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
                                                   "engine": "mcp>=2.3",
                                                   "error": str(MCP_SERVICE.import_error) if MCP_SERVICE.import_error else None},
                                    "auth_required": bool(ADMIN_TOKEN),
+                                   "webui": {"enabled": WEBUI_ENABLED},
                                    "cache_mb": round(self._cache_mb(), 1),
                                    "moods": sorted(MOODS.keys())})
             if path == "/readyz":
@@ -1183,6 +1318,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             u, qs = self._qs()
+            if u.path == WEBUI_PREFIX or u.path.startswith(WEBUI_PREFIX + "/"):
+                if not self._admin_ok(u.path):
+                    return self._unauthorized()
+                return self._proxy_webui()
             if not self._admin_ok(u.path):
                 return self._unauthorized()
             if u.path == "/mcp":
@@ -1248,9 +1387,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def do_PUT(self):
+        self._do_webui_write()
+
+    def do_PATCH(self):
+        self._do_webui_write()
+
+    def _do_webui_write(self):
+        u, _ = self._qs()
+        if not (u.path == WEBUI_PREFIX or u.path.startswith(WEBUI_PREFIX + "/")):
+            return self._json({"error": "not found", "path": u.path}, 404)
+        if not self._admin_ok(u.path):
+            return self._unauthorized()
+        return self._proxy_webui()
+
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Allow", "GET, POST, HEAD, DELETE, OPTIONS")
+        self.send_header("Allow", "GET, POST, PUT, PATCH, HEAD, DELETE, OPTIONS")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -1259,6 +1412,8 @@ class Handler(BaseHTTPRequestHandler):
         u, _ = self._qs()
         if not self._admin_ok(u.path):
             return self._unauthorized()
+        if u.path == WEBUI_PREFIX or u.path.startswith(WEBUI_PREFIX + "/"):
+            return self._proxy_webui()
         if u.path == "/mcp":
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1531,49 +1686,13 @@ class GatewayServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-class PublicHandler(Handler):
-    """公网专用端口（GW_PUBLIC_PORT）：只开放 /play/ 签名直链，其余路径一律 404。
-
-    背景：/api/*、/mcp、/healthz 没有鉴权，整域名反代到 GW_PORT 会全部暴露。
-    开启 GW_PUBLIC_PORT 后，反代指向这个端口，管理面仍旧只听 GW_PORT（内网）。
-    只依赖路径判断，不依赖反代软件的任何高级特性。
-    """
-
-    def _not_found(self):
-        return self._json({"error": "not found"}, 404)
-
-    def do_GET(self):
-        u = urllib.parse.urlparse(self.path)
-        if not (u.path == "/play" or u.path.startswith("/play/") or
-                u.path == "/lyrics" or u.path.startswith("/lyrics/")):
-            return self._not_found()
-        return Handler.do_GET(self)
-
-    def do_POST(self):
-        return self._not_found()
-
-    def do_DELETE(self):
-        return self._not_found()
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, OPTIONS")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-
 def main():
     srv = GatewayServer((HOST, PORT), Handler)
-    LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB)",
-             VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
-    if PUBLIC_PORT and PUBLIC_PORT != PORT:
-        pub = GatewayServer((HOST, PUBLIC_PORT), PublicHandler)
-        threading.Thread(target=pub.serve_forever, name="gw-public", daemon=True).start()
-        LOG.info("public play-only listener on %s:%d (only GET /play/..., 其他路径 404)", HOST, PUBLIC_PORT)
-    elif PUBLIC_PORT:
-        LOG.warning("GW_PUBLIC_PORT=%d 与 GW_PORT 相同，已忽略（公网面与管理面不能共用端口）", PUBLIC_PORT)
-    if not PUBLIC_PORT and not ADMIN_TOKEN:
-        LOG.warning("当前只有一个监听端口且未设置 GW_ADMIN_TOKEN：管理接口与播放接口共用同一端口，请勿直接暴露到公网")
+    LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB, webui=%s)",
+             VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576,
+             WEBUI_URL or "off")
+    if not ADMIN_TOKEN:
+        LOG.warning("未设置 GW_ADMIN_TOKEN：管理接口、MCP 与 WebUI 均无鉴权，只应内网访问")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

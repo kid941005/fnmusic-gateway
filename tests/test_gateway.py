@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 import weakref
 
@@ -311,51 +312,121 @@ class TestCache(Base):
         self.assertEqual(app.CACHE.ensure("mock-1", p), path)  # 命中缓存
 
 
-class TestPublicPort(Base):
-    """GW_PUBLIC_PORT 用的 PublicHandler：只放行 /play/，其余一律 404。"""
+class _FakeWebUIHandler(BaseHTTPRequestHandler):
+    """最小 WebUI 上游：记录收到的头，验证网关注入 X-Trim-IsAdmin。"""
+
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def log_message(self, *_args):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _record(self):
+        _FakeWebUIHandler.seen.append((self.command, self.path, dict(self.headers)))
+
+    def do_GET(self):
+        self._record()
+        if self.path.endswith("/api/state"):
+            return self._send(200, json.dumps({"ok": True, "path": self.path}).encode())
+        if self.path.endswith("/static/app.js"):
+            return self._send(200, b"window.APP_BASE='/app/fnmusic-ext';",
+                              "application/javascript; charset=utf-8")
+        return self._send(200, b"<html>webui</html>", "text/html; charset=utf-8")
+
+    def do_POST(self):
+        self._do_write()
+
+    def do_PUT(self):
+        self._do_write()
+
+    def _do_write(self):
+        self._record()
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        out = {"method": self.command, "body": body.decode("utf-8", "replace"),
+               "admin": self.headers.get("X-Trim-IsAdmin")}
+        self._send(200, json.dumps(out).encode())
+
+
+class TestWebUI(Base):
+    """单端口 WebUI：/app/fnmusic-ext 同端口反代 + Cookie 管理鉴权。"""
 
     @classmethod
     def setUpClass(cls):
-        os.makedirs(app.CACHE_DIR, exist_ok=True)
-        cls.srv = app.GatewayServer(("127.0.0.1", 0), app.PublicHandler)
-        cls.port = cls.srv.server_address[1]
-        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        super().setUpClass()
+        cls._old_token = app.ADMIN_TOKEN
+        cls._old_url = app.WEBUI_URL
+        cls._old_enabled = app.WEBUI_ENABLED
+        app.ADMIN_TOKEN = "test-secret"
+        cls.up = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWebUIHandler)
+        cls.up_port = cls.up.server_address[1]
+        threading.Thread(target=cls.up.serve_forever, daemon=True).start()
+        app.WEBUI_URL = "http://127.0.0.1:%d" % cls.up_port
+        app.WEBUI_ENABLED = True
+        _FakeWebUIHandler.seen.clear()
 
-    def test_non_play_paths_blocked(self):
-        for p in ("/healthz", "/readyz", "/api/search?q=x", "/api/play?query=x",
-                  "/api/playlists", "/api/moods", "/mcp"):
-            r, _ = self.req("GET", p, raw=True)
-            self.assertEqual(r.status, 404, p)
-        r, _ = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, raw=True)
-        self.assertEqual(r.status, 404)
-        r, _ = self.req("DELETE", "/mcp", raw=True)
-        self.assertEqual(r.status, 404)
+    @classmethod
+    def tearDownClass(cls):
+        cls.up.shutdown()
+        cls.up.server_close()
+        app.ADMIN_TOKEN = cls._old_token
+        app.WEBUI_URL = cls._old_url
+        app.WEBUI_ENABLED = cls._old_enabled
+        super().tearDownClass()
 
-    def test_lyrics_allowed(self):
-        guid = "lyr-pub"
-        os.makedirs(app.LYRICS_DIR, exist_ok=True)
-        with open(app.lyric_cache_path(guid), "w", encoding="utf-8") as fp:
-            fp.write("[00:02.00]公网歌词\n")
-        exp = int(app.time.time()) + 60
-        r, body = self.req("GET", "/lyrics/%s.lrc?exp=%d&sig=%s" % (guid, exp, app.sign(guid, exp)), raw=True)
+    def _cookie(self):
+        r, _ = self.req("GET", "/app/fnmusic-ext/?token=" + app.ADMIN_TOKEN, raw=True)
+        self.assertEqual(r.status, 302)
+        raw = r.getheader("Set-Cookie") or ""
+        self.assertIn("fnmusic_admin=", raw)
+        return raw.split(";")[0]
+
+    def test_root_redirects_to_webui(self):
+        r, _ = self.req("GET", "/", raw=True)
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/app/fnmusic-ext/")
+
+    def test_webui_requires_token_then_sets_cookie(self):
+        r, _ = self.req("GET", "/app/fnmusic-ext/", raw=True)
+        self.assertEqual(r.status, 401)
+        cookie = self._cookie()
+        r, body = self.req("GET", "/app/fnmusic-ext/", headers={"Cookie": cookie}, raw=True)
         self.assertEqual(r.status, 200)
-        self.assertIn("公网歌词".encode(), body)
+        self.assertIn(b"webui", body)
 
-    def test_play_still_works(self):
-        exp = int(app.time.time()) + 60
-        path = "/play/mock-1.mp3?exp=%d&sig=%s" % (exp, app.sign("mock-1", exp))
-        r, body = self.req("GET", path, raw=True)
+    def test_webui_proxies_api_and_injects_admin_header(self):
+        cookie = self._cookie()
+        r, body = self.req("GET", "/app/fnmusic-ext/api/state", headers={"Cookie": cookie})
         self.assertEqual(r.status, 200)
-        self.assertEqual(r.getheader("Content-Type"), "audio/mpeg")
-        self.assertGreater(len(body), 1024)
-        r2, part = self.req("GET", path, headers={"Range": "bytes=0-99"}, raw=True)
-        self.assertEqual(r2.status, 206)
-        self.assertEqual(len(part), 100)
-        r3, _ = self.req("HEAD", path, raw=True)
-        self.assertEqual(r3.status, 200)
-        bad = "/play/mock-1.mp3?exp=%d&sig=deadbeef" % exp
-        r4, _ = self.req("GET", bad, raw=True)
-        self.assertEqual(r4.status, 403)
+        self.assertTrue(body.get("ok"))
+        self.assertTrue(_FakeWebUIHandler.seen)
+        self.assertEqual(_FakeWebUIHandler.seen[-1][2].get("X-Trim-IsAdmin"), "true")
+
+    def test_webui_proxies_post_and_put(self):
+        cookie = self._cookie()
+        r, body = self.req("POST", "/app/fnmusic-ext/api/action", body={"x": 1},
+                           headers={"Cookie": cookie})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body.get("method"), "POST")
+        self.assertEqual(body.get("admin"), "true")
+        self.assertIn('"x": 1', body.get("body", ""))
+        r, body = self.req("PUT", "/app/fnmusic-ext/api/action", body={"x": 2},
+                           headers={"Cookie": cookie})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body.get("method"), "PUT")
+
+    def test_healthz_reports_webui_enabled(self):
+        r, body = self.req("GET", "/healthz")
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body["webui"]["enabled"])
 
 
 class TestRanking(unittest.TestCase):
@@ -803,7 +874,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.2.0")
+        self.assertEqual(app.VERSION, "2.3.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

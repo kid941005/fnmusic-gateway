@@ -17,7 +17,7 @@ ENV PYTHONUNBUFFERED=1 \
     GW_PORT=8766
 
 VOLUME ["/data"]
-EXPOSE 8766 8767
+EXPOSE 8766
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('GW_PORT','8766')+'/healthz',timeout=3)"

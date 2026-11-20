@@ -54,18 +54,13 @@ services:
       GW_TEE_SAVE: "${GW_TEE_SAVE:-true}"
       GW_LIBRARY_MAX_BYTES: "${GW_LIBRARY_MAX_BYTES:-0}"
       GW_SIGN_SECRET: "${GW_SIGN_SECRET:-}"
-      FNMUSIC_BASE: "${FNMUSIC_BASE:-http://192.168.50.100:59820}"
-      FNMUSIC_USER: "${FNMUSIC_USER:-KID}"
-      FNMUSIC_PASS: "${FNMUSIC_PASS:-}"
-      FNMUSIC_DEVICE_ID: "${FNMUSIC_DEVICE_ID:-}"
       GW_FALLBACK_URLS: "${GW_FALLBACK_URLS:-musicdl@http://fnmusic-sources:8001}"
-      GW_DOWNLOAD_DIR: "${GW_DOWNLOAD_DIR:-/vol1/1000/Music}"
-      GW_LIBRARY_SCAN_CMD: "${GW_LIBRARY_SCAN_CMD:-}"
+      GW_DOWNLOAD_DIR: "${GW_DOWNLOAD_DIR:-/music}"
       GW_PREVIEW_MIN_SECONDS: "${GW_PREVIEW_MIN_SECONDS:-35}"
     volumes:
       - ./data:/data
       # 本地曲库（下载/边播边存落盘）。右侧必须与 GW_DOWNLOAD_DIR 一致
-      - "${GW_MUSIC_DIR:-./music}:/vol1/1000/Music"
+      - "${GW_MUSIC_DIR:-./music}:/music"
 
   fnmusic-bridge:
     image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:latest}

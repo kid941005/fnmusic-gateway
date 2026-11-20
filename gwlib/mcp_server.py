@@ -46,7 +46,7 @@ _JSON_TYPES = {
 }
 
 DEFAULT_INSTRUCTIONS = (
-    "这是飞牛音乐网关。先用 music_search / music_browse / music_mood 找到歌，"
+    "这是音乐播放网关（在线音源模式，不登录任何音乐账号）。先用 music_search / music_mood 找到歌，"
     "music_play 会返回签名直链；拿到直链后必须调用设备工具 self.music.play_url，"
     "并传入 url、title、artist、lyric_url 四个参数。"
 )
@@ -58,7 +58,7 @@ class McpService:
     def __init__(self, call_tool: Callable[[str, dict, str], str], version: str,
                  default_base: str | Callable[[], str],
                  name: str = "fnmusic-gateway",
-                 title: str = "飞牛音乐网关",
+                 title: str = "音乐播放网关",
                  instructions: str = DEFAULT_INSTRUCTIONS,
                  logger: logging.Logger | None = None) -> None:
         self._call_tool = call_tool

@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2.4.0 (2026-11-20)
+
+### 破坏性变更：去掉飞牛账号接管，改为纯在线音源模式
+- 移除飞牛音乐账号登录：删除 `FnProvider`、`fnmusic_client.py`、`FNMUSIC_BASE` / `FNMUSIC_USER` / `FNMUSIC_PASS` / `FNMUSIC_DEVICE_ID` / `FNMUSIC_INSECURE_TLS` 与 `GW_LIBRARY_SCAN_CMD`；网关不再保存任何账号、密码或 token。
+- `GW_FALLBACK_URLS` 成为唯一数据来源：配置后走在线音源（默认 compose 已接好 `musicdl@http://fnmusic-sources:8001`），未配置时请求明确报「未配置在线音源：请设置 GW_FALLBACK_URLS」，不再静默失败。
+- `FallbackProvider(base=None)` 支持纯在线模式：搜索只并行问在线音源；歌单、收藏夹、本地曲库浏览等账号类接口抛 `BadRequest`（HTTP 400 / MCP 工具错误），不再返回空列表。
+- 收藏/下载语义统一为「落本地下载目录」：`music_favorite(action=add)`、`music_download`、`POST /api/download`、`POST /api/favorite` 都会把在线歌曲按源给的最高音质存到 `GW_DOWNLOAD_DIR`（容器内默认 `/music`），文件名 `歌名 - 歌手.<flac|mp3>`。
+- `/readyz` 语义改为探在线音源健康（有健康源即 200，否则 503 + 各源状态）；`/healthz` 新增 `mode` 字段（`online` / `mock`）。
+- 本地下载目录从「飞牛曲库目录」改为普通目录：`GW_DOWNLOAD_DIR` 默认 `/music`，compose 卷改为 `${GW_MUSIC_DIR:-./music}:/music`。
+- 离线自测变量 `FNMUSIC_MOCK` 改名为 `GW_MOCK`。
+- `gwlib/storage.py` 的 `LibraryStore` 去掉 `scan_cmd_getter`（不再触发曲库扫描）。
+- 版本 2.3.0 → **2.4.0**；测试 72 → **77 个用例**（新增纯在线模式 5 例）。
+
 ## 2.3.0 (2026-11-20)
 
 ### 破坏性变更：只保留单端口 + 同端口 WebUI

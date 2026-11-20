@@ -11,7 +11,7 @@ def build_tools():
     return [
         {
             "name": "music_search",
-            "description": "在本地曲库优先搜歌（自动纠正同音字/错字，按相关度排序）；本地没有时会并行到所有在线音源兜底。返回带序号的曲目列表。",
+            "description": "在所有在线音源里搜歌（自动纠正同音字/错字，按相关度排序）。返回带序号的曲目列表。",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "歌名或歌手"},
                 "limit": {"type": "integer", "description": "最多返回几首，默认 10"}},
@@ -19,25 +19,25 @@ def build_tools():
         },
         {
             "name": "music_browse",
-            "description": "浏览飞牛音乐库：category=track 全部歌曲 / album 专辑 / artist 歌手 / playlist 歌单。",
+            "description": "浏览本地曲库：category=track 全部歌曲 / album 专辑 / artist 歌手 / playlist 歌单。在线音源模式没有本地曲库，会返回提示。",
             "inputSchema": {"type": "object", "properties": {
                 "category": {"type": "string", "enum": ["track", "album", "artist", "playlist"]},
                 "limit": {"type": "integer"}}, "required": ["category"]},
         },
         {
             "name": "music_playlists",
-            "description": "列出我的自建歌单。",
+            "description": "列出本地曲库里的自建歌单（在线音源模式不可用）。",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "music_playlist_tracks",
-            "description": "按歌单名列出里面的曲目。",
+            "description": "按歌单名列出里面的曲目（在线音源模式不可用）。",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["name"]},
         },
         {
             "name": "music_favorites",
-            "description": "列出我收藏的歌曲。",
+            "description": "列出收藏的歌曲（在线音源模式没有收藏夹）。",
             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
         },
         {
@@ -59,7 +59,7 @@ def build_tools():
         },
         {
             "name": "music_favorite",
-            "description": "收藏或取消收藏一首歌。action=add|remove，query 是歌名。在线歌曲 add 时会按最高音质下载到本地曲库（需配置 GW_DOWNLOAD_DIR）。",
+            "description": "收藏或取消收藏一首歌。action=add|remove，query 是歌名。在线音源模式下 add 会把歌曲按最高音质下载到本地曲库（需配置 GW_DOWNLOAD_DIR）；remove 不可用。",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["add", "remove"]},
                 "query": {"type": "string"}, "quality": QUALITY_PROP}, "required": ["action", "query"]},
@@ -84,7 +84,7 @@ def build_tools():
         },
         {
             "name": "music_storage",
-            "description": "查看播放缓存与本地曲库存放情况。",
+            "description": "查看播放缓存与本地下载目录占用。",
             "inputSchema": {"type": "object", "properties": {}},
         },
     ]

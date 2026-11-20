@@ -186,11 +186,10 @@ class MediaCache:
 
 
 class LibraryStore:
-    """把在线音源原始文件落到飞牛曲库目录。保存原始文件而不是转码 MP3。"""
+    """把在线音源原始文件落到本地下载目录。保存原始文件而不是转码 MP3。"""
 
-    def __init__(self, directory_getter, scan_cmd_getter=None, logger=None, max_bytes=0):
+    def __init__(self, directory_getter, logger=None, max_bytes=0):
         self._dir_getter = directory_getter or (lambda: "")
-        self._scan_getter = scan_cmd_getter or (lambda: "")
         self.max_bytes = max(0, int(max_bytes or 0))
         self.log = logger or LOG
         self._jobs = {}
@@ -243,7 +242,6 @@ class LibraryStore:
             except OSError:
                 pass
             raise
-        self.run_scan()
         return fp, len(raw)
 
     def save_from_provider(self, provider, track, quality=None):
@@ -268,7 +266,6 @@ class LibraryStore:
                     os.remove(tmp)
                 except OSError:
                     pass
-        self.run_scan()
         return fp, size
 
     def save_async(self, provider, track, quality=None):
@@ -294,15 +291,6 @@ class LibraryStore:
         finally:
             with self._lock:
                 self._jobs.pop(track.get("guid"), None)
-
-    def run_scan(self):
-        cmd = str(self._scan_getter() or "").strip()
-        if not cmd:
-            return
-        try:
-            subprocess.run(cmd, shell=True, check=False, timeout=120)
-        except Exception as exc:
-            self.log.warning("library scan failed: %s", exc)
 
     def stats(self):
         directory = str(self._dir_getter() or "").strip()

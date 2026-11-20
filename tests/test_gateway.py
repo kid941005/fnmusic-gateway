@@ -23,7 +23,7 @@ sys.path.insert(0, HERE)
 
 DATA = tempfile.mkdtemp(prefix="gw-test-")
 os.environ.setdefault("GW_DATA", DATA)
-os.environ["FNMUSIC_MOCK"] = "1"
+os.environ["GW_MOCK"] = "1"
 os.environ["GW_LYRICS"] = "0"  # 单测不联网查歌词
 os.environ.pop("GW_PUBLIC_BASE", None)
 
@@ -201,6 +201,7 @@ class TestHttp(Base):
         self.assertEqual(r.status, 200)
         self.assertTrue(d["ok"])
         self.assertTrue(d["mock"])
+        self.assertEqual(d["mode"], "mock")
         self.assertIn("mcp_server", d)
         self.assertEqual(d["mcp_server"]["engine"], "mcp>=2.3")
 
@@ -208,6 +209,7 @@ class TestHttp(Base):
         r, d = self.req("GET", "/readyz")
         self.assertEqual(r.status, 200)
         self.assertTrue(d["ok"])
+        self.assertEqual(d["mode"], "mock")
 
     def test_search(self):
         r, d = self.req("GET", "/api/search?q=" + urllib.parse.quote("晴天"))
@@ -576,6 +578,49 @@ class TestFallback(unittest.TestCase):
             app.DOWNLOAD_DIR = old
 
 
+class TestOnlineOnly(unittest.TestCase):
+    """2.4.0：不登录飞牛账号，FallbackProvider(base=None) 只走在线音源。"""
+
+    def _fp(self, rows=None):
+        fp = app.FallbackProvider(None, ["musicdl@http://x:1"])
+        fp.exts = [_FakeExt(rows or [{"guid": "ext:musicdl:e1", "title": "晴天",
+                                      "artist": "周杰伦", "source": "musicdl"}])]
+        return fp
+
+    def test_search_uses_only_online_sources(self):
+        rows = self._fp().search("晴天", 5)
+        self.assertEqual([r["guid"] for r in rows], ["ext:musicdl:e1"])
+
+    def test_local_library_calls_raise_bad_request(self):
+        fp = self._fp()
+        for call in (lambda: fp.playlists(), lambda: fp.favorites(),
+                     lambda: fp.list_tracks(1), lambda: fp.albums(1),
+                     lambda: fp.artists(1), lambda: fp.add_favorite("x"),
+                     lambda: fp.remove_favorite("x")):
+            with self.assertRaises(app.BadRequest):
+                call()
+
+    def test_stream_rejects_non_ext_guid(self):
+        with self.assertRaises(app.BadRequest):
+            self._fp().stream("mock-1")
+
+    def test_stream_routes_ext_guid(self):
+        fp = self._fp()
+        fp.exts = [_FakeExt(wav=b"RIFFxxxx")]
+        self.assertEqual(fp.stream("ext:musicdl:abc"), ("audio/wav", b"RIFFxxxx"))
+
+    def test_provider_requires_online_sources(self):
+        old = (app._PROVIDER, app._PROVIDER_ERR, app.MOCK, app.FALLBACK_URLS)
+        app._PROVIDER, app._PROVIDER_ERR, app.MOCK = None, None, False
+        app.FALLBACK_URLS = []
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                app.provider()
+            self.assertIn("GW_FALLBACK_URLS", str(ctx.exception))
+        finally:
+            app._PROVIDER, app._PROVIDER_ERR, app.MOCK, app.FALLBACK_URLS = old
+
+
 class TestExtProviderHttp(unittest.TestCase):
     """本地假上游，验证 ExtProvider 的契约解析（不依赖 NAS）。"""
 
@@ -861,7 +906,7 @@ class TestAuditFixes(unittest.TestCase):
 
     def test_library_max_bytes_enforced(self):
         d = tempfile.mkdtemp(prefix="gw-lib-", dir=DATA)
-        lib = gw_storage.LibraryStore(lambda: d, lambda: "", max_bytes=8)
+        lib = gw_storage.LibraryStore(lambda: d, max_bytes=8)
         with self.assertRaises(gw_storage.StorageError):
             lib.save_bytes({"guid": "g", "title": "t", "artist": "a"}, "audio/mpeg", b"0123456789")
 
@@ -874,7 +919,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.3.0")
+        self.assertEqual(app.VERSION, "2.4.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 
@@ -924,7 +969,7 @@ class TestRelease201(unittest.TestCase):
                 return "audio/mpeg", 300
 
         d = tempfile.mkdtemp(prefix="gw-lib-stream-", dir=DATA)
-        lib = gw_storage.LibraryStore(lambda: d, lambda: "")
+        lib = gw_storage.LibraryStore(lambda: d)
         fp, size = lib.save_from_provider(StreamProv(), {"guid": "ext:x:1", "title": "t", "artist": "a"})
         self.assertEqual(size, 300)
         self.assertTrue(fp.endswith(".mp3"))

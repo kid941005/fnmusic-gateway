@@ -4,13 +4,13 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.3.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.4.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
 
-飞牛音乐（fnOS Music）→ 小智 的播放网关。**一个进程，一个端口，WebUI 同端口**：
+在线音源 → 小智 的播放网关。**不接管飞牛音乐，不登录任何音乐账号**；一个进程，一个端口，WebUI 同端口：
 
 | 入口 | 地址 | 谁用 | 用途 |
 |---|---|---|---|
-| MCP（streamable-http） | `POST /mcp` | 小智服务端 / 云端 LLM | 搜索、歌单、收藏、按心情选曲、拿直链 |
+| MCP（streamable-http） | `POST /mcp` | 小智服务端 / 云端 LLM | 搜索、按心情选曲、拿直链、下载到本地 |
 | 签名直链 | `GET /play/<guid>.mp3?exp=&sig=` | 设备 `self.music.play_url` | 设备直拉流，不经过小智服务端 |
 
 另有 REST 面（`/api/*`）给小智插件或脚本用，避免它们去讲 MCP 协议。
@@ -18,25 +18,26 @@
 
 ## 能做什么
 
-- **本地曲库**：搜索、浏览歌曲/专辑/歌手/歌单、看收藏、按心情选曲。
-- **设备可播**：飞牛曲库里的 FLAC/其他格式自动转 MP3，签发短时直链，支持 Range、HEAD 和预转码。
+- **纯在线音源**：通过 musicdl / 网易 / 洛雪等音源容器搜歌，网关自己不登录任何音乐账号。
+- **设备可播**：音源里的 FLAC/无损自动转 MP3，签发短时直链，支持 Range、HEAD 和预转码。
 - **屏显信息**：播放时把歌名、歌手、歌词（LRC）一起交给设备，不再显示 `unknown`。
-- **在线兜底**：本地没有的歌，按配置走在线音源（musicdl / 网易 / 洛雪），支持试听识别和“收藏即下载”。
 - **听得更准**：中文同音字/错字纠正 + 相关度排序（青花磁 → 青花瓷）。
+- **按心情选曲**：内置情绪关键词 + 在线音源搜索组合出候选歌单。
 - **安全外网**：只发布一个 8766；公网反代只转发 `/play/` 与 `/lyrics/`，管理面与 WebUI 不暴露。
 - **多种接入**：12 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
 - **音质可选**：`standard / high / exhigh / lossless` 四档，设备始终拿 MP3，下载保留原始音质。
-- **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地曲库。
+- **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地下载目录。
 - **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / mcp_tools / mcp_server 七层，新增音源或音质策略不改播放层与 MCP 层。
 - **同端口 WebUI**：音源管理界面通过 `/app/fnmusic-ext/` 反代到 8766，浏览器不需要再访问单独的 WebUI 端口，也不额外暴露宿主机端口。
 - **官方 MCP 2.3**：`/mcp` 由官方 `mcp>=2.3` 的 `MCPServer`（原 FastMCP）提供工具注册、参数校验与错误包装，旧 JSON-RPC 仅在依赖缺失时兜底。
 
 ## 为什么需要这一层
 
-1. **设备只解 MP3**，飞牛曲库多为 FLAC ⇒ 必须转码。
-2. **飞牛 token 不能进 URL**（URL 会进设备日志、进 LLM 上下文）⇒ 直链用 HMAC 短时签名，token 留在网关里。
+1. **设备只解 MP3**，音源多为 FLAC/无损 ⇒ 必须转码。
+2. **音源地址与密钥不能进 URL**（URL 会进设备日志、进 LLM 上下文）⇒ 直链用 HMAC 短时签名，密钥留在网关里。
 3. **设备要求 URL ≤ 2048 字节、仅 http/https、禁空白与 `@`** ⇒ 不能把签名参数塞一堆。
 4. 首次点播就转码并落盘缓存，`/api/play` 返回前预热，设备连上就能满速读。
+5. **不碰账号数据**：网关只做“搜索→转码→签名直链”，歌单/收藏这类账号数据由音源容器自己的 WebUI 管理。
 
 ## 2.x 的分层结构
 
@@ -46,7 +47,7 @@
 |---|---|---|
 | `gwlib/errors.py` | 统一错误码与 HTTP 状态映射 | `GatewayError` / `as_payload` |
 | `gwlib/quality.py` | 音质档位与转码参数 | `normalize_quality` / `get_profile` |
-| `gwlib/storage.py` | MP3 转码缓存 + 本地曲库落盘 | `MediaCache.ensure` / `LibraryStore.save_from_provider` |
+| `gwlib/storage.py` | MP3 转码缓存 + 本地下载目录落盘 | `MediaCache.ensure` / `LibraryStore.save_from_provider` |
 | `gwlib/sources.py` | 在线音源适配、探活、多源并行检索 | `ExtProvider` / `FallbackProvider` / `source_status` |
 | `gwlib/playback.py` | 选源→音质→缓存→直链→边播边存 | `PlaybackService.prepare` |
 | `gwlib/mcp_tools.py` | 12 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
@@ -121,7 +122,7 @@ http://NAS_IP:8766/app/fnmusic-ext/?token=<GW_ADMIN_TOKEN>
 - **公网**：Lucky/nginx 只反代 8766 的 `/play/` 与 `/lyrics/`；不要反代 `/app/fnmusic-ext/`、`/api/`、`/mcp`。
 - **WebUI 镜像**：默认 `:musicdl-webui`（musicdl + WebUI，约 906 MB）。需要网易/洛雪时把
   `FNMUSIC_SOURCES_IMAGE` 改成 `:latest` 全量镜像；内部端口仍是 8001/8004，不需要增加宿主机端口。
-- **本地曲库**：下载与边播边存写到容器内 `/vol1/1000/Music`，compose 已挂到宿主机 `./music`；
+- **本地下载目录**：下载与边播边存写到容器内 `/music`，compose 已挂到宿主机 `./music`；
   改 `GW_MUSIC_DIR` 即可换目录。
 - **桥接器**：只有使用小智“MCP 接入点（wss）”时才需要；不填 `MCP_ENDPOINT` 会一直重连，不影响网关。
 
@@ -153,7 +154,7 @@ docker compose up -d
 | `GW_MP3_CHANNELS` | 2 | 声道数 |
 | `GW_PREWARM` | 1 | `/api/play` 返回前先转码，设备连上即可读 |
 | `GW_MAX_LIMIT` | 50 | 单次查询返回条数上限（LLM 传再大也会被收敛） |
-| `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把 NAS CPU 打满 |
+| `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把宿主机 CPU 打满 |
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
 | `GW_MCP_TIMEOUT` | 300 | 网关转发到官方 MCPServer 内部回环服务的超时（秒） |
 | `GW_ADMIN_TOKEN` | 空=不鉴权 | 管理令牌；设置后除 `/play/`、`/lyrics/`、`/healthz` 外的接口都要带 `X-Admin-Token` 或 `Authorization: Bearer`。单端口 compose 强制设置；WebUI 首次访问用 `?token=` 换取 Cookie |
@@ -167,7 +168,7 @@ docker compose up -d
 |---|---|---|
 | `GW_QUALITY_DEFAULT` | `standard` | 默认音质：`standard`(128k) / `high`(192k) / `exhigh`(320k) / `lossless`(下载原始音质，播放仍 320k MP3) |
 | `GW_TEE_SAVE` | 1 | 在线歌曲播放时是否边播边存到 `GW_DOWNLOAD_DIR`；0=关闭 |
-| `GW_LIBRARY_MAX_BYTES` | 0 | 本地曲库容量上限（字节，0=不限）；超出后下载报错 |
+| `GW_LIBRARY_MAX_BYTES` | 0 | 本地下载目录容量上限（字节，0=不限）；超出后下载报错 |
 | `GW_SOURCES_SEARCH_PARALLEL` | 1 | 多音源检索是否并行；0=串行 |
 
 ### 歌词（设备屏显）
@@ -180,37 +181,33 @@ docker compose up -d
 | `GW_LYRICS_DIR` | `$GW_DATA/lyrics` | LRC 缓存目录 |
 | `GW_LYRICS_RETRY` | 86400 | 查不到歌词的重试间隔（秒） |
 
-### 多音源兜底
+### 在线音源
+
+网关不登录任何音乐账号，只通过下面的音源容器取数据；`GW_FALLBACK_URLS` 为空时请求会明确报「未配置在线音源」。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GW_FALLBACK_URLS` | 空=关闭 | 在线音源，逗号分隔；默认 compose 已设为 `musicdl@http://fnmusic-sources:8001`，也可只写 URL 按端口推断类型 |
+| `GW_FALLBACK_URLS` | 空 | 在线音源，逗号分隔；默认 compose 已设为 `musicdl@http://fnmusic-sources:8001`，也可只写 URL 按端口推断类型 |
 | `GW_FALLBACK_TIMEOUT` | 8 | 在线音源请求超时（秒） |
 | `GW_FALLBACK_SEARCH_LIMIT` | 10 | 每个在线音源最多取几条 |
 | `GW_FALLBACK_TOTAL_LIMIT` | 50 | 所有音源合并后的总结果上限 |
 | `GW_FALLBACK_TOTAL_TIMEOUT` | 15 | 多源检索总超时预算（秒），到点返回已有结果 |
-| `GW_DOWNLOAD_DIR` | 空 | 下载与边播边存的落盘目录（指向飞牛曲库目录）；不配则下载/边播边存关闭 |
-| `GW_LIBRARY_SCAN_CMD` | 空 | 下载完成后触发的曲库扫描命令（如 `fnmusic-ext scan`），可选 |
+| `GW_DOWNLOAD_DIR` | 空 | 下载与边播边存的落盘目录；不配则下载/边播边存关闭 |
 | `GW_PREVIEW_MIN_SECONDS` | 35 | 转码后时长低于此值判为试听片段（很多在线源未登录只给 30 秒） |
 
 ### 搜索与心情
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GW_SMART_SEARCH` | 1 | 搜索是否做别名纠错 + 相关度排序；0=沿用飞牛原始顺序 |
+| `GW_SMART_SEARCH` | 1 | 搜索是否做别名纠错 + 相关度排序；0=直接用音源返回顺序 |
 | `GW_ALIASES_FILE` | `$GW_DATA/music_aliases.json` | ASR 同音字/错字纠正表（示例见 `data/music_aliases.json.example`，改完自动重载） |
 | `GW_MOODS_FILE` | `$GW_DATA/moods.json` | 心情映射表 |
 
-### 飞牛账号
+### 离线自测
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `FNMUSIC_BASE` | `http://192.168.50.100:59820` | 飞牛音乐地址 |
-| `FNMUSIC_USER` | KID | 必须是 KID |
-| `FNMUSIC_PASS` | 空 | 飞牛密码；登录后 token 落盘，之后可留空 |
-| `FNMUSIC_DEVICE_ID` | 内置 | 换设备号会强制重新登录 |
-| `FNMUSIC_TOKEN_FILE` | `$GW_DATA/fnmusic_token.json` | 登录 token 落盘位置 |
-| `FNMUSIC_MOCK` | 0 | 1=离线自测 |
+| `GW_MOCK` | 0 | 1=用内置假曲库自测，不连任何音源 |
 
 ## 接到小智
 
@@ -244,7 +241,7 @@ call_mcp_tool(conn, conn.mcp_client, "self.music.play_url", {
 })
 ~~~
 
-插件读环境变量 `FNMUSIC_GW_BASE`（默认 `http://192.168.50.100:8766`），可在 xiaozhi 容器里设。
+插件读环境变量 `FNMUSIC_GW_BASE`（默认 `http://NAS_IP:8766`），可在 xiaozhi 容器里设；网关设置了 `GW_ADMIN_TOKEN` 时插件也要带 `X-Admin-Token`。
 
 ### 方式 C：小智 MCP 接入点（wss，已有接入点时用这个）
 
@@ -329,9 +326,9 @@ curl -s "http://127.0.0.1:8766/api/play?query=%E6%99%B4%E5%A4%A9" \
 curl -s "<上一步的 lyric_url>" | head -3   # 期望 [00:29.36] 故事的小黃花 ...
 ~~~
 
-## 多音源兜底（本地优先，在线兜底）
+## 在线音源
 
-飞牛库里没有的歌，可以接到在线音源。环境变量默认**关闭**，设置 `GW_FALLBACK_URLS` 才启用；默认 `docker-compose.yml` 已经在内部网络里接好 musicdl 单源，不需要改：
+网关只做「搜索 → 转码 → 签名直链」，不登录任何音乐账号；音源由 [fnos_music_ext](https://github.com/12hgl/fnos_music_ext)（或自建 fork）的容器提供。默认 `docker-compose.yml` 已经在内部网络里接好 musicdl 单源，不需要改：
 
 ~~~bash
 # 单源：type@url；type 省略时按端口推断
@@ -339,22 +336,22 @@ GW_FALLBACK_URLS="musicdl@http://fnmusic-sources:8001"
 # 多个源用逗号分隔，每项写成 type@url（需要 :latest 全量镜像时再配）
 ~~~
 
-上游就是 [fnos_music_ext](https://github.com/12hgl/fnos_music_ext)（或自建 fork）的**音源容器**。
-默认 compose 中它只在内部网络 `fnmusic` 里监听，宿主不映射端口；容器内端口与类型对应：
+默认 compose 中音源容器只在内部网络 `fnmusic` 里监听，宿主不映射端口；容器内端口与类型对应：
 musicdl `8001`、musicbox `8002`、lxmusic `8003`、neteasefree `8005`。
-`/healthz` 的 `fallback` 字段会列出当前配置的源。
+`/healthz` 的 `fallback` 字段、`/api/sources`、MCP `music_sources` 都会列出当前配置的源与健康状态。
 
 行为：
 
-- **搜索**：本地曲库结果优先；条数不够才追加在线结果，并按「歌名+歌手」跨源去重。
+- **搜索**：并行问所有在线音源，按「歌名+歌手」跨源去重。
   在线结果的 `guid` 形如 `ext:<svc>:<原始 id>`，`source` 标明来自哪个源。
 - **播放**：`/api/play` / MCP `music_play` 对在线歌曲同样出签名直链，`source` 为在线源名；
   网关按需拉流 → ffmpeg 转 MP3 → 落缓存，设备端无感。
 - **试听识别**：转码后时长 < `GW_PREVIEW_MIN_SECONDS`（默认 35 秒）判为试听片段，
   `preview=true`、`duration=N`，`music_play` 会提示「这是试听片段，想听完整版就说收藏」。
-- **收藏即下载**：对在线歌曲 `music_favorite(action=add)` 会按源给的最高音质原样落到
-  `GW_DOWNLOAD_DIR`（指向飞牛曲库目录），文件名 `歌名 - 歌手.<flac|mp3>`；
-  配了 `GW_LIBRARY_SCAN_CMD` 就顺手触发曲库扫描，之后这首歌就走本地库了。
+- **收藏即下载**：`music_favorite(action=add)` / `music_download` / `POST /api/download` 会把在线歌曲按源给的最高音质原样落到
+  `GW_DOWNLOAD_DIR`，文件名 `歌名 - 歌手.<flac|mp3>`。
+- **账号类接口不可用**：歌单、收藏夹、本地曲库浏览属于账号数据，网关不提供；
+  `/api/playlists`、`/api/favorites`、`music_browse` 等在纯在线模式下返回明确提示（400 / 工具错误），不会静默给空列表。
 - **歌词**：在线源自带歌词优先（musicdl `/info`、lx `/api/v1/track/lyric`、其余 `/api/v1/song/{id}/lyric`），
   没有再回退 LRCLIB，仍然走同一套签名 `/lyrics/` 直链。
 
@@ -406,39 +403,39 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/healthz` | 存活探针：只证明进程活着，不碰 NAS |
-| GET | `/readyz` | 就绪探针：真访问一次曲库，异常返回 503 |
+| GET | `/healthz` | 存活探针：只证明进程活着，不探音源 |
+| GET | `/readyz` | 就绪探针：探一次在线音源健康，无健康源返回 503 |
 | GET | `/api/search?q=&limit=` | 搜歌（含别名纠正与排序） |
-| GET | `/api/playlists` | 列出歌单 |
-| GET | `/api/playlist?name=&limit=` | 按歌单名列出曲目 |
-| GET | `/api/favorites?limit=` | 列出收藏 |
+| GET | `/api/playlists` | 列出歌单（需本地曲库，在线模式返回 400） |
+| GET | `/api/playlist?name=&limit=` | 按歌单名列出曲目（需本地曲库） |
+| GET | `/api/favorites?limit=` | 列出收藏（需本地曲库） |
 | GET | `/api/mood?mood=&limit=` | 按心情/场景选曲 |
 | GET | `/api/play?query=\|mood=\|playlist=&index=&quality=` | 取签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
 | GET | `/api/status` | 上一次播放的是什么 |
 | GET | `/api/sources` | 各在线音源探活结果 |
-| GET | `/api/storage` | 缓存与本地曲库用量 |
+| GET | `/api/storage` | 缓存与本地下载目录用量 |
 | GET | `/api/quality` | 可用音质档位 |
-| POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid`） |
+| POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid`）；在线歌曲 add 时按最高音质下载到本地下载目录 |
 | POST | `/api/warm` | body `{"guid":"...","quality":"high"}`，预转码到缓存 |
-| POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地曲库 |
+| POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地下载目录 |
 | POST | `/mcp` | MCP streamable-http（JSON-RPC） |
 
 ### MCP 工具（12 个）
 
 | 工具 | 用途 |
 |---|---|
-| `music_search` | 本地优先搜歌，自动纠错排序，可在线兜底 |
-| `music_browse` | 浏览 track / album / artist / playlist |
-| `music_playlists` | 列出我的自建歌单 |
-| `music_playlist_tracks` | 按歌单名列出曲目 |
-| `music_favorites` | 列出收藏 |
+| `music_search` | 在所有在线音源里搜歌，跨源去重排序 |
+| `music_browse` | 浏览本地曲库（在线模式会返回明确提示） |
+| `music_playlists` | 列出我的自建歌单（在线模式不可用） |
+| `music_playlist_tracks` | 按歌单名列出曲目（在线模式不可用） |
+| `music_favorites` | 列出收藏（在线模式不可用） |
 | `music_mood` | 按心情/场景选曲 |
 | `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；可选 `quality` |
-| `music_favorite` | 收藏/取消收藏；在线歌曲 add 时按最高音质下载 |
+| `music_favorite` | 在线歌曲 add 时按最高音质下载到本地下载目录；remove 在线模式不可用 |
 | `music_status` | 上一次播放的是什么（含音质） |
-| `music_download` | 显式下载在线歌曲到本地曲库，可指定音质 |
+| `music_download` | 显式下载在线歌曲到本地下载目录，可指定音质 |
 | `music_sources` | 查看在线音源可用性 |
-| `music_storage` | 查看缓存与本地曲库用量 |
+| `music_storage` | 查看播放缓存与本地下载目录用量 |
 
 ## 自检与验收
 
@@ -446,8 +443,8 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 
 | 探针 | 语义 | 失败时 |
 |---|---|---|
-| `GET /healthz` | 存活：只证明网关进程活着，不碰 NAS（NAS 掉线时缓存仍能服务） | 进程挂了 |
-| `GET /readyz` | 就绪：真访问一次曲库 | 返回 503 + 原因（NAS 不通 / 账号错 / token 失效） |
+| `GET /healthz` | 存活：只证明网关进程活着，不探音源（音源掉线时缓存仍能服务） | 进程挂了 |
+| `GET /readyz` | 就绪：探一次在线音源健康 | 返回 503 + 原因（音源容器没起 / 源不可用） |
 
 ### 直链自测
 
@@ -466,7 +463,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 72 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 77 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/纯在线模式/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -490,9 +487,9 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（72 用例，含官方 MCPServer 2.3 与管理令牌路径） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（77 用例，含官方 MCPServer 2.3、管理令牌与纯在线模式路径） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、纯在线模式、音质档位与缓存分键、新 REST |
 
-真实飞牛曲库仍需在 NAS 同网段按上面的「直链自测」验收一次（开发机到 `192.168.50.100:59820` 不通）。
+真实音源容器仍需在 NAS 同网段按上面的「直链自测」验收一次（默认 compose 里的 `fnmusic-sources` 只在内网监听，开发机直连不到）。
 
 ## 已知限制
 
@@ -510,11 +507,10 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 ~~~
 app.py                    网关主体（HTTP/MCP 路由 + 依赖装配）
 gwlib/                    分层模块：errors/quality/storage/sources/playback/mcp_tools/mcp_server
-fnmusic_client.py         飞牛音乐客户端
 bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（72 用例）、bridge_selftest.py
+tests/                    test_gateway.py（77 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 桥接器 + 音源 + 同端口 WebUI（只发布 8766）
 ~~~

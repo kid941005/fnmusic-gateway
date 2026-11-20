@@ -16,6 +16,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 
 from . import __version__ as VERSION
+from .errors import BadRequest
 from .quality import get_profile
 from .storage import LibraryStore, _call_stream, _call_stream_to_path
 
@@ -248,10 +249,15 @@ class ExtProvider:
 
 
 class FallbackProvider:
-    """本地曲库优先；本地不足时并行问所有在线音源并按标题/歌手去重补齐。"""
+    """在线音源聚合器。
+
+    base=None 表示纯在线模式（不登录飞牛账号）：没有本地曲库、歌单和收藏，
+    相关方法直接给出明确提示；搜索、播放、下载全部走在线音源。
+    传入 base 时保持旧行为：本地曲库优先，本地不足再并行问在线音源补齐。
+    """
 
     def __init__(self, base, urls, timeout=8, search_limit=10,
-                 download_dir_getter=None, scan_cmd_getter=None, parallel=True,
+                 download_dir_getter=None, parallel=True,
                  max_bytes=0, total_limit=50, total_timeout=15):
         self.base = base
         self.exts = [ExtProvider(url, svc, timeout=timeout) for svc, url in
@@ -262,43 +268,50 @@ class FallbackProvider:
         self.total_timeout = max(1.0, float(total_timeout or 15))
         self.library = LibraryStore(
             download_dir_getter or (lambda: os.environ.get("GW_DOWNLOAD_DIR", "")),
-            scan_cmd_getter or (lambda: os.environ.get("GW_LIBRARY_SCAN_CMD", "")),
             LOG,
             max_bytes=max_bytes,
         )
 
+    def _local(self):
+        """取本地后端；纯在线模式下抛 BadRequest 而不是 AttributeError。"""
+        if self.base is None:
+            raise BadRequest("在线音源模式没有本地曲库/歌单/收藏；直接按歌名搜索即可")
+        return self.base
+
     def list_tracks(self, limit=20):
-        return self.base.list_tracks(limit)
+        return self._local().list_tracks(limit)
 
     def playlists(self):
-        return self.base.playlists()
+        return self._local().playlists()
 
     def playlist_tracks(self, guid, limit=200):
-        return self.base.playlist_tracks(guid, limit)
+        return self._local().playlist_tracks(guid, limit)
 
     def albums(self, limit=20):
-        return self.base.albums(limit)
+        return self._local().albums(limit)
 
     def artists(self, limit=20):
-        return self.base.artists(limit)
+        return self._local().artists(limit)
 
     def favorites(self, limit=100):
-        return self.base.favorites(limit)
+        return self._local().favorites(limit)
 
     def add_favorite(self, guid):
-        return self.base.add_favorite(guid)
+        return self._local().add_favorite(guid)
 
     def remove_favorite(self, guid):
-        return self.base.remove_favorite(guid)
+        return self._local().remove_favorite(guid)
 
     def search(self, q, limit=10):
         # 总结果上限：所有源加起来最多 total_limit 条
         cap = min(max(1, int(limit or 1)), self.total_limit)
-        try:
-            rows = list(self.base.search(q, cap) or [])[:cap]
-        except Exception as exc:
-            LOG.warning("local search failed: %s", exc)
-            rows = []
+        rows = []
+        if self.base is not None:
+            try:
+                rows = list(self.base.search(q, cap) or [])[:cap]
+            except Exception as exc:
+                LOG.warning("local search failed: %s", exc)
+                rows = []
         if len(rows) >= cap or not self.exts:
             return rows
         have = set((_norm_text(t.get("title")), _norm_text(t.get("artist"))) for t in rows)
@@ -360,13 +373,15 @@ class FallbackProvider:
             if not ext:
                 raise RuntimeError("在线音源未配置")
             return _call_stream(ext, guid, quality)
-        return _call_stream(self.base, guid, quality)
+        return _call_stream(self._local(), guid, quality)
 
     def stream_to_path(self, guid, path, quality=None):
-        target = self._ext(guid) if is_ext_guid(guid) else self.base
-        if target is None:
-            raise RuntimeError("在线音源未配置")
-        return _call_stream_to_path(target, guid, path, quality)
+        if is_ext_guid(guid):
+            ext = self._ext(guid)
+            if not ext:
+                raise RuntimeError("在线音源未配置")
+            return _call_stream_to_path(ext, guid, path, quality)
+        return _call_stream_to_path(self._local(), guid, path, quality)
 
     def lyrics_text(self, guid):
         if not is_ext_guid(guid):

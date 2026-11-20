@@ -80,8 +80,8 @@ def _device(conn, tool, args, timeout=15):
 
 @_reg(
     "fnmusic_gw_play",
-    "从飞牛音乐库播放歌曲。mode=search 按歌名（value 是歌名），mode=mood 按心情，"
-    "mode=playlist 按歌单名，mode=stop 停止播放。",
+    "从在线音源播放歌曲。mode=search 按歌名（value 是歌名），mode=mood 按心情，"
+    "mode=playlist 按歌单名（需本地曲库），mode=stop 停止播放。",
     {
         "type": "object",
         "properties": {
@@ -145,7 +145,7 @@ def fnmusic_gw_play(conn, mode="search", value="", quality=""):
 
 @_reg(
     "fnmusic_gw_search",
-    "在飞牛音乐库里搜歌，只列出结果不播放。",
+    "在在线音源里搜歌，只列出结果不播放。",
     {
         "type": "object",
         "properties": {"query": {"type": "string", "description": "歌名或歌手"}},

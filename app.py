@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""fnmusic-gateway —— 飞牛音乐(fnOS) → 小智 的一层网关。
+"""fnmusic-gateway —— 在线音源 → 小智 的一层网关。
 
 单端口出口（管理、MCP、播放、WebUI 全部走 GW_PORT）
 --------------------------------------------------
@@ -12,10 +12,11 @@
 辅助 REST
 --------
 GET /healthz                                  健康检查
-GET /api/search?q=&limit=                     搜歌
-GET /api/playlists                            歌单列表
-GET /api/playlist?name=&limit=                歌单曲目
-GET /api/favorites                            收藏
+GET /api/search?q=&limit=                     搜歌（在线音源）
+GET /api/sources                              在线音源健康状态
+GET /api/playlists                            歌单列表（需本地曲库）
+GET /api/playlist?name=&limit=                歌单曲目（需本地曲库）
+GET /api/favorites                            收藏（需本地曲库）
 GET /api/mood?mood=                           按心情选曲
 GET /api/play?query=|mood=|playlist=[&index=] 取播放直链（会预热转码）
 GET /api/status                               上一次播放
@@ -23,10 +24,10 @@ GET /api/status                               上一次播放
 设计约束（实测自固件 v2.6.0）
 ---------------------------
 - 设备只解 MP3；self.music.play_url 的 URL <= 2048 字节、仅 http/https、禁空白与 '@'
-- 飞牛 token 绝不进 URL：直链用 HMAC 短时签名（默认 15 分钟）
-- 飞牛曲库多为 FLAC：首次点播用 ffmpeg 转 128k/44.1k 立体声 MP3 并落盘缓存（LRU）
+- 音源地址与密钥绝不进 URL：直链用 HMAC 短时签名（默认 15 分钟）
+- 在线音源多为 FLAC/无损：首次点播用 ffmpeg 转 128k/44.1k 立体声 MP3 并落盘缓存（LRU）
 
-依赖：Python 3.9+ 标准库 + ffmpeg 可执行文件。无第三方包。
+依赖：Python 3.9+ 标准库 + ffmpeg 可执行文件；MCP 用官方 SDK 时需 mcp>=2.3。
 """
 import difflib
 import hashlib
@@ -104,7 +105,7 @@ MP3_BITRATE = _env("GW_MP3_BITRATE", "128k")
 MP3_SR = _env_int("GW_MP3_SR", 44100)
 MP3_CHANNELS = _env_int("GW_MP3_CHANNELS", 2)
 PREWARM = _env_bool("GW_PREWARM", True)
-MOCK = _env_bool("FNMUSIC_MOCK", False)
+MOCK = _env_bool("GW_MOCK", False)
 MOODS_FILE = _env("GW_MOODS_FILE", os.path.join(DATA_DIR, "moods.json"))
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
@@ -126,16 +127,15 @@ LYRICS_RETRY = max(60, _env_int("GW_LYRICS_RETRY", 86400))
 LYRIC_MAX_BYTES = 64 * 1024
 os.makedirs(LYRICS_DIR, exist_ok=True)
 
-# 在线音源兜底（fnos_music_ext 音源容器）。格式：逗号分隔，每项 "type@http://127.0.0.1:8768"
+# 在线音源（fnos_music_ext 音源容器）。格式：逗号分隔，每项 "type@http://host:port"
 # 或只写 URL（按端口猜类型：8768 musicdl / 8770 musicbox / 8772 lxmusic / 8776 neteasefree）。
-# 默认空 = 关闭兜底，行为与 1.4.0 完全一致。
+# 网关不登录任何音乐账号，只通过这些音源搜索/播放/下载；为空则启动后请求会明确报错。
 FALLBACK_URLS = [x.strip() for x in (_env("GW_FALLBACK_URLS", "") or "").split(",") if x.strip()]
 FALLBACK_TIMEOUT = max(1, _env_int("GW_FALLBACK_TIMEOUT", 8))
 FALLBACK_SEARCH_LIMIT = max(1, _env_int("GW_FALLBACK_SEARCH_LIMIT", 10))
 FALLBACK_TOTAL_LIMIT = max(1, _env_int("GW_FALLBACK_TOTAL_LIMIT", MAX_LIMIT))
 FALLBACK_TOTAL_TIMEOUT = max(1, _env_int("GW_FALLBACK_TOTAL_TIMEOUT", 15))
 DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
-LIBRARY_SCAN_CMD = _env("GW_LIBRARY_SCAN_CMD", "")
 PREVIEW_MIN_SECONDS = max(1, _env_int("GW_PREVIEW_MIN_SECONDS", 35))
 
 # 音质与存储策略
@@ -157,7 +157,7 @@ logging.basicConfig(level=_log_level(_env("GW_LOG_LEVEL", "INFO")),
                     format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("fnmusic-gw")
 
-# 同时最多几个 ffmpeg：防止多台设备同时点播把 NAS 的 CPU 打满
+# 同时最多几个 ffmpeg：防止多台设备同时点播把宿主机 CPU 打满
 _TRANSCODE_SLOTS = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
 
 
@@ -473,60 +473,12 @@ def save_state(d):
 
 # ---------------------------------------------------------------- 转码缓存
 CACHE = MediaCache(CACHE_DIR, CACHE_MAX, LOG, transcode_slots=_TRANSCODE_SLOTS)
-LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, lambda: LIBRARY_SCAN_CMD, LOG,
-                       max_bytes=LIBRARY_MAX_BYTES)
+LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG, max_bytes=LIBRARY_MAX_BYTES)
 
 
 # ---------------------------------------------------------------- provider
-class FnProvider:
-    """飞牛音乐真实后端。"""
-
-    def __init__(self):
-        from fnmusic_client import FnMusicClient
-        self.client = FnMusicClient(
-            base=_env("FNMUSIC_BASE", _env("FNOS_BASE", "http://192.168.50.100:59820")),
-            username=_env("FNMUSIC_USER", _env("FNOS_USER", "KID")),
-            password=_env("FNMUSIC_PASS", _env("FNOS_PASS", "")) or None,
-            device_id=_env("FNMUSIC_DEVICE_ID", _env("FNOS_DEVICE_ID", "")) or None,
-            token_file=_env("FNMUSIC_TOKEN_FILE", os.path.join(DATA_DIR, "fnmusic_token.json")),
-        )
-        self.client.ensure_token()
-
-    def search(self, q, limit=10):
-        return dedupe(norm_track(t) for t in _rows(self.client.search_track(q, 1, limit)))
-
-    def list_tracks(self, limit=20):
-        return dedupe(norm_track(t) for t in _rows(self.client.track_list(1, limit)))
-
-    def playlists(self):
-        return [norm_playlist(p) for p in _rows(self.client.playlist_list(1, 200))]
-
-    def playlist_tracks(self, guid, limit=200):
-        return dedupe(norm_track(t) for t in _rows(self.client.playlist_tracks(guid, 1, limit)))
-
-    def albums(self, limit=20):
-        rows = _rows(self.client.album_list(1, limit))
-        return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
-
-    def artists(self, limit=20):
-        rows = _rows(self.client.artist_list(1, limit))
-        return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
-
-    def favorites(self, limit=100):
-        return dedupe(norm_track(t) for t in _rows(self.client.favorite_list(1, limit)))
-
-    def stream(self, guid):
-        return self.client.stream_bytes(guid)
-
-    def add_favorite(self, guid):
-        self.client.favorite_add(guid)
-
-    def remove_favorite(self, guid):
-        self.client.favorite_remove(guid)
-
-
 class MockProvider:
-    """离线自测用：不需要 NAS，音频是本地生成的 4 秒正弦波。"""
+    """离线自测用：不需要任何音源，音频是本地生成的 4 秒正弦波。"""
 
     TRACKS = [
         {"guid": "mock-1", "title": "晴天", "artist": "周杰伦", "album": "叶惠美"},
@@ -589,7 +541,7 @@ _PROVIDER_LOCK = threading.Lock()
 
 
 def provider():
-    """惰性单例。并发首请求只登录一次（否则会重复登录/重复建连接）。"""
+    """惰性单例。纯在线音源模式：不登录任何音乐账号，只连 GW_FALLBACK_URLS。"""
     global _PROVIDER, _PROVIDER_ERR
     p = _PROVIDER
     if p is not None:
@@ -599,19 +551,20 @@ def provider():
             try:
                 if MOCK:
                     _PROVIDER = MockProvider()
+                elif FALLBACK_URLS:
+                    _PROVIDER = FallbackProvider(
+                        None, FALLBACK_URLS, timeout=FALLBACK_TIMEOUT,
+                        search_limit=FALLBACK_SEARCH_LIMIT,
+                        download_dir_getter=lambda: DOWNLOAD_DIR,
+                        max_bytes=LIBRARY_MAX_BYTES,
+                        parallel=SOURCE_SEARCH_PARALLEL,
+                        total_limit=FALLBACK_TOTAL_LIMIT,
+                        total_timeout=FALLBACK_TOTAL_TIMEOUT)
+                    LOG.info("online sources enabled: %s", ", ".join(fallback_services()))
                 else:
-                    _PROVIDER = FnProvider()
-                    if FALLBACK_URLS:
-                        _PROVIDER = FallbackProvider(
-                            _PROVIDER, FALLBACK_URLS, timeout=FALLBACK_TIMEOUT,
-                            search_limit=FALLBACK_SEARCH_LIMIT,
-                            download_dir_getter=lambda: DOWNLOAD_DIR,
-                            scan_cmd_getter=lambda: LIBRARY_SCAN_CMD,
-                            max_bytes=LIBRARY_MAX_BYTES,
-                            parallel=SOURCE_SEARCH_PARALLEL,
-                            total_limit=FALLBACK_TOTAL_LIMIT,
-                            total_timeout=FALLBACK_TOTAL_TIMEOUT)
-                        LOG.info("fallback enabled: %s", ", ".join(fallback_services()))
+                    raise RuntimeError(
+                        "未配置在线音源：请设置 GW_FALLBACK_URLS"
+                        "（如 musicdl@http://fnmusic-sources:8001）")
                 _PROVIDER_ERR = None
             except Exception as e:
                 _PROVIDER_ERR = str(e)
@@ -624,7 +577,7 @@ def provider_error():
 
 
 class _LazyProvider:
-    """按需构造 provider，避免 music_sources/music_storage/music_status 依赖飞牛可用性。"""
+    """按需构造 provider，避免 music_sources/music_storage/music_status 依赖音源可用性。"""
 
     def __init__(self):
         self._p = None
@@ -974,7 +927,7 @@ def call_tool(name, args, base):
 
     if name == "music_sources":
         if not FALLBACK_URLS:
-            return "没有配置在线音源（GW_FALLBACK_URLS 为空），只用本地曲库。"
+            return "没有配置在线音源（GW_FALLBACK_URLS 为空）。网关不登录音乐账号，请先配置音源地址。"
         rows = source_status(FALLBACK_URLS)
         lines = ["在线音源 %d 个：" % len(rows)]
         for item in rows:
@@ -1234,8 +1187,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._admin_ok(path):
                 return self._unauthorized()
             if path == "/healthz":
-                # 存活探针：只证明进程活着，不碰 NAS（NAS 掉线时缓存仍能服务）
-                return self._json({"ok": True, "version": VERSION, "mock": MOCK,
+                # 存活探针：只证明进程活着，不探音源（音源掉线时缓存仍能服务）
+                return self._json({"ok": True, "version": VERSION,
+                                   "mode": "mock" if MOCK else "online",
+                                   "mock": MOCK,
                                    "provider_error": provider_error(),
                                    "fallback": fallback_services(),
                                    "quality_default": QUALITY_DEFAULT,
@@ -1248,7 +1203,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "cache_mb": round(self._cache_mb(), 1),
                                    "moods": sorted(MOODS.keys())})
             if path == "/readyz":
-                # 就绪探针：真访问一次曲库，NAS/账号异常回 503
+                # 就绪探针：真探一次数据面，音源全挂时回 503
                 return self._handle_readyz()
             if path == "/play" or path.startswith("/play/"):
                 return self._handle_play(u, qs)
@@ -1339,6 +1294,15 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json({"error": "track not found"}, 404)
                     guid = rows[0]["guid"]
                 if action == "add":
+                    if is_ext_guid(guid) and hasattr(p, "download_ext"):
+                        st = load_state()
+                        track = {"guid": guid,
+                                 "title": (st.get("title") if st.get("guid") == guid else "") or guid,
+                                 "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
+                                 "source": "ext"}
+                        fp, n = p.download_ext(track, DEFAULT_QUALITY)
+                        return self._json({"ok": True, "guid": guid, "action": action,
+                                           "saved": fp, "bytes": n})
                     p.add_favorite(guid)
                 else:
                     p.remove_favorite(guid)
@@ -1422,13 +1386,18 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found", "path": u.path}, 404)
 
     def _handle_readyz(self):
+        """就绪探针：mock 探本地曲目，在线模式探所有音源健康状态。"""
         try:
-            p = provider()
-            rows = p.list_tracks(1)
-            return self._json({"ok": True, "provider": "mock" if MOCK else "fnmusic",
-                               "tracks_probe": len(rows)})
+            if MOCK:
+                rows = provider().list_tracks(1)
+                return self._json({"ok": True, "mode": "mock", "tracks_probe": len(rows)})
+            rows = source_status(FALLBACK_URLS, timeout=3)
+            healthy = [r for r in rows if r.get("healthy")]
+            return self._json({"ok": bool(healthy), "mode": "online", "sources": rows},
+                              200 if healthy else 503)
         except Exception as e:
-            return self._json({"ok": False, "error": str(e)}, 503)
+            return self._json({"ok": False, "mode": "mock" if MOCK else "online",
+                               "error": str(e)}, 503)
 
     def _cache_mb(self):
         try:

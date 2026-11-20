@@ -385,24 +385,30 @@ class TestWebUI(Base):
         super().tearDownClass()
 
     def _cookie(self):
-        r, _ = self.req("GET", "/app/fnmusic-ext/?token=" + app.ADMIN_TOKEN, raw=True)
+        r, _ = self.req("GET", "/?token=" + app.ADMIN_TOKEN, raw=True)
         self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/")
         raw = r.getheader("Set-Cookie") or ""
         self.assertIn("fnmusic_admin=", raw)
         return raw.split(";")[0]
 
-    def test_root_redirects_to_webui(self):
+    def test_root_is_webui(self):
+        # 未登录：根路径直接 401（不再跳转长前缀）
         r, _ = self.req("GET", "/", raw=True)
-        self.assertEqual(r.status, 302)
-        self.assertEqual(r.getheader("Location"), "/app/fnmusic-ext/")
-
-    def test_webui_requires_token_then_sets_cookie(self):
-        r, _ = self.req("GET", "/app/fnmusic-ext/", raw=True)
         self.assertEqual(r.status, 401)
+        # ?token= 校验后写 Cookie 并回到根
         cookie = self._cookie()
-        r, body = self.req("GET", "/app/fnmusic-ext/", headers={"Cookie": cookie}, raw=True)
+        r, body = self.req("GET", "/", headers={"Cookie": cookie}, raw=True)
         self.assertEqual(r.status, 200)
         self.assertIn(b"webui", body)
+        # 上游收到的就是 "/"
+        self.assertEqual(_FakeWebUIHandler.seen[-1][1], "/")
+
+    def test_legacy_prefix_still_proxied_for_assets(self):
+        cookie = self._cookie()
+        r, body = self.req("GET", "/app/fnmusic-ext/static/app.js", headers={"Cookie": cookie}, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn(b"APP_BASE", body)
 
     def test_webui_proxies_api_and_injects_admin_header(self):
         cookie = self._cookie()
@@ -579,7 +585,7 @@ class TestFallback(unittest.TestCase):
 
 
 class TestOnlineOnly(unittest.TestCase):
-    """2.4.0：不登录飞牛账号，FallbackProvider(base=None) 只走在线音源。"""
+    """2.4.x：不登录飞牛账号，FallbackProvider(base=None) 只走在线音源。"""
 
     def _fp(self, rows=None):
         fp = app.FallbackProvider(None, ["musicdl@http://x:1"])
@@ -919,7 +925,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.4.0")
+        self.assertEqual(app.VERSION, "2.4.1")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

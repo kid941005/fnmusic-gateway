@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.4.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.4.1**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
 
 在线音源 → 小智 的播放网关。**不接管飞牛音乐，不登录任何音乐账号**；一个进程，一个端口，WebUI 同端口：
 
@@ -28,7 +28,7 @@
 - **音质可选**：`standard / high / exhigh / lossless` 四档，设备始终拿 MP3，下载保留原始音质。
 - **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地下载目录。
 - **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / mcp_tools / mcp_server 七层，新增音源或音质策略不改播放层与 MCP 层。
-- **同端口 WebUI**：音源管理界面通过 `/app/fnmusic-ext/` 反代到 8766，浏览器不需要再访问单独的 WebUI 端口，也不额外暴露宿主机端口。
+- **同端口 WebUI**：音源管理界面直接挂在 8766 根路径（`http://NAS_IP:8766/`），浏览器不需要记路径、也不需要访问单独的 WebUI 端口，不额外暴露宿主机端口。
 - **官方 MCP 2.3**：`/mcp` 由官方 `mcp>=2.3` 的 `MCPServer`（原 FastMCP）提供工具注册、参数校验与错误包装，旧 JSON-RPC 仅在依赖缺失时兜底。
 
 ## 为什么需要这一层
@@ -61,7 +61,7 @@
 
 | 入口 | 地址 | 谁用 |
 |---|---|---|
-| WebUI | `http://NAS_IP:8766/app/fnmusic-ext/` | 浏览器（音源管理） |
+| WebUI | `http://NAS_IP:8766/` | 浏览器（音源管理，根路径直达） |
 | MCP | `http://NAS_IP:8766/mcp` | 小智服务端 / 桥接器 |
 | REST / 播放 | `http://NAS_IP:8766/api/...`、`/play/...` | 插件、设备直链 |
 
@@ -107,19 +107,19 @@ curl -s -H "X-Admin-Token: $TOKEN" 127.0.0.1:8766/api/quality
 浏览器访问：
 
 ~~~text
-http://NAS_IP:8766/app/fnmusic-ext/?token=<GW_ADMIN_TOKEN>
+http://NAS_IP:8766/?token=<GW_ADMIN_TOKEN>
 ~~~
 
-网关校验 token 后写入 HttpOnly Cookie，并 302 去掉 URL 里的 token；之后直接访问
-`http://NAS_IP:8766/app/fnmusic-ext/` 即可。WebUI 里的管理 API 由网关注入管理员身份，
-不需要在浏览器里手工加 Header。
+网关校验 token 后写入 HttpOnly Cookie，并 302 回到 `/`（URL 里的 token 被去掉）；之后直接访问
+`http://NAS_IP:8766/` 即可。WebUI 里的管理 API 由网关注入管理员身份，不需要在浏览器里手工加 Header。
+（上游管理台前端固化了 `/app/fnmusic-ext/static|api` 前缀，网关仍保留该前缀的反代供其资源与 API 使用，但浏览地址就是根路径。）
 
 ### 端口与安全边界
 
 - **只发布 8766**：网关容器 `ports: 8766:8766`；音源容器零端口。
 - **内部回环**：官方 MCPServer 2.3 在容器内 `127.0.0.1` 的随机端口启动，只给网关自己转发 `/mcp`，不映射到宿主机。
 - **鉴权**：`GW_ADMIN_TOKEN` 保护 `/api/*`、`/mcp`、WebUI；`/play/`、`/lyrics/`、`/healthz` 匿名。
-- **公网**：Lucky/nginx 只反代 8766 的 `/play/` 与 `/lyrics/`；不要反代 `/app/fnmusic-ext/`、`/api/`、`/mcp`。
+- **公网**：Lucky/nginx 只反代 8766 的 `/play/` 与 `/lyrics/`；不要反代 `/`、`/api/`、`/mcp`（`/` 就是 WebUI）。
 - **WebUI 镜像**：默认 `:musicdl-webui`（musicdl + WebUI，约 906 MB）。需要网易/洛雪时把
   `FNMUSIC_SOURCES_IMAGE` 改成 `:latest` 全量镜像；内部端口仍是 8001/8004，不需要增加宿主机端口。
 - **本地下载目录**：下载与边播边存写到容器内 `/music`，compose 已挂到宿主机 `./music`；
@@ -366,14 +366,14 @@ musicdl `8001`、musicbox `8002`、lxmusic `8003`、neteasefree `8005`。
 |---|---|
 | `GET/HEAD /play/<guid>.mp3?exp=&sig=` | 是（支持 Range） |
 | `GET/HEAD /lyrics/<guid>.lrc?exp=&sig=` | 是 |
-| `/api/*`、`/mcp`、`/app/fnmusic-ext/*`、`/healthz`、`/readyz` | **否** |
+| `/`、`/api/*`、`/mcp`、`/app/fnmusic-ext/*`、`/healthz`、`/readyz` | **否**（`/` 即 WebUI） |
 
 Lucky 配置要点：
 
 - 前端地址：`https://fnmusic.example.com:59826`
 - 后端地址：`http://192.168.50.100:8766`
 - 路径规则：只放行 `/play/*` 与 `/lyrics/*`；其余路径直接拒绝
-- **不要**把 `/app/fnmusic-ext/` 反代到公网；WebUI 走内网或 VPN
+- **不要**把 `/`（WebUI）反代到公网；WebUI 走内网或 VPN
 - `GW_PUBLIC_BASE` 可留空（按请求 Host 推导），也可显式设成公网域名，设备直链会用它
 
 验证（应全部符合上表）：
@@ -381,7 +381,7 @@ Lucky 配置要点：
 ~~~bash
 curl -s -o /dev/null -w '%{http_code}' https://fnmusic.example.com/healthz; echo
 curl -s -o /dev/null -w '%{http_code}' https://fnmusic.example.com/api/playlists; echo
-curl -s -o /dev/null -w '%{http_code}' https://fnmusic.example.com/app/fnmusic-ext/; echo
+curl -s -o /dev/null -w '%{http_code}' https://fnmusic.example.com/; echo   # WebUI，应 401/403
 curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' https://fnmusic.example.com/mcp; echo
 ~~~
 
@@ -482,7 +482,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 篡改 sig / 过期 | 403 |
 | `Range: bytes=0-99` | 206，100 字节 |
 | `DELETE /mcp`（会话关闭） | 204，无告警 |
-| 同端口 WebUI（mock 上游） | `/` 302 到 `/app/fnmusic-ext/`；无 token 401；`?token=` 302 + HttpOnly Cookie；静态/API/POST/PUT 反代成功，上游收到 `X-Trim-IsAdmin: true` |
+| 同端口 WebUI（mock 上游） | `/` 直接返回管理台 HTML（无 token 401）；`/?token=` 302 回 `/` + HttpOnly Cookie；`/app/fnmusic-ext/static|api` 反代成功，上游收到 `X-Trim-IsAdmin: true`；POST/PUT 正常 |
 | 歌词链路（真实 LRCLIB） | `/api/play?query=晴天` → `lyric_url`；拉取 200 `text/plain; charset=utf-8`，首行 `[00:29.36] 故事的小黃花`（带 LRC 时间戳，固件才认） |
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |

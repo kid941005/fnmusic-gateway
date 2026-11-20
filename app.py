@@ -1040,6 +1040,12 @@ class Handler(BaseHTTPRequestHandler):
         if (path in ("/", "/healthz") or path == "/play" or path.startswith("/play/")
                 or path == "/lyrics" or path.startswith("/lyrics/")):
             return True
+        return self._admin_credential_ok()
+
+    def _admin_credential_ok(self):
+        """只校验凭据本身（Header / Bearer / Cookie），不看路径是否公开。"""
+        if not ADMIN_TOKEN:
+            return True
         supplied = (self.headers.get("X-Admin-Token") or "").strip()
         auth = (self.headers.get("Authorization") or "").strip()
         if not supplied and auth.lower().startswith("bearer "):
@@ -1068,12 +1074,18 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.urlencode(pairs)
         return u.path + (("?" + q) if q else "")
 
-    def _handle_root(self, u, _qs):
-        if WEBUI_ENABLED:
-            q = ("?" + u.query) if u.query else ""
-            return self._redirect(WEBUI_PREFIX + "/" + q)
-        return self._json({"service": "fnmusic-gateway", "version": VERSION,
-                           "webui": False, "mcp": "/mcp"})
+    def _handle_root(self, u, qs):
+        if not WEBUI_ENABLED:
+            return self._json({"service": "fnmusic-gateway", "version": VERSION,
+                               "webui": False, "mcp": "/mcp"})
+        token = (qs.get("token") or [""])[0]
+        if token and ADMIN_TOKEN:
+            if not hmac.compare_digest(token, ADMIN_TOKEN):
+                return self._unauthorized()
+            return self._redirect("/", [self._admin_cookie_header()])
+        if not self._admin_credential_ok():
+            return self._unauthorized()
+        return self._proxy_webui("/")
 
     def _handle_webui_get(self, u, qs):
         if u.path == WEBUI_PREFIX:
@@ -1088,7 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._unauthorized()
         return self._proxy_webui()
 
-    def _proxy_webui(self):
+    def _proxy_webui(self, upstream_path=None):
         if not WEBUI_ENABLED:
             return self._json({"error": {"code": "webui_disabled", "message": "未配置 WebUI"}}, 404)
         target = urllib.parse.urlparse(WEBUI_URL)
@@ -1098,7 +1110,8 @@ class Handler(BaseHTTPRequestHandler):
         if n < 0 or n > WEBUI_BODY_CAP:
             return self._json({"error": {"code": "payload_too_large", "message": "请求体过大"}}, 413)
         body = self.rfile.read(n) if n else b""
-        upath = (target.path.rstrip("/") + self.path) or "/"
+        req_path = upstream_path if upstream_path is not None else self.path
+        upath = (target.path.rstrip("/") + req_path) or "/"
         conn = None
         try:
             port = target.port or (443 if target.scheme == "https" else 80)

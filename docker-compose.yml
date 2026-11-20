@@ -2,7 +2,7 @@
 # fnmusic 单端口版：3 个容器，宿主机只发布 1 个端口（8766）
 #
 #   浏览器/小智/设备都只访问 8766：
-#     - WebUI      http://NAS_IP:8766/app/fnmusic-ext/
+#     - WebUI      http://NAS_IP:8766/（根路径直达）
 #     - MCP        http://NAS_IP:8766/mcp
 #     - REST/播放  http://NAS_IP:8766/api/...、/play/...
 #     - 音源容器不映射任何宿主机端口，只在内部网络 fnmusic 里访问
@@ -10,7 +10,7 @@
 # 安全模型：
 #   - GW_ADMIN_TOKEN 保护管理接口、MCP 与 WebUI（/play/、/lyrics/、/healthz 匿名）
 #   - 公网只让 Lucky/nginx 反代 8766，并且只转发 /play/ 与 /lyrics/
-#   - WebUI 首次访问：http://NAS_IP:8766/app/fnmusic-ext/?token=<GW_ADMIN_TOKEN>
+#   - WebUI 首次访问：http://NAS_IP:8766/?token=<GW_ADMIN_TOKEN>
 #     网关校验后写入 HttpOnly Cookie 并 302 去掉 URL 里的 token
 #
 # 首次使用（NAS 上 root）：

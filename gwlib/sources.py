@@ -10,15 +10,16 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 
+from . import __version__ as VERSION
 from .quality import get_profile
-from .storage import LibraryStore, _call_stream
+from .storage import LibraryStore, _call_stream, _call_stream_to_path
 
 LOG = logging.getLogger("fnmusic-gw.sources")
-VERSION = "2.0.0"
 EXT_PREFIX = "ext:"
 SERVICE_PORTS = {"8768": "musicdl", "8770": "musicbox", "8772": "lxmusic", "8776": "neteasefree"}
 SERVICE_ALIASES = {"musicdl": "musicdl", "lx": "lxmusic", "lxmusic": "lxmusic",
@@ -199,15 +200,31 @@ class ExtProvider:
             url = data.get("url")
         return str(url or "")
 
-    def stream(self, guid, quality=None):
+    def _open(self, guid, quality=None):
         _svc, eid = ext_split(guid)
         url = self._resolve_url(eid, quality)
         if not url:
             raise RuntimeError("在线音源未返回可播放地址（%s）" % self.svc)
         req = urllib.request.Request(url, headers={"User-Agent": "fnmusic-gateway/" + self.version})
-        with urllib.request.urlopen(req, timeout=max(20, self.timeout * 3)) as resp:
+        return urllib.request.urlopen(req, timeout=max(20, self.timeout * 3))
+
+    def stream(self, guid, quality=None):
+        with self._open(guid, quality) as resp:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             return ctype, resp.read()
+
+    def stream_to_path(self, guid, path, quality=None):
+        """流式写入文件，避免把整首无损音频读进内存。返回 (content_type, 字节数)。"""
+        with self._open(guid, quality) as resp, open(path, "wb") as fh:
+            ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+            total = 0
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                total += len(chunk)
+            return ctype, total
 
     def lyrics(self, guid):
         _svc, eid = ext_split(guid)
@@ -235,12 +252,14 @@ class FallbackProvider:
 
     def __init__(self, base, urls, timeout=8, search_limit=10,
                  download_dir_getter=None, scan_cmd_getter=None, parallel=True,
-                 max_bytes=0):
+                 max_bytes=0, total_limit=50, total_timeout=15):
         self.base = base
         self.exts = [ExtProvider(url, svc, timeout=timeout) for svc, url in
                      (parse_spec(spec) for spec in urls)]
         self.search_limit = max(1, int(search_limit or 10))
         self.parallel = parallel
+        self.total_limit = max(1, int(total_limit or 50))
+        self.total_timeout = max(1.0, float(total_timeout or 15))
         self.library = LibraryStore(
             download_dir_getter or (lambda: os.environ.get("GW_DOWNLOAD_DIR", "")),
             scan_cmd_getter or (lambda: os.environ.get("GW_LIBRARY_SCAN_CMD", "")),
@@ -273,31 +292,50 @@ class FallbackProvider:
         return self.base.remove_favorite(guid)
 
     def search(self, q, limit=10):
+        # 总结果上限：所有源加起来最多 total_limit 条
+        cap = min(max(1, int(limit or 1)), self.total_limit)
         try:
-            rows = self.base.search(q, limit)
+            rows = list(self.base.search(q, cap) or [])[:cap]
         except Exception as exc:
             LOG.warning("local search failed: %s", exc)
             rows = []
-        if len(rows) >= limit or not self.exts:
+        if len(rows) >= cap or not self.exts:
             return rows
         have = set((_norm_text(t.get("title")), _norm_text(t.get("artist"))) for t in rows)
-        need = limit - len(rows)
+        need = cap - len(rows)
         per_source = max(need, self.search_limit)
+        deadline = time.monotonic() + self.total_timeout
         batches = []
-        if self.parallel and len(self.exts) > 1:
-            with ThreadPoolExecutor(max_workers=min(4, len(self.exts))) as pool:
-                futures = {pool.submit(ext.search, q, per_source): ext for ext in self.exts}
-                for future in as_completed(futures):
+        workers = min(4, len(self.exts)) if (self.parallel and len(self.exts) > 1) else 1
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = {}
+        try:
+            futures = {pool.submit(ext.search, q, per_source): ext for ext in self.exts}
+            if workers == 1:
+                # 串行：逐个等，但每个都受剩余总预算限制
+                for future in futures:
+                    remaining = max(0.0, deadline - time.monotonic())
                     try:
-                        batches.append(future.result())
+                        batches.append(future.result(timeout=remaining))
+                    except FuturesTimeoutError:
+                        LOG.warning("online search exceeded %.1fs total budget", self.total_timeout)
+                        break
                     except Exception:
                         batches.append([])
-        else:
-            for ext in self.exts:
+            else:
+                # 并行：到点就停止等待，已返回的结果照常合并
                 try:
-                    batches.append(ext.search(q, per_source))
-                except Exception:
-                    batches.append([])
+                    for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+                        try:
+                            batches.append(future.result())
+                        except Exception:
+                            batches.append([])
+                except FuturesTimeoutError:
+                    LOG.warning("online search exceeded %.1fs total budget", self.total_timeout)
+        finally:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
         for batch in batches:
             for track in batch:
                 key = (_norm_text(track.get("title")), _norm_text(track.get("artist")))
@@ -305,10 +343,9 @@ class FallbackProvider:
                     continue
                 have.add(key)
                 rows.append(track)
-                need -= 1
-                if need <= 0:
-                    return rows[:limit]
-        return rows[:limit]
+                if len(rows) >= cap:
+                    return rows[:cap]
+        return rows[:cap]
 
     def _ext(self, guid):
         svc, _ = ext_split(guid)
@@ -324,6 +361,12 @@ class FallbackProvider:
                 raise RuntimeError("在线音源未配置")
             return _call_stream(ext, guid, quality)
         return _call_stream(self.base, guid, quality)
+
+    def stream_to_path(self, guid, path, quality=None):
+        target = self._ext(guid) if is_ext_guid(guid) else self.base
+        if target is None:
+            raise RuntimeError("在线音源未配置")
+        return _call_stream_to_path(target, guid, path, quality)
 
     def lyrics_text(self, guid):
         if not is_ext_guid(guid):

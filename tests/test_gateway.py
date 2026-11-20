@@ -5,6 +5,7 @@
 
 覆盖：签名/直链、纯函数、MCP JSON-RPC、REST、Range 下载、参数校验。
 """
+import gc
 import http.client
 import json
 import os
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+import weakref
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
@@ -527,6 +529,15 @@ class TestExtProviderHttp(unittest.TestCase):
         self.assertGreater(len(body), 100)
         self.assertIn("hello", e.lyrics("ext:musicdl:s1"))
 
+    def test_stream_to_path(self):
+        e = gw_sources.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
+        d = tempfile.mkdtemp(prefix="gw-stream-", dir=DATA)
+        fp = os.path.join(d, "a.mp3")
+        ctype, n = e.stream_to_path("ext:musicdl:s1", fp)
+        self.assertIn("mpeg", ctype)
+        self.assertEqual(n, os.path.getsize(fp))
+        self.assertGreater(n, 100)
+
 
 class TestSearchApi(Base):
     """REST 搜索走排序与别名纠正。"""
@@ -749,6 +760,67 @@ class TestAuditFixes(unittest.TestCase):
     def test_fallback_library_gets_max_bytes(self):
         fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"], max_bytes=123)
         self.assertEqual(fp.library.max_bytes, 123)
+
+class TestRelease201(unittest.TestCase):
+    """2.0.1：流式落盘、弱引用锁、单版本常量、搜索总上限/总超时。"""
+
+    def test_single_version_constant(self):
+        import gwlib
+        self.assertEqual(app.VERSION, "2.0.1")
+        self.assertEqual(gw_sources.VERSION, app.VERSION)
+        self.assertEqual(gwlib.__version__, app.VERSION)
+
+    def test_media_cache_locks_are_weak(self):
+        d = tempfile.mkdtemp(prefix="gw-locks-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 1024)
+        lock = cache._lock("k")
+        self.assertIs(cache._lock("k"), lock)
+        self.assertIsInstance(cache._locks, weakref.WeakValueDictionary)
+        ref = weakref.ref(lock)
+        del lock
+        gc.collect()
+        self.assertIsNone(ref())
+
+    def test_fallback_total_limit_caps_merged_rows(self):
+        rows = [{"guid": "ext:musicdl:%d" % i, "title": "t%d" % i,
+                 "artist": "a", "source": "musicdl"} for i in range(20)]
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"],
+                                  total_limit=3, total_timeout=2)
+        fp.exts = [_FakeExt(rows)]
+        out = fp.search("t", 10)
+        self.assertEqual(len(out), 3)
+
+    def test_fallback_total_timeout_stops_waiting(self):
+        class SlowExt:
+            svc = "musicdl"
+
+            def search(self, q, limit=10):
+                app.time.sleep(0.4)
+                return [{"guid": "ext:musicdl:slow", "title": q, "artist": "a"}]
+
+        fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"],
+                                  total_limit=5, total_timeout=1)
+        fp.exts = [SlowExt()]
+        fp.total_timeout = 0.05
+        started = app.time.monotonic()
+        out = fp.search("x", 5)
+        elapsed = app.time.monotonic() - started
+        self.assertLess(elapsed, 0.35)
+        self.assertEqual(out, [])
+
+    def test_library_save_from_provider_streams_to_file(self):
+        class StreamProv:
+            def stream_to_path(self, guid, path, quality=None):
+                with open(path, "wb") as fh:
+                    fh.write(b"ID3" * 100)
+                return "audio/mpeg", 300
+
+        d = tempfile.mkdtemp(prefix="gw-lib-stream-", dir=DATA)
+        lib = gw_storage.LibraryStore(lambda: d, lambda: "")
+        fp, size = lib.save_from_provider(StreamProv(), {"guid": "ext:x:1", "title": "t", "artist": "a"})
+        self.assertEqual(size, 300)
+        self.assertTrue(fp.endswith(".mp3"))
+        self.assertEqual(os.path.getsize(fp), 300)
 
 
 if __name__ == "__main__":

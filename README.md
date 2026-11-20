@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.0.0**（2026-11-19） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.0.1**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐（fnOS Music）→ 小智 的播放网关。**一个进程，两个出口**：
 
@@ -84,17 +84,17 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 镜像与版本
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64` 并推到 GHCR。
-以 `v2.0.0` 为例，会生成 `2.0.0`、`2.0`、`latest`、`sha-xxxxxxx` 四个标签。
+以 `v2.0.1` 为例，会生成 `2.0.1`、`2.0`、`latest`、`sha-xxxxxxx` 四个标签。
 
 ~~~bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:2.0.0   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:2.0.1   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ~~~
 
 两份 compose 默认跟 `latest`；想锁定版本或换本地镜像时用 `GW_IMAGE` 覆盖：
 
 ~~~bash
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.0.0 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.0.1 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合本地 build
 ~~~
 
@@ -205,6 +205,8 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 | `GW_FALLBACK_URLS` | 空=关闭 | 在线音源，逗号分隔，如 `musicdl@http://127.0.0.1:8768`；也可只写 URL，按端口推断类型 |
 | `GW_FALLBACK_TIMEOUT` | 8 | 在线音源请求超时（秒） |
 | `GW_FALLBACK_SEARCH_LIMIT` | 10 | 每个在线音源最多取几条 |
+| `GW_FALLBACK_TOTAL_LIMIT` | 50 | 所有音源合并后的总结果上限 |
+| `GW_FALLBACK_TOTAL_TIMEOUT` | 15 | 多源检索总超时预算（秒），到点返回已有结果 |
 | `GW_DOWNLOAD_DIR` | 空 | 下载与边播边存的落盘目录（指向飞牛曲库目录）；不配则下载/边播边存关闭 |
 | `GW_LIBRARY_SCAN_CMD` | 空 | 下载完成后触发的曲库扫描命令（如 `fnmusic-ext scan`），可选 |
 | `GW_PREVIEW_MIN_SECONDS` | 35 | 转码后时长低于此值判为试听片段（很多在线源未登录只给 30 秒） |
@@ -487,7 +489,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 60 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底，全离线（mock）
+python tests/test_gateway.py -v   # 66 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 

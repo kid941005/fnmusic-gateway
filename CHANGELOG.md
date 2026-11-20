@@ -1,6 +1,13 @@
 # CHANGELOG
 
-## 未发布（2.0.0 之后的审计修复，2026-11-19）
+## 2.0.1 (2026-11-20)
+
+### 优化：流式落盘、锁回收、单版本常量与检索预算
+- 在线音频改为流式落盘（`ExtProvider.stream_to_path` / `_call_stream_to_path`），`MediaCache` 与 `LibraryStore` 不再把整首 FLAC/MP3 读进内存。
+- `MediaCache._locks` 改用 `weakref.WeakValueDictionary`，长期运行时 guid 增多不再累积锁对象。
+- 版本收敛到 `gwlib.__version__` 单一常量，`app.py`、`sources.py`、镜像标签与文档从同一处取值。
+- `FallbackProvider` 新增总结果上限 `GW_FALLBACK_TOTAL_LIMIT`（默认 50）与总超时预算 `GW_FALLBACK_TOTAL_TIMEOUT`（默认 15 秒），并行/串行检索都受预算约束。
+- 测试 60 → **66 个用例**（新增流式落盘、弱引用锁、单版本常量、总上限/总超时回归）。
 
 ### 修复：全项目审计发现的功能、安全与健壮性问题
 - 管理类 MCP 工具不再强依赖飞牛可用：`call_tool` 使用惰性 provider，`music_sources` / `music_storage` / `music_status` 在 NAS 掉线时仍可用。
@@ -18,6 +25,7 @@
 - `music_play` / `music_download` 的 JSON Schema 增加 `anyOf` 必填约束；清理未使用 import、死 `except BadRequest` 与无文档 `q_quality` 别名。
 - 文档同步：`music_*` 工具数 9→12、新增 `.env.example`、compose 的 `GW_PUBLIC_BASE` 默认改 8767（公网播放口）。
 - 测试 53 → **60 个用例**（新增审计回归：空环境变量、source/healthy、NAS 掉线下的 status/storage、URL 含 @、缓存 0 不限、曲库上限、FallbackProvider 上限传递）。
+- 2.0.1 再补 6 个用例至 **66 个**。
 
 ## 2.0.0 (2026-11-19)
 

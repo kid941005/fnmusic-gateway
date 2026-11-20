@@ -47,6 +47,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from gwlib import __version__ as VERSION
 from gwlib.errors import BadRequest, GatewayError, as_payload
 from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, normalize_quality
 from gwlib.storage import LibraryStore, MediaCache, audio_seconds
@@ -56,7 +57,6 @@ from gwlib.sources import (FallbackProvider, is_ext_guid,
 from gwlib.playback import PlaybackService
 from gwlib.mcp_tools import build_tools
 
-VERSION = "2.0.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -119,6 +119,8 @@ os.makedirs(LYRICS_DIR, exist_ok=True)
 FALLBACK_URLS = [x.strip() for x in (_env("GW_FALLBACK_URLS", "") or "").split(",") if x.strip()]
 FALLBACK_TIMEOUT = max(1, _env_int("GW_FALLBACK_TIMEOUT", 8))
 FALLBACK_SEARCH_LIMIT = max(1, _env_int("GW_FALLBACK_SEARCH_LIMIT", 10))
+FALLBACK_TOTAL_LIMIT = max(1, _env_int("GW_FALLBACK_TOTAL_LIMIT", MAX_LIMIT))
+FALLBACK_TOTAL_TIMEOUT = max(1, _env_int("GW_FALLBACK_TOTAL_TIMEOUT", 15))
 DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
 LIBRARY_SCAN_CMD = _env("GW_LIBRARY_SCAN_CMD", "")
 PREVIEW_MIN_SECONDS = max(1, _env_int("GW_PREVIEW_MIN_SECONDS", 35))
@@ -593,7 +595,9 @@ def provider():
                             download_dir_getter=lambda: DOWNLOAD_DIR,
                             scan_cmd_getter=lambda: LIBRARY_SCAN_CMD,
                             max_bytes=LIBRARY_MAX_BYTES,
-                            parallel=SOURCE_SEARCH_PARALLEL)
+                            parallel=SOURCE_SEARCH_PARALLEL,
+                            total_limit=FALLBACK_TOTAL_LIMIT,
+                            total_timeout=FALLBACK_TOTAL_TIMEOUT)
                         LOG.info("fallback enabled: %s", ", ".join(fallback_services()))
                 _PROVIDER_ERR = None
             except Exception as e:

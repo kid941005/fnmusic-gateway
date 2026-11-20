@@ -6,7 +6,9 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
+import weakref
 
 from .errors import BadRequest, StorageError
 from .quality import get_profile
@@ -14,16 +16,30 @@ from .quality import get_profile
 LOG = logging.getLogger("fnmusic-gw.storage")
 
 
-def _call_stream(provider, guid, quality=None):
-    """按 provider.stream 是否接受 quality 关键字调用，避免用 TypeError 探测签名。"""
-    fn = provider.stream
+def _accepts_quality(fn):
+    """按函数签名判断是否接受 quality 关键字，避免用 TypeError 探测。"""
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
-        params = None
-    accepts_quality = params is None or "quality" in params or any(
+        return True
+    return "quality" in params or any(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-    return fn(guid, quality=quality) if accepts_quality else fn(guid)
+
+
+def _call_stream(provider, guid, quality=None):
+    fn = provider.stream
+    return fn(guid, quality=quality) if _accepts_quality(fn) else fn(guid)
+
+
+def _call_stream_to_path(provider, guid, path, quality=None):
+    """优先用 provider.stream_to_path 流式落盘，老 provider 回退到 stream 字节。"""
+    fn = getattr(provider, "stream_to_path", None)
+    if fn is None:
+        ctype, raw = _call_stream(provider, guid, quality)
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        return ctype, len(raw)
+    return fn(guid, path, quality=quality) if _accepts_quality(fn) else fn(guid, path)
 
 
 def audio_seconds(path):
@@ -50,7 +66,8 @@ class MediaCache:
         self._legacy_sample_rate = sample_rate
         self._legacy_channels = channels
         os.makedirs(directory, exist_ok=True)
-        self._locks = {}
+        # 弱引用：锁只在有线程持有/等待时存活，避免 guid 越多锁越多
+        self._locks = weakref.WeakValueDictionary()
         self._guard = threading.Lock()
         self._slots = transcode_slots or threading.BoundedSemaphore(2)
         self._cleanup_stale()
@@ -82,9 +99,6 @@ class MediaCache:
                 self._locks[key] = lock
             return lock
 
-    def _stream(self, provider, guid, quality):
-        return _call_stream(provider, guid, quality)
-
     def ensure(self, guid, provider, timeout=180, quality=None):
         profile = get_profile(quality)
         dst = self.path(guid, profile["name"])
@@ -93,16 +107,13 @@ class MediaCache:
         with self._lock(os.path.basename(dst)):
             if os.path.exists(dst) and os.path.getsize(dst) > 1024:
                 return dst
-            ctype, raw = self._stream(provider, guid, profile["name"])
-            if not raw:
-                raise StorageError("empty audio for %s" % guid)
-            low = (ctype or "").lower()
-            ext = ".flac" if "flac" in low else (".mp3" if "mpeg" in low else ".wav" if "wav" in low else ".bin")
-            src = dst + ".src" + ext
+            src = dst + ".src"
             tmp = dst + ".part"
             try:
-                with open(src, "wb") as fh:
-                    fh.write(raw)
+                # 直接流式落盘到临时源文件，避免整首 FLAC/MP3 读进内存
+                _call_stream_to_path(provider, guid, src, profile["name"])
+                if not os.path.exists(src) or os.path.getsize(src) < 1:
+                    raise StorageError("empty audio for %s" % guid)
                 bitrate = profile["bitrate"] or self._legacy_bitrate or "128k"
                 sample_rate = profile["sample_rate"] or self._legacy_sample_rate or 44100
                 channels = profile["channels"] or self._legacy_channels or 2
@@ -198,17 +209,29 @@ class LibraryStore:
         os.makedirs(directory, exist_ok=True)
         return os.path.join(directory, name + ext)
 
+    @staticmethod
+    def _ext_for(ctype):
+        low = (ctype or "").lower()
+        if "flac" in low:
+            return ".flac"
+        if "mpeg" in low or "mp3" in low:
+            return ".mp3"
+        if "wav" in low:
+            return ".wav"
+        return ".bin"
+
+    def _check_capacity(self, size):
+        if not self.max_bytes:
+            return
+        current = self.stats().get("bytes", 0)
+        if current + size > self.max_bytes:
+            raise StorageError("本地曲库已达容量上限（%.0f MB）" % (self.max_bytes / 1048576.0))
+
     def save_bytes(self, track, ctype, raw):
         if not raw:
             raise BadRequest("在线音源返回空音频")
-        if self.max_bytes:
-            current = self.stats().get("bytes", 0)
-            if current + len(raw) > self.max_bytes:
-                raise StorageError("本地曲库已达容量上限（%.0f MB）" % (self.max_bytes / 1048576.0))
-        low = (ctype or "").lower()
-        ext = ".flac" if "flac" in low else (".mp3" if ("mpeg" in low or "mp3" in low)
-               else ".wav" if "wav" in low else ".bin")
-        fp = self.target_path(track, ext)
+        self._check_capacity(len(raw))
+        fp = self.target_path(track, self._ext_for(ctype))
         tmp = fp + ".part"
         try:
             with open(tmp, "wb") as fh:
@@ -224,8 +247,29 @@ class LibraryStore:
         return fp, len(raw)
 
     def save_from_provider(self, provider, track, quality=None):
-        ctype, raw = _call_stream(provider, track["guid"], quality)
-        return self.save_bytes(track, ctype, raw)
+        directory = str(self._dir_getter() or "").strip()
+        if not directory:
+            raise BadRequest("保存到本地曲库需要先配置 GW_DOWNLOAD_DIR")
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".fnmusic-", suffix=".part", dir=directory)
+        os.close(fd)
+        try:
+            # 边下边写临时文件；拿到 Content-Type 后再决定扩展名
+            ctype, size = _call_stream_to_path(provider, track["guid"], tmp, quality)
+            if not size:
+                raise BadRequest("在线音源返回空音频")
+            self._check_capacity(size)
+            fp = self.target_path(track, self._ext_for(ctype))
+            os.replace(tmp, fp)
+            tmp = ""
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        self.run_scan()
+        return fp, size
 
     def save_async(self, provider, track, quality=None):
         if not self.enabled():

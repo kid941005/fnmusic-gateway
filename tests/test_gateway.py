@@ -66,6 +66,41 @@ class Base(unittest.TestCase):
             return r, data
 
 
+class TestAdminToken(Base):
+    """单端口模式：GW_ADMIN_TOKEN 保护管理接口，/play 与 /lyrics 保持匿名。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._old = app.ADMIN_TOKEN
+        app.ADMIN_TOKEN = "test-secret"
+
+    @classmethod
+    def tearDownClass(cls):
+        app.ADMIN_TOKEN = cls._old
+        super().tearDownClass()
+
+    def test_healthz_is_public(self):
+        r, body = self.req("GET", "/healthz")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body.get("auth_required"), True)
+
+    def test_api_requires_token(self):
+        r, body = self.req("GET", "/api/quality")
+        self.assertEqual(r.status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_api_accepts_header_and_bearer(self):
+        r, body = self.req("GET", "/api/quality", headers={"X-Admin-Token": "test-secret"})
+        self.assertEqual(r.status, 200)
+        r, body = self.req("GET", "/api/quality", headers={"Authorization": "Bearer test-secret"})
+        self.assertEqual(r.status, 200)
+
+    def test_play_path_is_public(self):
+        r, _ = self.req("GET", "/play/not-a-guid.mp3?exp=1&sig=bad")
+        self.assertNotEqual(r.status, 401)
+
+
 class TestPure(unittest.TestCase):
     def test_sign_verify(self):
         exp = int(app.time.time()) + 60
@@ -768,7 +803,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.1.0")
+        self.assertEqual(app.VERSION, "2.2.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

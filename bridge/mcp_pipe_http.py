@@ -18,6 +18,7 @@ fnmusic-gateway，不需要再拉起一个 stdio MCP 进程。
 环境变量：
     MCP_ENDPOINT   必填，接入点地址（ws:// 或 wss://）
     GW_MCP_URL     fnmusic-gateway 的 MCP 端点，默认 http://127.0.0.1:8766/mcp
+    GW_ADMIN_TOKEN 网关管理令牌（设置 GW_ADMIN_TOKEN 时必填）
     GW_TIMEOUT     单次工具调用超时秒数，默认 120（搜索+预热转码可能较慢）
     LOG_LEVEL      DEBUG/INFO/WARNING，默认 INFO
 """
@@ -33,6 +34,7 @@ import urllib.request
 ENDPOINT = (os.environ.get("MCP_ENDPOINT") or "").strip()
 GW_MCP_URL = (os.environ.get("GW_MCP_URL") or "http://127.0.0.1:8766/mcp").strip()
 GW_TIMEOUT = float(os.environ.get("GW_TIMEOUT") or "120")
+GW_ADMIN_TOKEN = (os.environ.get("GW_ADMIN_TOKEN") or "").strip()
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 600.0
 
@@ -54,14 +56,17 @@ def mask_url(url: str) -> str:
 
 def _post_sync(payload: bytes):
     """同步 POST 到网关；返回 (响应 JSON 或 None, 是否通知)。"""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if GW_ADMIN_TOKEN:
+        headers["X-Admin-Token"] = GW_ADMIN_TOKEN
     req = urllib.request.Request(
         GW_MCP_URL,
         data=payload,
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        },
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=GW_TIMEOUT) as resp:

@@ -103,6 +103,9 @@ MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
 HTTP_BODY_CAP = 1024 * 1024
 MCP_BODY_CAP = 4 * 1024 * 1024
 MCP_TIMEOUT = max(30, _env_int("GW_MCP_TIMEOUT", 300))
+# 管理令牌：为空时不鉴权（兼容旧部署）。单端口模式下强烈建议设置。
+# 带令牌后，/play/ 与 /lyrics/ 之外的接口都必须带 X-Admin-Token 或 Authorization: Bearer。
+ADMIN_TOKEN = (_env("GW_ADMIN_TOKEN", "") or "").strip()
 _HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$")
 TRANSCODE_CONCURRENCY = max(1, _env_int("GW_TRANSCODE_CONCURRENCY", 2))
 
@@ -1042,6 +1045,24 @@ class Handler(BaseHTTPRequestHandler):
             host = "127.0.0.1:%d" % PORT
         return "http://" + host
 
+    def _admin_ok(self, path):
+        """管理面鉴权：未配置令牌时保持旧行为；/play/ 与 /lyrics/ 永远放行。"""
+        if not ADMIN_TOKEN:
+            return True
+        if (path == "/healthz" or path == "/play" or path.startswith("/play/")
+                or path == "/lyrics" or path.startswith("/lyrics/")):
+            return True
+        supplied = (self.headers.get("X-Admin-Token") or "").strip()
+        auth = (self.headers.get("Authorization") or "").strip()
+        if not supplied and auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        return bool(supplied) and hmac.compare_digest(supplied, ADMIN_TOKEN)
+
+    def _unauthorized(self):
+        return self._json(
+            {"error": {"code": "unauthorized", "message": "需要管理令牌"}},
+            401, [("WWW-Authenticate", 'Bearer realm="fnmusic-gateway"')])
+
     def _qs(self):
         u = urllib.parse.urlparse(self.path)
         return u, urllib.parse.parse_qs(u.query)
@@ -1076,6 +1097,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             u, qs = self._qs()
             path = u.path
+            if not self._admin_ok(path):
+                return self._unauthorized()
             if path == "/healthz":
                 # 存活探针：只证明进程活着，不碰 NAS（NAS 掉线时缓存仍能服务）
                 return self._json({"ok": True, "version": VERSION, "mock": MOCK,
@@ -1086,6 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "mcp_server": {"available": MCP_SERVICE.available,
                                                   "engine": "mcp>=2.3",
                                                   "error": str(MCP_SERVICE.import_error) if MCP_SERVICE.import_error else None},
+                                   "auth_required": bool(ADMIN_TOKEN),
                                    "cache_mb": round(self._cache_mb(), 1),
                                    "moods": sorted(MOODS.keys())})
             if path == "/readyz":
@@ -1159,6 +1183,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             u, qs = self._qs()
+            if not self._admin_ok(u.path):
+                return self._unauthorized()
             if u.path == "/mcp":
                 return self._handle_mcp()
             if u.path == "/api/favorite":
@@ -1231,6 +1257,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         """MCP 客户端关闭会话时发 DELETE /mcp，回 204 即可（无状态，无需清理）。"""
         u, _ = self._qs()
+        if not self._admin_ok(u.path):
+            return self._unauthorized()
         if u.path == "/mcp":
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1544,6 +1572,8 @@ def main():
         LOG.info("public play-only listener on %s:%d (only GET /play/..., 其他路径 404)", HOST, PUBLIC_PORT)
     elif PUBLIC_PORT:
         LOG.warning("GW_PUBLIC_PORT=%d 与 GW_PORT 相同，已忽略（公网面与管理面不能共用端口）", PUBLIC_PORT)
+    if not PUBLIC_PORT and not ADMIN_TOKEN:
+        LOG.warning("当前只有一个监听端口且未设置 GW_ADMIN_TOKEN：管理接口与播放接口共用同一端口，请勿直接暴露到公网")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.1.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.2.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐（fnOS Music）→ 小智 的播放网关。**一个进程，两个出口**：
 
@@ -60,6 +60,7 @@
 | **单网关**（只播本地曲库） | `docker-compose.yml` | 网关 + 桥接器，同一镜像 | 8766 / 8767（host 网络） | 无 |
 | **全量多源** | `docker-compose.full.yml` | 网关 + 桥接器 + `fnos_music_ext:latest`（1.96 GB） | 8766 / 8767 / 8768 / 8770 / 8772 / 8774（后四个只绑 127.0.0.1） | 有 |
 | **轻量多源** | `docker-compose.slim.yml` | 网关 + 桥接器 + `fnos_music_ext:musicdl`（827 MB） | **仅 8766 / 8767** | 无 |
+| **单端口多源**（端口洁癖首选） | `docker-compose.oneport.yml` | 网关 + 桥接器 + `fnos_music_ext:musicdl`（827 MB） | **仅 8766**（管理接口需 `GW_ADMIN_TOKEN`） | 无 |
 | **轻量多源 + WebUI** | `docker-compose.slim.yml` + `docker-compose.webui.yml` | 音源换 `fnos_music_ext:musicdl-webui`（906 MB） | 仅 8766 / 8767 + 127.0.0.1:8774 | 有（只能管理 musicdl） |
 
 - 桥接器只有在你使用“小智 MCP 接入点（wss）”时才需要；不填 `MCP_ENDPOINT` 它会一直重连，不影响网关本体。
@@ -86,17 +87,17 @@ python app.py                       # 真实模式，需要 .env 里的飞牛地
 ### 镜像与版本
 
 每次推 `main` 或打 `v*` tag，GitHub Actions 会自动构建 `linux/amd64` + `linux/arm64` 并推到 GHCR。
-以 `v2.1.0` 为例，会生成 `2.1.0`、`2.1`、`latest`、`sha-xxxxxxx` 四个标签。
+以 `v2.2.0` 为例，会生成 `2.2.0`、`2.2`、`latest`、`sha-xxxxxxx` 四个标签。
 
 ~~~bash
-docker pull ghcr.io/kid941005/fnmusic-gateway:2.1.0   # 生产建议锁定版本
+docker pull ghcr.io/kid941005/fnmusic-gateway:2.2.0   # 生产建议锁定版本
 docker pull ghcr.io/kid941005/fnmusic-gateway:latest  # 跟主线
 ~~~
 
 两份 compose 默认跟 `latest`；想锁定版本或换本地镜像时用 `GW_IMAGE` 覆盖：
 
 ~~~bash
-GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.1.0 docker compose up -d
+GW_IMAGE=ghcr.io/kid941005/fnmusic-gateway:2.2.0 docker compose up -d
 GW_IMAGE=fnmusic-gateway:dev docker compose up -d   # 配合本地 build
 ~~~
 
@@ -135,6 +136,31 @@ docker compose -f docker-compose.slim.yml pull
 docker compose -f docker-compose.slim.yml up -d
 ss -ltnp | grep -E '876[0-9]'      # 只应看到 8766 / 8767
 ~~~
+
+### 单端口版：只发布 1 个端口
+
+参考 Songloft / 柠檬音乐的单端口形态：音源容器不映射任何宿主机端口，网关只发布 **8766**，管理接口与播放接口共用一个端口。管理接口由 `GW_ADMIN_TOKEN` 保护；`/play/`、`/lyrics/`、`/healthz` 保持匿名。
+
+~~~bash
+mkdir -p data sources-data
+chown -R 1000:1000 sources-data
+cp .env.example .env && chmod 600 .env
+# 生成管理令牌（单端口版必填）
+TOKEN=$(openssl rand -hex 24)
+sed -i "s/^GW_ADMIN_TOKEN=.*/GW_ADMIN_TOKEN=$TOKEN/" .env
+docker compose -f docker-compose.oneport.yml pull
+docker compose -f docker-compose.oneport.yml up -d
+
+ss -ltnp | grep 8766          # 只应看到 8766
+curl -s 127.0.0.1:8766/healthz
+curl -s -H "X-Admin-Token: $TOKEN" 127.0.0.1:8766/api/quality
+~~~
+
+- **公网**：Lucky/nginx 只把 `/play/` 与 `/lyrics/` 反代到 `NAS:8766`；管理接口即使被误转发，也要令牌才能用。
+- **小智后端 MCP**：`http://NAS:8766/mcp`，请求头加 `X-Admin-Token: $GW_ADMIN_TOKEN`；桥接器会自动带上。
+- **音源**：默认 `:musicdl` 单源；要网易/洛雪，把 `FNMUSIC_SOURCES_IMAGE` 换成完整镜像，并把 `GW_FALLBACK_URLS` 指向内部端口（如 `http://fnmusic-sources:8002`），仍然不需要暴露音源端口。
+- **本地曲库**：下载与边播边存默认写到容器内 `/vol1/1000/Music`，oneport compose 已把它挂到宿主机 `./music`；改 `GW_MUSIC_DIR` 即可换目录。
+- **WebUI**：需要时临时叠加 `docker-compose.webui.yml`，会额外发布 `127.0.0.1:8774`，用完可停。
 
 ### 轻量版 + WebUI
 
@@ -181,6 +207,7 @@ docker compose -f docker-compose.slim.yml -f docker-compose.webui.yml up -d
 | `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把 NAS CPU 打满 |
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
 | `GW_MCP_TIMEOUT` | 300 | 网关转发到官方 MCPServer 内部回环服务的超时（秒） |
+| `GW_ADMIN_TOKEN` | 空=不鉴权 | 管理令牌；设置后除 `/play/`、`/lyrics/`、`/healthz` 外的接口都要带 `X-Admin-Token` 或 `Authorization: Bearer`。单端口版必须设置 |
 
 ### 音质与本地存储
 
@@ -382,10 +409,15 @@ GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768,musicbox@http://127.0.0.1:8770"
 注意：在线源的 `id` 有 TTL（进程内存缓存），解析失败时网关会用「歌名+歌手」重搜一次；
 单源同一时刻通常只能跑一个（supervisor 互斥），多源配置时靠 `/healthz` 探测选活的。
 
-## 公网播放：只反代 8767，绝不要反代 8766
+## 公网播放：只反代播放端口，绝不要反代管理端口
 
-`/api/*`、`/mcp`、`/healthz` **没有鉴权**。要设备在外网也能播，正确做法是开一个
-**只服务 `/play/` 与 `/lyrics/` 的公网端口**，反代只指向它：
+`/api/*`、`/mcp` **默认没有鉴权**（设置 `GW_ADMIN_TOKEN` 后需要令牌）。要设备在外网也能播，
+正确做法是只把 `/play/` 与 `/lyrics/` 暴露给公网：
+
+- **两端口版**（`docker-compose.yml` / `.full.yml` / `.slim.yml`）：公网只反代 **8767**，`8766` 留在内网。
+- **单端口版**（`docker-compose.oneport.yml`）：只有一个 **8766**，Lucky/nginx 只转发 `/play/` 与 `/lyrics/`；管理接口靠 `GW_ADMIN_TOKEN` 保护。
+
+下面是两端口版示例：
 
 ~~~yaml
   fnmusic-gateway:
@@ -396,7 +428,7 @@ GW_FALLBACK_URLS="musicdl@http://127.0.0.1:8768,musicbox@http://127.0.0.1:8770"
       GW_PUBLIC_BASE: "https://fnmusic.example.com"          # 设备拿到的直链走这个地址
 ~~~
 
-反代（Lucky / nginx / caddy）把整个域名转发到 `192.168.50.100:8767`，**不需要任何路径规则**：
+反代（Lucky / nginx / caddy）把整个域名转发到 `192.168.50.100:8767`，**不需要任何路径规则**（单端口版把目标改成 `:8766`，并按上面只转发 `/play/` 与 `/lyrics/`）：
 
 | 请求 | 8767（公网面） | 8766（管理面） |
 |---|---|---|
@@ -492,7 +524,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 66 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 70 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/多音源兜底/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -516,7 +548,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（66 用例，含官方 MCPServer 2.3 路径） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（70 用例，含官方 MCPServer 2.3 与管理令牌路径） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、多音源兜底、音质档位与缓存分键、新 REST |
 
 真实飞牛曲库仍需在 NAS 同网段按上面的「直链自测」验收一次（开发机到 `192.168.50.100:59820` 不通）。
 
@@ -529,7 +561,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 - **无封面与进度条**：固件只显示歌名、歌手和滚动歌词。
 - **单实例**：缓存与签名密钥都在本地，多副本要共享 `/data`。
 - **在线音源依赖上游**：未登录时常只给试听片段，且单源同一时刻通常只能跑一个；用多源时靠 `/healthz` 选活。
-- **管理面无鉴权**：`8766` 只能留在内网；公网只反代 `8767`。
+- **管理面默认无鉴权**：`8766` 只能留在内网；公网只反代 `8767`。单端口版（`docker-compose.oneport.yml`）**必须设置 `GW_ADMIN_TOKEN`**，否则 8766 一旦被转发就等于把管理接口暴露出去。
 
 ## 仓库结构
 
@@ -541,9 +573,10 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（66 用例）、bridge_selftest.py
+tests/                    test_gateway.py（70 用例）、bridge_selftest.py
 docker-compose.yml        单网关（host 网络）
 docker-compose.full.yml   网关 + 全量音源 + WebUI
 docker-compose.slim.yml   网关 + 轻量音源（只开 2 个端口）
+docker-compose.oneport.yml 网关 + 轻量音源（只开 1 个端口，管理接口需令牌）
 docker-compose.webui.yml  给轻量音源叠加 WebUI
 ~~~

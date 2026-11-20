@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2.2.0 (2026-11-20)
+
+### 新增：单端口部署模式（参考 Songloft / 柠檬音乐）
+- 新增 `docker-compose.oneport.yml`：网关只发布 **8766** 一个宿主端口，管理接口与播放接口共用；音源容器不映射任何端口。
+- 新增环境变量 `GW_ADMIN_TOKEN`：设置后除 `/play/`、`/lyrics/`、`/healthz` 外的接口都要求 `X-Admin-Token` 或 `Authorization: Bearer`；未设置时保持旧的无鉴权行为。
+- 桥接器 `bridge/mcp_pipe_http.py` 支持 `GW_ADMIN_TOKEN`，转发 MCP 请求时自动带 `X-Admin-Token`。
+- `/healthz` 增加 `auth_required` 字段；公网入口仍只建议反代 `/play/` 与 `/lyrics/`。
+- README 新增「单端口版：只发布 1 个端口」章节与部署形态对照行；新增 `.env.example` 的 `GW_ADMIN_TOKEN` 示例。
+- 版本 2.1.0 → **2.2.0**；测试 66 → **70 个用例**（新增管理令牌的公开路径/401/两种令牌头/播放匿名）。
+
 ## 2.1.0 (2026-11-20)
 
 ### 升级：MCP 服务层迁移到官方 MCPServer 2.3

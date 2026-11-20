@@ -18,8 +18,6 @@ async def main(url):
             print("SEARCH", r.content[0].text.replace("\n", " | ")[:160])
             r = await s.call_tool("music_play", {"query": "晴天"})
             print("PLAY", r.content[0].text.replace("\n", " | ")[:220])
-            r = await s.call_tool("music_mood", {"mood": "睡前"})
-            print("MOOD", r.content[0].text.replace("\n", " | ")[:160])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""网关设置页（飞牛音乐连接）。纯静态 HTML，接口走同源 Cookie 鉴权。"""
+"""网关设置页（飞牛音乐连接 + 兜底音源）。纯静态 HTML，接口走同源 Cookie 鉴权。"""
 
 SETTINGS_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -16,6 +16,8 @@ label{display:block;font-size:13px;color:#374151;margin:12px 0 6px}
 label:first-child{margin-top:0}
 input{width:100%;padding:9px 11px;border:1px solid #d1d5db;border-radius:8px;font:14px ui-monospace,monospace;background:#fff;color:#111}
 input:focus{outline:2px solid #93c5fd;border-color:#60a5fa}
+label.check{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px;color:#374151}
+label.check input{width:auto;margin:0}
 .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
 button{padding:9px 16px;border-radius:8px;border:1px solid #d1d5db;background:#fff;font-size:14px;cursor:pointer}
 button.primary{background:#2563eb;border-color:#2563eb;color:#fff}
@@ -26,6 +28,9 @@ pre.show{display:block}
 pre.ok{background:#052e16;color:#bbf7d0}
 pre.bad{background:#450a0a;color:#fecaca}
 .meta{font-size:12.5px;color:#6b7280;margin-top:10px}
+.fb-row{display:flex;gap:8px;margin-top:10px}
+.fb-row input{flex:1}
+.fb-row button{padding:7px 12px;font-size:13px;white-space:nowrap}
 a{color:#2563eb}
 </style></head><body><main>
 <h1>网关设置 · 飞牛音乐</h1>
@@ -40,6 +45,7 @@ a{color:#2563eb}
   <input id="password" type="password" placeholder="••••••" autocomplete="current-password">
   <label>设备 ID（可留空）</label>
   <input id="device_id" placeholder="可选" autocomplete="off">
+  <label class="check"><input type="checkbox" id="insecure_tls">使用自签 HTTPS 证书（跳过证书校验）</label>
   <div class="row">
     <button class="primary" id="save">保存</button>
     <button id="test">测试连接</button>
@@ -51,42 +57,49 @@ a{color:#2563eb}
 </div>
 
 <div class="card">
-  <div style="font-size:14px;font-weight:600;margin-bottom:8px">在线音源</div>
-  <div class="meta" id="fallback">加载中…</div>
-  <div class="meta">在线音源的启用/账号/脚本请到 <a href="/">音乐管理台</a> 里配置（平台状态、洛雪源、网易扫码）。</div>
+  <div style="font-size:14px;font-weight:600;margin-bottom:8px">兜底在线音源</div>
+  <div class="meta">格式 <code>类型@地址</code>，类型 musicdl / lxmusic / musicbox / neteasefree，可只写地址自动识别。按顺序尝试，前面的优先。</div>
+  <div id="fbList"></div>
+  <div class="row">
+    <button id="fbAdd">+ 添加音源</button>
+    <button class="primary" id="fbSave">保存音源</button>
+  </div>
+  <pre id="fbOut"></pre>
+  <div class="meta">在线音源的平台/账号/脚本请到 <a href="/">音乐管理台</a> 里配置。</div>
 </div>
 </main>
 <script>
 (function(){
   var $ = function(id){ return document.getElementById(id); };
-  var out = $('out');
-  function show(ok, text){
-    out.className = 'show ' + (ok ? 'ok' : 'bad');
-    out.textContent = text;
+  function showAt(el, ok, text){
+    el.className = 'show ' + (ok ? 'ok' : 'bad');
+    el.textContent = text;
   }
   function fill(d){
     $('base').value = d.base || '';
     $('username').value = d.username || '';
     $('device_id').value = d.device_id || '';
     $('password').value = '';
+    $('insecure_tls').checked = !!d.insecure_tls;
     $('srcBadge').textContent = d.configured ? '已配置' : '未配置';
     var bits = [];
     if (d.download_dir) bits.push('下载目录 ' + d.download_dir);
     if (d.token_cached) bits.push('已缓存登录令牌');
     if (d.source) bits.push('配置来源 ' + d.source);
     $('meta').textContent = bits.join(' · ');
-    var fb = (d.fallback && d.fallback.length) ? d.fallback.join('、') : '未配置（只走飞牛音乐）';
-    $('fallback').textContent = '兜底音源：' + fb;
+    fbRows = (d.fallback_urls || []).slice();
+    renderFb();
   }
   function load(){
     fetch('/api/settings/fnos', {credentials:'same-origin'}).then(function(r){
-      if (r.status === 401) { show(false, '需要管理令牌：请用 http://NAS:8766/?token=<GW_ADMIN_TOKEN> 打开一次'); return null; }
+      if (r.status === 401) { showAt($('out'), false, '需要管理令牌：请用 http://NAS:8766/?token=<GW_ADMIN_TOKEN> 打开一次'); return null; }
       return r.json();
-    }).then(function(d){ if (d) fill(d); }).catch(function(e){ show(false, String(e)); });
+    }).then(function(d){ if (d) fill(d); }).catch(function(e){ showAt($('out'), false, String(e)); });
   }
   function payload(){
     return {base: $('base').value.trim(), username: $('username').value.trim(),
-            password: $('password').value, device_id: $('device_id').value.trim()};
+            password: $('password').value, device_id: $('device_id').value.trim(),
+            insecure_tls: $('insecure_tls').checked};
   }
   $('save').onclick = function(){
     var btn = this; btn.disabled = true;
@@ -94,26 +107,76 @@ a{color:#2563eb}
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload())})
       .then(function(r){ return r.json().then(function(d){ return [r.status, d]; }); })
       .then(function(pair){
-        if (pair[0] === 200) { fill(pair[1]); show(true, '已保存，下一首歌按新配置连接'); }
-        else { show(false, '保存失败：' + JSON.stringify(pair[1])); }
-      }).catch(function(e){ show(false, String(e)); })
+        if (pair[0] === 200) { fill(pair[1]); showAt($('out'), true, '已保存，下一首歌按新配置连接'); }
+        else { showAt($('out'), false, '保存失败：' + JSON.stringify(pair[1])); }
+      }).catch(function(e){ showAt($('out'), false, String(e)); })
       .then(function(){ btn.disabled = false; });
   };
   $('test').onclick = function(){
-    var btn = this; btn.disabled = true; show(true, '连接中…');
+    var btn = this; btn.disabled = true; showAt($('out'), true, '连接中…');
     fetch('/api/settings/fnos/test', {method:'POST', credentials:'same-origin',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload())})
       .then(function(r){ return r.json(); })
       .then(function(d){
-        if (d.ok) { show(true, '连接成功：' + d.ms + ' ms，取到 ' + (d.tracks||0) + ' 首曲目'); }
-        else { show(false, '连接失败（' + (d.ms||0) + ' ms）：' + (d.error || d.message || '未知错误')); }
-      }).catch(function(e){ show(false, String(e)); })
+        if (d.ok) { showAt($('out'), true, '连接成功：' + d.ms + ' ms，取到 ' + (d.tracks||0) + ' 首曲目'); }
+        else { showAt($('out'), false, '连接失败（' + (d.ms||0) + ' ms）：' + (d.error || d.message || '未知错误')); }
+      }).catch(function(e){ showAt($('out'), false, String(e)); })
       .then(function(){ btn.disabled = false; });
   };
   $('logout').onclick = function(){
     fetch('/api/settings/fnos/logout', {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body:'{}'})
-      .then(function(r){ return r.json(); }).then(function(){ show(true, '已清除缓存令牌，下次播放重新登录'); load(); })
-      .catch(function(e){ show(false, String(e)); });
+      .then(function(r){ return r.json(); }).then(function(){ showAt($('out'), true, '已清除缓存令牌，下次播放重新登录'); load(); })
+      .catch(function(e){ showAt($('out'), false, String(e)); });
+  };
+
+  var fbRows = [];
+  function renderFb(){
+    var box = $('fbList');
+    box.innerHTML = '';
+    if (!fbRows.length) {
+      var empty = document.createElement('div');
+      empty.className = 'meta'; empty.textContent = '尚未配置兜底音源';
+      box.appendChild(empty);
+      return;
+    }
+    fbRows.forEach(function(v, i){
+      var row = document.createElement('div'); row.className = 'fb-row';
+      var inp = document.createElement('input');
+      inp.value = v; inp.placeholder = 'musicdl@http://fnmusic-sources:8001';
+      inp.oninput = function(){ fbRows[i] = inp.value; };
+      var test = document.createElement('button'); test.textContent = '测试';
+      test.onclick = function(){ testSpec(inp.value, test); };
+      var del = document.createElement('button'); del.textContent = '删除';
+      del.onclick = function(){ fbRows.splice(i, 1); renderFb(); };
+      row.appendChild(inp); row.appendChild(test); row.appendChild(del);
+      box.appendChild(row);
+    });
+  }
+  function testSpec(spec, btn){
+    spec = (spec || '').trim();
+    if (!spec) { showAt($('fbOut'), false, '请先填写音源地址'); return; }
+    btn.disabled = true; btn.textContent = '测试中';
+    fetch('/api/settings/fallback/test', {method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({spec: spec})})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.ok) showAt($('fbOut'), true, spec + ' 可用（' + d.ms + ' ms，类型 ' + d.service + '）');
+        else showAt($('fbOut'), false, spec + ' 不可用（' + (d.ms||0) + ' ms）：' + (d.error || '未知错误'));
+      }).catch(function(e){ showAt($('fbOut'), false, String(e)); })
+      .then(function(){ btn.disabled = false; btn.textContent = '测试'; });
+  }
+  $('fbAdd').onclick = function(){ fbRows.push(''); renderFb(); };
+  $('fbSave').onclick = function(){
+    var btn = this; btn.disabled = true;
+    var urls = fbRows.map(function(x){ return (x||'').trim(); }).filter(Boolean);
+    fetch('/api/settings/fallback', {method:'PUT', credentials:'same-origin',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({urls: urls})})
+      .then(function(r){ return r.json().then(function(d){ return [r.status, d]; }); })
+      .then(function(pair){
+        if (pair[0] === 200) { fbRows = (pair[1].urls || []).slice(); renderFb(); showAt($('fbOut'), true, '已保存，兜底音源已热重建'); }
+        else { showAt($('fbOut'), false, '保存失败：' + JSON.stringify(pair[1])); }
+      }).catch(function(e){ showAt($('fbOut'), false, String(e)); })
+      .then(function(){ btn.disabled = false; });
   };
   load();
 })();

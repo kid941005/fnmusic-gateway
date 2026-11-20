@@ -9,7 +9,9 @@ import os
 import threading
 
 FIELDS = {
-    "fnos": ("base", "username", "password", "device_id"),
+    "fnos": ("base", "username", "password", "device_id", "insecure_tls"),
+    # 兜底在线音源，逗号分隔的 type@url 列表
+    "fallback": ("urls",),
 }
 
 

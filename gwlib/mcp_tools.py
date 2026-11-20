@@ -41,21 +41,15 @@ def build_tools():
             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
         },
         {
-            "name": "music_mood",
-            "description": "按心情/场景选曲，返回候选列表。mood 例如：安静、放松、睡前、开心、伤感、运动、工作、下雨。",
-            "inputSchema": {"type": "object", "properties": {
-                "mood": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["mood"]},
-        },
-        {
             "name": "music_play",
             "description": ("拿一首歌的可播放直链，同时给出歌名、歌手、歌词直链和音质（设备屏显要用）。"
-                            "query/mood/playlist 三选一，index 从 1 开始。"
+                            "query/playlist 二选一，index 从 1 开始。"
                             "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url 四个参数都填上。"),
             "inputSchema": {"type": "object", "properties": {
-                "query": {"type": "string"}, "mood": {"type": "string"},
+                "query": {"type": "string"},
                 "playlist": {"type": "string"}, "index": {"type": "integer"},
                 "quality": QUALITY_PROP},
-                "anyOf": [{"required": ["query"]}, {"required": ["mood"]}, {"required": ["playlist"]}]},
+                "anyOf": [{"required": ["query"]}, {"required": ["playlist"]}]},
         },
         {
             "name": "music_favorite",

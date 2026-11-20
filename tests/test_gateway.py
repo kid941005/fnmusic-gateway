@@ -168,9 +168,8 @@ class TestTools(unittest.TestCase):
     def setUp(self):
         self.p = app.MockProvider()
 
-    def test_search_and_mood(self):
+    def test_search(self):
         self.assertIn("晴天", app.call_tool("music_search", {"query": "晴天"}, "http://h"))
-        self.assertIn("睡前", app.call_tool("music_mood", {"mood": "睡前"}, "http://h"))
 
     def test_browse_categories(self):
         for cat in ("track", "album", "artist", "playlist"):
@@ -292,7 +291,7 @@ class TestHttp(Base):
         self.assertTrue(r.getheader("Mcp-Session-Id"))
         self.assertEqual(d["result"]["serverInfo"]["name"], "fnmusic-gateway")
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(d["result"]["tools"]), 12)
+        self.assertEqual(len(d["result"]["tools"]), 11)
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                          "params": {"name": "music_status", "arguments": {}}})
         self.assertIn("content", d["result"])
@@ -533,6 +532,75 @@ class TestFnSettings(Base):
         r, body = self.req("POST", "/api/settings/fnos/logout", body={}, headers=self._h())
         self.assertEqual(r.status, 200)
         self.assertFalse(os.path.exists(path))
+
+    def test_settings_tls_toggle(self):
+        r, body = self.req("PUT", "/api/settings/fnos", body={"insecure_tls": True},
+                           headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body["insecure_tls"])
+        self.assertEqual(app.FNOS_CONFIG.section("fnos").get("insecure_tls"), "1")
+        self.assertEqual(os.environ.get("FNMUSIC_INSECURE_TLS"), "1")
+        r, body = self.req("PUT", "/api/settings/fnos", body={"insecure_tls": False},
+                           headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertFalse(body["insecure_tls"])
+        self.assertNotIn("insecure_tls", app.FNOS_CONFIG.section("fnos"))
+
+    def test_settings_fallback_roundtrip(self):
+        urls = ["musicdl@http://127.0.0.1:8001", "lxmusic@http://127.0.0.1:8002"]
+        r, body = self.req("PUT", "/api/settings/fallback", body={"urls": urls},
+                           headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body["urls"], urls)
+        self.assertEqual(body["services"], ["musicdl", "lxmusic"])
+        self.assertEqual(app.fallback_urls(), urls)
+        r, body = self.req("GET", "/api/settings/fallback", headers=self._h())
+        self.assertEqual(body["urls"], urls)
+        # 空列表清空配置，回退到环境变量（此处为空）
+        r, body = self.req("PUT", "/api/settings/fallback", body={"urls": []}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body["urls"], [])
+
+    def test_settings_fallback_rejects_bad_spec(self):
+        r, _ = self.req("PUT", "/api/settings/fallback",
+                        body={"urls": ["bogus-spec"]}, headers=self._h())
+        self.assertEqual(r.status, 400)
+
+    def test_settings_fallback_test_failure(self):
+        r, body = self.req("POST", "/api/settings/fallback/test",
+                           body={"spec": "musicdl@http://127.0.0.1:1"}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertFalse(body["ok"])
+        self.assertTrue(body["error"])
+        self.assertEqual(body["service"], "musicdl")
+
+    def test_settings_fallback_test_ok(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            spec = "musicdl@http://127.0.0.1:%d" % srv.server_address[1]
+            r, body = self.req("POST", "/api/settings/fallback/test",
+                               body={"spec": spec}, headers=self._h())
+            self.assertEqual(r.status, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["service"], "musicdl")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class TestRanking(unittest.TestCase):
@@ -844,7 +912,7 @@ class TestV2Quality(unittest.TestCase):
 
     def test_tool_catalog(self):
         names = [t["name"] for t in app.TOOLS]
-        self.assertEqual(len(names), 12)
+        self.assertEqual(len(names), 11)
         for n in ("music_download", "music_sources", "music_storage"):
             self.assertIn(n, names)
         play = [t for t in app.TOOLS if t["name"] == "music_play"][0]
@@ -1023,7 +1091,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.5.0")
+        self.assertEqual(app.VERSION, "2.6.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

@@ -80,14 +80,14 @@ def _device(conn, tool, args, timeout=15):
 
 @_reg(
     "fnmusic_gw_play",
-    "从在线音源播放歌曲。mode=search 按歌名（value 是歌名），mode=mood 按心情，"
+    "从在线音源播放歌曲。mode=search 按歌名（value 是歌名），"
     "mode=playlist 按歌单名（需本地曲库），mode=stop 停止播放。",
     {
         "type": "object",
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["search", "mood", "playlist", "stop"],
+                "enum": ["search", "playlist", "stop"],
                 "description": "播放方式",
             },
             "value": {"type": "string", "description": "歌名 / 心情 / 歌单名"},
@@ -106,7 +106,7 @@ def fnmusic_gw_play(conn, mode="search", value="", quality=""):
             return ActionResponse(
                 action=Action.RESPONSE, result=str(e), response="停不下来，可能没在放歌。"
             )
-    key = {"search": "query", "mood": "mood", "playlist": "playlist"}.get(mode)
+    key = {"search": "query", "playlist": "playlist"}.get(mode)
     if not key or not value:
         return ActionResponse(action=Action.RESPONSE, result="bad args", response="要听什么？")
     try:
@@ -162,16 +162,3 @@ def fnmusic_gw_search(conn, query=""):
         return ActionResponse(action=Action.RESPONSE, result="empty", response="没搜到。")
     names = "、".join(t.get("title", "") for t in rows[:5])
     return ActionResponse(action=Action.RESPONSE, result=names, response="找到%s，要听哪首？" % names)
-
-
-@_reg(
-    "fnmusic_gw_mood",
-    "按心情挑歌并播放。",
-    {
-        "type": "object",
-        "properties": {"mood": {"type": "string", "description": "心情，如 睡前、放松、运动"}},
-        "required": ["mood"],
-    },
-)
-def fnmusic_gw_mood(conn, mood=""):
-    return fnmusic_gw_play(conn, "mood", mood)

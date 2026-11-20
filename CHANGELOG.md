@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2.6.0 (2026-11-20)
+
+### 变更：移除心情选曲
+- 删除 `GET /api/mood`、MCP 工具 `music_mood`、`mood_tracks()`、`MOODS`/`moods.json` 与 `GW_MOODS_FILE`；`/api/play` 与 `music_play` 只保留 `query` / `playlist` 二选一。这是破坏性变更：仍调用 `/api/mood` 或 `music_mood` 的客户端需改走 `/api/search` / `music_search`。
+
+### 新功能：设置页补齐自签证书与兜底音源
+- 设置页新增「使用自签 HTTPS 证书（跳过证书校验）」开关，存 `/data/config.json` 的 `fnos.insecure_tls`，运行期即时生效；`GW_FNOS_INSECURE_TLS` 仅作首次默认。
+- 设置页新增兜底音源编辑器：可增删改 `GW_FALLBACK_URLS` 列表、逐条「测试」探活，保存后立即热重建 provider。
+- 新增 REST：`GET/PUT /api/settings/fallback`、`POST /api/settings/fallback/test`；配置存 `/data/config.json` 的 `fallback.urls`，环境变量 `GW_FALLBACK_URLS` 仅作兜底。
+- 版本 2.5.0 → **2.6.0**；测试 84 → **89** 个用例（删除心情用例，新增 TLS 开关、兜底音源增删改/校验/逐条测试）。
+
 ## 2.5.0 (2026-11-20)
 
 ### 新功能：飞牛音乐优先 + 网页设置

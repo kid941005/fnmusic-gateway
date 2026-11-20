@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.5.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.6.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、在线音源兜底的播放网关。一个进程，一个端口，WebUI 同端口；飞牛地址与账号在网页里填，不用改环境变量：
 
@@ -116,17 +116,19 @@ http://NAS_IP:8766/?token=<GW_ADMIN_TOKEN>
 `http://NAS_IP:8766/` 即可。WebUI 里的管理 API 由网关注入管理员身份，不需要在浏览器里手工加 Header。
 （上游管理台前端固化了 `/app/fnmusic-ext/static|api` 前缀，网关仍保留该前缀的反代供其资源与 API 使用，但浏览地址就是根路径。）
 
-### 网关设置（飞牛音乐）
+### 网关设置（飞牛音乐 + 兜底音源）
 
 WebUI 首页右下角有「**网关设置 · 飞牛音乐**」入口，也可以直接访问 `http://NAS_IP:8766/settings`（首次带 `?token=<GW_ADMIN_TOKEN>` 换 Cookie）。页面上：
 
 - 填 **飞牛音乐地址**（如 `http://192.168.1.10:5666`）、**账号**、**密码**、设备 ID（可留空）；
 - 点「**测试连接**」会真实登录并试取 1 首，返回耗时和曲目数或错误原因；
 - 点「保存」写入 `/data/config.json`（权限 0600），并立即生效，无需重启；
-- 点「清除登录令牌」删掉缓存 token（换账号或密码后建议清一次）。
+- 勾选「**使用自签 HTTPS 证书**」可跳过证书校验（内网自签场景）；
+- 点「清除登录令牌」删掉缓存 token（换账号或密码后建议清一次）；
+- 「**兜底在线音源**」卡片可增删改音源列表（格式 `类型@地址`），每条可单独「测试」探活，保存后立即热重建，无需重启。
 
-配置优先级：网页保存的值 > 环境变量 `GW_FNOS_*`。密码只保存在本地，接口只回 `password_set`，保存时留空表示不修改。
-没配飞牛时，网关自动用下面的「在线音源」兜底。
+配置优先级：网页保存的值 > 环境变量 `GW_FNOS_*` / `GW_FALLBACK_URLS`。密码只保存在本地，接口只回 `password_set`，保存时留空表示不修改。
+没配飞牛时，网关自动用「兜底在线音源」播放。
 
 ### 端口与安全边界
 
@@ -224,13 +226,12 @@ docker compose up -d
 | `GW_DOWNLOAD_DIR` | 空 | 下载与边播边存的落盘目录；不配则下载/边播边存关闭 |
 | `GW_PREVIEW_MIN_SECONDS` | 35 | 转码后时长低于此值判为试听片段（很多在线源未登录只给 30 秒） |
 
-### 搜索与心情
+### 搜索
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GW_SMART_SEARCH` | 1 | 搜索是否做别名纠错 + 相关度排序；0=直接用音源返回顺序 |
 | `GW_ALIASES_FILE` | `$GW_DATA/music_aliases.json` | ASR 同音字/错字纠正表（示例见 `data/music_aliases.json.example`，改完自动重载） |
-| `GW_MOODS_FILE` | `$GW_DATA/moods.json` | 心情映射表 |
 
 ### 离线自测
 
@@ -289,7 +290,7 @@ compose 里已经包含 `fnmusic-bridge` 服务（填 `MCP_ENDPOINT` 就会启�
 ~~~bash
 export MCP_ENDPOINT='wss://xxx:59826/mcp_endpoint/mcp/?token=...'
 docker compose up -d            # fnmusic-gateway + fnmusic-bridge
-docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 12 个工具" 即成功
+docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 11 个工具" 即成功
 ~~~
 
 不填 `MCP_ENDPOINT` 时桥接器会一直重连、不影响网关本体。
@@ -438,8 +439,7 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | GET | `/api/playlists` | 列出飞牛音乐歌单（未配飞牛返回 400） |
 | GET | `/api/playlist?name=&limit=` | 按歌单名列出飞牛曲目（未配飞牛返回 400） |
 | GET | `/api/favorites?limit=` | 列出飞牛收藏（未配飞牛返回 400） |
-| GET | `/api/mood?mood=&limit=` | 按心情/场景选曲 |
-| GET | `/api/play?query=\|mood=\|playlist=&index=&quality=` | 取签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
+| GET | `/api/play?query=\|playlist=&index=&quality=` | 取签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
 | GET | `/api/status` | 上一次播放的是什么 |
 | GET | `/api/sources` | 各在线音源探活结果 |
 | GET | `/api/storage` | 缓存与本地下载目录用量 |
@@ -448,12 +448,15 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | PUT | `/api/settings/fnos` | 保存飞牛配置（空密码=不修改，base 必须 http(s)） |
 | POST | `/api/settings/fnos/test` | 用当前/提交的配置真实登录并试取 1 首，返回 `{ok,ms,tracks|error}` |
 | POST | `/api/settings/fnos/logout` | 删除缓存的飞牛 token |
+| GET | `/api/settings/fallback` | 读取兜底音源列表 |
+| PUT | `/api/settings/fallback` | 保存兜底音源（body `{"urls":["musicdl@http://host:8001"]}`），立即热重建 provider |
+| POST | `/api/settings/fallback/test` | 逐条测试音源（body `{"spec":"musicdl@http://host:8001"}`），返回 `{ok,ms,service\|error}` |
 | POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid`）；在线歌曲 add 时按最高音质下载到本地下载目录 |
 | POST | `/api/warm` | body `{"guid":"...","quality":"high"}`，预转码到缓存 |
 | POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地下载目录 |
 | POST | `/mcp` | MCP streamable-http（JSON-RPC） |
 
-### MCP 工具（12 个）
+### MCP 工具（11 个）
 
 | 工具 | 用途 |
 |---|---|
@@ -462,7 +465,6 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | `music_playlists` | 列出飞牛音乐歌单（未配飞牛不可用） |
 | `music_playlist_tracks` | 按歌单名列出飞牛曲目（未配飞牛不可用） |
 | `music_favorites` | 列出飞牛收藏（未配飞牛不可用） |
-| `music_mood` | 按心情/场景选曲 |
 | `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；可选 `quality` |
 | `music_favorite` | 配了飞牛时直接写飞牛收藏；在线曲目 add 时按最高音质下载到本地下载目录 |
 | `music_status` | 上一次播放的是什么（含音质） |
@@ -496,7 +498,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 84 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/飞牛设置持久化与测试连接/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 89 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/飞牛设置持久化与测试连接/自签证书开关/兜底音源增删改与逐条测试/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -508,7 +510,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 
 | 项 | 结果 |
 |---|---|
-| 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 12 个工具、call_tool 正常 |
+| 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 11 个工具、call_tool 正常 |
 | 2.1.0 官方 MCPServer 2.3（mock） | 内部 uvicorn 随机回环端口启动成功；initialize / tools-list / tools-call / notification / 坏 JSON 全通过；66 用例全绿 |
 | `/api/play?query=晴天` | 返回签名直链 + 预热 65244 字节 |
 | 直链下载 | 200，`ffprobe`：mp3 / 44100 / 2ch / 128000 |
@@ -520,7 +522,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（84 用例，含官方 MCPServer 2.3、管理令牌、飞牛设置页与纯在线回退） | 全绿：签名/过期/篡改、Range 206、MCP initialize+12 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、飞牛配置读写/测试连接/登出、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（89 用例，含官方 MCPServer 2.3、管理令牌、飞牛设置页与纯在线回退） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、飞牛配置读写/测试连接/登出、自签证书开关、兜底音源增删改与逐条测试、音质档位与缓存分键、新 REST |
 
 真实音源容器与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（默认 compose 里的 `fnmusic-sources` 只在内网监听，开发机直连不到；飞牛可在网页「网关设置」里点测试连接确认）。
 
@@ -545,6 +547,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（84 用例）、bridge_selftest.py
+tests/                    test_gateway.py（89 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 桥接器 + 音源 + 同端口 WebUI（只发布 8766）
 ~~~

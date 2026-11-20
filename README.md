@@ -151,6 +151,8 @@ docker compose up -d
 
 ## 环境变量
 
+> `docker-compose.yml` 只透传常用几项（令牌、WebUI 上游、飞牛账号、兜底音源、下载目录）。下面其它参数都有默认值，需要调时把它们加到 compose 的 `environment` 里即可。
+
 ### 网关与缓存
 
 | 变量 | 默认 | 说明 |

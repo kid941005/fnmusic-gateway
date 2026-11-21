@@ -18,7 +18,7 @@
 services:
   # ---- 网关：REST / MCP / 原生 WebUI / 播放直链 / 内置在线音源，全部走 8766 ----
   fnmusic-gateway:
-    image: ghcr.io/kid941005/fnmusic-gateway:2.9.0   # 升级版本时同步这里；想自动跟随最新可改成 :latest
+    image: ghcr.io/kid941005/fnmusic-gateway:latest   # 始终跟随最新发布
     container_name: fnmusic-gateway
     restart: unless-stopped
     ports:
@@ -47,7 +47,7 @@ services:
 
   # ---- 桥接器：仅在用「小智 MCP 接入点(wss)」时需要；不用可整段删掉 ----
   fnmusic-bridge:
-    image: ghcr.io/kid941005/fnmusic-gateway:2.9.0
+    image: ghcr.io/kid941005/fnmusic-gateway:latest
     container_name: fnmusic-bridge
     restart: unless-stopped
     networks: [fnmusic]

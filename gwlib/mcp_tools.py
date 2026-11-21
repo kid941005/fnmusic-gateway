@@ -68,6 +68,8 @@ def build_tools():
             "description": "把在线歌曲下载/保存到本地下载目录（GW_DOWNLOAD_DIR）。guid 或 query 二选一；quality=lossless 时保存原始文件。",
             "inputSchema": {"type": "object", "properties": {
                 "guid": {"type": "string"}, "query": {"type": "string"},
+                "title": {"type": "string", "description": "可选：显式指定保存文件名里的歌名"},
+                "artist": {"type": "string", "description": "可选：显式指定保存文件名里的歌手"},
                 "quality": QUALITY_PROP},
                 "anyOf": [{"required": ["guid"]}, {"required": ["query"]}]},
         },

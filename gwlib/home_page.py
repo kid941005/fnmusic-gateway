@@ -84,7 +84,8 @@ function render(rows,q){
   var box=el('results')
   if(!rows.length){box.innerHTML='<div class="empty">没有搜到结果，请换个关键词或到设置页检查在线音源。</div>';return}
   box.innerHTML=rows.map(function(t,i){
-    var meta=[t.artist,t.album].filter(Boolean).join(' · ')+(t.duration_s?(' · '+dur(t.duration_s)):'')
+    var src=t.source==='local'?'本地':(t.platform||t.source||'在线')
+    var meta=[src,t.artist,t.album].filter(Boolean).join(' · ')+(t.duration_s?(' · '+dur(t.duration_s)):'')
     return '<div class="track"><div><div class="t-title">'+esc(t.title||t.guid)+'</div><div class="t-meta">'+esc(meta)+'</div></div>'+
       '<div class="actions"><button class="btn primary" data-play="'+i+'">播放</button>'+
       '<button class="btn" data-dl="'+i+'">下载</button></div></div>'
@@ -98,7 +99,10 @@ async function search(){
   try{
     var d=await getJSON('/api/search?q='+encodeURIComponent(q)+'&limit=20')
     lastRows=d.tracks||[];render(lastRows,q)
-    say('共 '+d.count+' 条'+(d.corrected?'（已按别名纠正为「'+d.corrected+'」）':''))
+    var stat=''
+    if(typeof d.local_count==='number')stat='（本地 '+d.local_count+' · 在线 '+(d.online_count||0)+'）'
+    if(d.local_error)stat+='，本地搜索失败：'+d.local_error
+    say('共 '+d.count+' 条'+stat+(d.corrected?'（已按别名纠正为「'+d.corrected+'」）':''))
   }catch(e){say('搜索失败：'+e.message)}finally{el('go').disabled=false}
 }
 async function play(t,i){
@@ -108,7 +112,7 @@ async function play(t,i){
 }
 async function download(t){
   if(!t)return;say('正在保存 '+t.title+'…')
-  try{var r=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:t.guid})})
+  try{var r=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:t.guid,title:t.title||'',artist:t.artist||''})})
     var d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status));say('已保存：'+d.path+'（'+Math.round(d.bytes/1024)+' KB）')}catch(e){say('下载失败：'+e.message)}
 }
 el('go').onclick=search;el('q').addEventListener('keydown',function(e){if(e.key==='Enter')search()})

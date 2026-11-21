@@ -62,6 +62,7 @@ from gwlib.config import ConfigStore
 from gwlib.settings_page import SETTINGS_HTML
 from gwlib.home_page import HOME_HTML
 from gwlib.login_page import login_html
+from fnmusic_client import normalize_base
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -460,6 +461,35 @@ def dedupe(tracks):
     return out
 
 
+def resolve_download_track(p, guid, title="", artist=""):
+    """下载用曲目元数据：显式标题 > 当前播放状态 > provider 缓存 > guid 兜底。
+
+    前端/MCP 按 guid 下载时不再依赖「刚播放过」，避免保存成 guid - 未知。
+    """
+    guid = str(guid or "").strip()
+    title = str(title or "").strip()
+    artist = str(artist or "").strip()
+    if title and title != guid:
+        return {"guid": guid, "title": title, "artist": artist, "source": "ext"}
+    state = load_state()
+    if state.get("guid") == guid and state.get("title"):
+        return {"guid": guid, "title": str(state["title"]),
+                "artist": artist or str(state.get("artist") or ""), "source": "ext"}
+    info_fn = getattr(p, "track_info", None)
+    if callable(info_fn):
+        try:
+            info = info_fn(guid)
+        except Exception as exc:
+            LOG.debug("track_info(%s) failed: %s", guid, exc)
+            info = None
+        if isinstance(info, dict) and info.get("title"):
+            out = dict(info)
+            out["guid"] = guid
+            out.setdefault("source", "ext")
+            return out
+    return {"guid": guid, "title": title or guid, "artist": artist, "source": "ext"}
+
+
 # ---------------------------------------------------------------- 搜索排序
 # 中文 ASR 常把歌名/歌手听成同音字：别名表把「青花磁」纠正成「青花瓷」，再搜索并打分排序。
 # 文件格式 {"青花磁": "青花瓷", "周杰轮": "周杰伦"}；键值都按 _norm_text 归一化后匹配。
@@ -637,6 +667,12 @@ class MockProvider:
     def search(self, q, limit=10):
         return self._match(q, limit)
 
+    def track_info(self, guid):
+        for track in self.TRACKS:
+            if track["guid"] == guid:
+                return dict(track)
+        return None
+
     def list_tracks(self, limit=20):
         return self.TRACKS[:limit]
 
@@ -691,7 +727,20 @@ class FnProvider:
         self.client.ensure_token()
 
     def search(self, q, limit=10):
-        return dedupe(norm_track(t) for t in _rows(self.client.search_track(q, 1, limit)))
+        rows = dedupe(norm_track(t) for t in _rows(self.client.search_track(q, 1, limit)))
+        for row in rows:
+            row["source"] = "local"
+        return rows
+
+    def track_info(self, guid):
+        """按 guid 取飞牛曲目元数据，下载时用来还原「标题 - 歌手」文件名。"""
+        data = self.client.track_metadata(guid)
+        track = data.get("track") if isinstance(data, dict) else None
+        if not isinstance(track, dict):
+            return None
+        row = norm_track(track)
+        row["source"] = "local"
+        return row
 
     def list_tracks(self, limit=20):
         return dedupe(norm_track(t) for t in _rows(self.client.track_list(1, limit)))
@@ -729,7 +778,7 @@ class FnProvider:
 def fnos_settings():
     """飞牛音乐连接配置：data/config.json 优先，环境变量兜底。"""
     cfg = FNOS_CONFIG.section("fnos")
-    base = (cfg.get("base") or (_env("GW_FNOS_BASE", "") or "")).strip()
+    base = normalize_base(cfg.get("base") or (_env("GW_FNOS_BASE", "") or ""))
     user = (cfg.get("username") or (_env("GW_FNOS_USER", "") or "")).strip()
     pwd = cfg.get("password") or (_env("GW_FNOS_PASS", "") or "")
     dev = (cfg.get("device_id") or (_env("GW_FNOS_DEVICE_ID", "") or "")).strip()
@@ -1256,10 +1305,8 @@ def _tool_music_download(args, p, base, limit, quality):
     if not LIBRARY.enabled():
         raise BadRequest("未配置 GW_DOWNLOAD_DIR，无法保存到本地")
     if guid:
-        st = load_state()
-        track = {"guid": guid, "title": (st.get("title") if st.get("guid") == guid else "") or guid,
-                 "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
-                 "source": "ext"}
+        track = resolve_download_track(
+            p, guid, args.get("title") or "", args.get("artist") or "")
     elif q:
         rows = p.search(q, 5)
         if not rows:
@@ -1515,6 +1562,8 @@ class Handler(BaseHTTPRequestHandler):
             if key == "password" and not str(body.get(key) or "").strip():
                 continue  # 密码留空表示不修改
             patch[key] = body.get(key)
+        if "base" in patch:
+            patch["base"] = normalize_base(patch["base"])
         if "insecure_tls" in body:
             patch["insecure_tls"] = "1" if _truthy(body.get("insecure_tls")) else ""
         base = str(patch.get("base", fnos_settings()["base"]) or "").strip()
@@ -1533,7 +1582,7 @@ class Handler(BaseHTTPRequestHandler):
         password = body.get("password")
         if password in (None, ""):
             password = s["password"]
-        cfg = {"base": str(body.get("base") or s["base"]).strip(),
+        cfg = {"base": normalize_base(body.get("base") or s["base"]),
                "username": str(body.get("username") or s["username"]).strip(),
                "password": password or "",
                "device_id": str(body.get("device_id") or s["device_id"]).strip()}
@@ -1736,6 +1785,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     rows, fixed = p.search(q, limit), ""
                 out = {"query": q, "count": len(rows), "tracks": rows}
+                meta_fn = getattr(p, "last_search_meta", None)
+                if callable(meta_fn):
+                    try:
+                        meta = meta_fn() or {}
+                    except Exception:
+                        meta = {}
+                    if isinstance(meta, dict):
+                        out.update(meta)
                 if fixed and fixed != _norm_text(q):
                     out["corrected"] = fixed
                 return self._json(out)
@@ -1810,11 +1867,7 @@ class Handler(BaseHTTPRequestHandler):
                     guid = rows[0]["guid"]
                 if action == "add":
                     if is_ext_guid(guid) and hasattr(p, "download_ext"):
-                        st = load_state()
-                        track = {"guid": guid,
-                                 "title": (st.get("title") if st.get("guid") == guid else "") or guid,
-                                 "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
-                                 "source": "ext"}
+                        track = resolve_download_track(p, guid)
                         fp, n = p.download_ext(track, DEFAULT_QUALITY)
                         return self._json({"ok": True, "guid": guid, "action": action,
                                            "saved": fp, "bytes": n})
@@ -1836,14 +1889,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise BadRequest("未配置 GW_DOWNLOAD_DIR，无法保存到本地")
                 guid = str(body.get("guid") or "").strip()
                 query = str(body.get("query") or "").strip()
+                title = str(body.get("title") or "").strip()
+                artist = str(body.get("artist") or "").strip()
                 quality = body.get("quality")
                 p = provider()
                 if guid:
-                    st = load_state()
-                    track = {"guid": guid,
-                             "title": (st.get("title") if st.get("guid") == guid else "") or guid,
-                             "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
-                             "source": "ext"}
+                    track = resolve_download_track(p, guid, title, artist)
                 elif query:
                     rows = p.search(query, 5)
                     if not rows:

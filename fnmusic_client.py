@@ -51,6 +51,19 @@ class FnMusicError(Exception):
         self.code = code
 
 
+def normalize_base(base):
+    """统一飞牛音乐地址：去尾部斜杠；用户误把界面路径 /music 或 /music/api/v1 贴进来时纠正掉。
+
+    客户端自己会拼 API_PREFIX，所以 base 只应保留协议+主机+端口（可带反向代理前缀）。
+    """
+    value = str(base or "").strip().rstrip("/")
+    for suffix in ("/music/api/v1", "/music"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)].rstrip("/")
+            break
+    return value
+
+
 def _md5(s):
     return hashlib.md5(str(s).encode("utf-8")).hexdigest()
 
@@ -86,7 +99,7 @@ def encode_query(params):
 class FnMusicClient:
     def __init__(self, base=DEFAULT_BASE, username=DEFAULT_USERNAME, password=None, device_id=None,
                  token=None, token_file=None, timeout=12.0, insecure_tls=None):
-        self.base = (base or DEFAULT_BASE).rstrip("/")
+        self.base = normalize_base(base or DEFAULT_BASE)
         self.username = username or DEFAULT_USERNAME
         self.password = password
         self.device_id = device_id or DEFAULT_DEVICE_ID
@@ -111,7 +124,7 @@ class FnMusicClient:
         try:
             with open(self.token_file, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if d.get("base", "").rstrip("/") == self.base and d.get("token"):
+            if normalize_base(d.get("base", "")) == self.base and d.get("token"):
                 self.token = d["token"]
         except Exception:
             pass

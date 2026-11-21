@@ -361,6 +361,11 @@ class NativeMusicDLProvider:
                 total += len(chunk)
             return ctype, total
 
+    def track_info(self, guid):
+        """按 guid 从搜索缓存还原曲目元数据，供按 guid 下载时命名。"""
+        row = self._lookup(self._guid_eid(guid))
+        return self._track(row[0]) if row else None
+
     def lyrics(self, guid):
         row = self._lookup(self._guid_eid(guid))
         return str(row[2] or "") if row else ""

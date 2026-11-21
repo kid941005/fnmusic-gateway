@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2.9.3 (2026-11-21)
+
+### 修复：本地库未命中与下载文件名
+- 飞牛音乐地址自动归一化：normalize_base() 会去掉末尾 / 及误填的 /music、/music/api/v1，避免再拼成 /music/music/api/v1 而只返回 HTML、导致本地搜索被静默跳过。
+- /api/search 新增 local_count/online_count/local_error/online_error 诊断字段，前端显示「本地 X · 在线 Y」；本地搜索异常不再被完全吞掉。
+- 下载文件名改为「歌名 - 歌手」：新增 resolve_download_track()，按显式 title/artist → 播放状态同 guid → provider.track_info(guid) → guid 兜底；首页下载与 MCP music_download 均带 title/artist，服务端按 guid 从缓存还原元数据。
+- 搜索结果标注来源（本地/平台）。版本 2.9.2 → **2.9.3**；测试 **106 个用例**。
+
 ## 2.9.2 (2026-11-21)
 
 ### 代码审查修复与内部重构

@@ -29,6 +29,7 @@ os.environ["GW_LYRICS"] = "0"  # 单测不联网查歌词
 os.environ.pop("GW_PUBLIC_BASE", None)
 
 import app  # noqa: E402
+import fnmusic_client  # noqa: E402
 import gwlib.sources as gw_sources  # noqa: E402
 import gwlib.storage as gw_storage  # noqa: E402
 import gwlib.config as gw_config  # noqa: E402
@@ -523,6 +524,13 @@ class TestFnSettings(Base):
         r, _ = self.req("PUT", "/api/settings/fnos", body={"base": "ftp://x"}, headers=self._h())
         self.assertEqual(r.status, 400)
 
+    def test_settings_base_normalizes_music_suffix(self):
+        r, _ = self.req("PUT", "/api/settings/fnos",
+                        body={"base": "http://127.0.0.1:59820/music"}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        r, body = self.req("GET", "/api/settings/fnos", headers=self._h())
+        self.assertEqual(body["base"], "http://127.0.0.1:59820")
+
     def test_settings_test_connection_reports_failure(self):
         started = time.time()
         r, body = self.req("POST", "/api/settings/fnos/test",
@@ -747,6 +755,12 @@ class _FakeExt:
     def lyrics(self, guid):
         return self._lyric
 
+    def track_info(self, guid):
+        for row in self._rows:
+            if row.get("guid") == guid:
+                return dict(row)
+        return None
+
 
 class _FakeLocal:
     def __init__(self, rows=None):
@@ -760,6 +774,12 @@ class _FakeLocal:
 
     def stream(self, guid):
         return "audio/wav", b""
+
+    def track_info(self, guid):
+        for row in self._rows:
+            if row.get("guid") == guid:
+                return dict(row)
+        return None
 
 
 class TestFallback(unittest.TestCase):
@@ -789,6 +809,39 @@ class TestFallback(unittest.TestCase):
         fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
         fp.exts = [_FakeExt(wav=b"RIFFxxxx")]
         self.assertEqual(fp.stream("ext:musicdl:abc"), ("audio/wav", b"RIFFxxxx"))
+
+    def test_search_meta_counts_local_and_online(self):
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        ext = _FakeExt([{"guid": "ext:musicdl:e2", "title": "晴天", "artist": "陈奕迅",
+                         "source": "musicdl"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [ext]
+        rows = fp.search("晴天", 5)
+        meta = fp.last_search_meta()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(meta["local_count"], 1)
+        self.assertEqual(meta["online_count"], 1)
+        self.assertEqual(meta["local_error"], "")
+
+    def test_search_meta_reports_local_error(self):
+        class Boom:
+            def search(self, q, limit=10):
+                raise RuntimeError("bad base")
+        fp = app.FallbackProvider(Boom(), [])
+        rows = fp.search("晴天", 5)
+        meta = fp.last_search_meta()
+        self.assertEqual(rows, [])
+        self.assertEqual(meta["local_count"], 0)
+        self.assertIn("bad base", meta["local_error"])
+
+    def test_track_info_routes_local_and_ext(self):
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        ext = _FakeExt([{"guid": "ext:musicdl:e1", "title": "七里香", "artist": "周杰伦",
+                         "source": "musicdl"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [ext]
+        self.assertEqual(fp.track_info("l1")["title"], "晴天")
+        self.assertEqual(fp.track_info("ext:musicdl:e1")["title"], "七里香")
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg")
     def test_audio_seconds(self):
@@ -827,6 +880,16 @@ class TestFallback(unittest.TestCase):
                 fp.download_ext({"guid": "ext:musicdl:e", "title": "t", "artist": "a"})
         finally:
             app.DOWNLOAD_DIR = old
+
+
+class TestFnClientBase(unittest.TestCase):
+    def test_normalize_base_strips_music_suffix(self):
+        n = fnmusic_client.normalize_base
+        self.assertEqual(n("https://fn.hqgg.top:59826/music"), "https://fn.hqgg.top:59826")
+        self.assertEqual(n("https://fn.hqgg.top:59826/music/"), "https://fn.hqgg.top:59826")
+        self.assertEqual(n("https://fn.hqgg.top:59826/music/api/v1"), "https://fn.hqgg.top:59826")
+        self.assertEqual(n("https://fn.hqgg.top:59826/"), "https://fn.hqgg.top:59826")
+        self.assertEqual(n(""), "")
 
 
 class TestOnlineOnly(unittest.TestCase):
@@ -1109,6 +1172,20 @@ class TestV2Api(Base):
         finally:
             app.DOWNLOAD_DIR = old
 
+    def test_api_download_by_guid_uses_track_title(self):
+        old = app.DOWNLOAD_DIR
+        app.DOWNLOAD_DIR = os.path.join(DATA, "dl-guid")
+        try:
+            # 只传 guid：服务端应通过 provider.track_info 还原「标题 - 歌手」
+            r, d = self.req("POST", "/api/download", {"guid": "mock-1"})
+            self.assertEqual(r.status, 200, d)
+            name = os.path.basename(d["path"])
+            self.assertIn("晴天", name)
+            self.assertIn("周杰伦", name)
+            self.assertNotIn("mock-1", name)
+        finally:
+            app.DOWNLOAD_DIR = old
+
 
 class TestAuditFixes(unittest.TestCase):
     """本轮审计修复的回归用例。"""
@@ -1187,7 +1264,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.9.2")
+        self.assertEqual(app.VERSION, "2.9.3")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

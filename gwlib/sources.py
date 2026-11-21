@@ -271,6 +271,8 @@ class FallbackProvider:
         workers = min(4, len(self.exts)) if (self.parallel and len(self.exts) > 1) else 1
         self._pool = ThreadPoolExecutor(max_workers=max(1, workers),
                                         thread_name_prefix="gw-search")
+        # 每个请求线程独立的搜索诊断，供 /api/search 告诉前端本地/在线各命中多少。
+        self._search_meta = threading.local()
         self.library = LibraryStore(
             download_dir_getter or (lambda: os.environ.get("GW_DOWNLOAD_DIR", "")),
             LOG,
@@ -310,13 +312,18 @@ class FallbackProvider:
     def search(self, q, limit=10):
         # 总结果上限：所有源加起来最多 total_limit 条
         cap = min(max(1, int(limit or 1)), self.total_limit)
+        meta = {"local_count": 0, "online_count": 0,
+                "local_error": "", "online_error": ""}
+        self._search_meta.value = meta
         rows = []
         if self.base is not None:
             try:
                 rows = list(self.base.search(q, cap) or [])[:cap]
             except Exception as exc:
                 LOG.warning("local search failed: %s", exc)
+                meta["local_error"] = str(exc)
                 rows = []
+        meta["local_count"] = len(rows)
         if len(rows) >= cap or not self.exts:
             return rows
         have = set((_norm_text(t.get("title")), _norm_text(t.get("artist"))) for t in rows)
@@ -338,7 +345,8 @@ class FallbackProvider:
                     except FuturesTimeoutError:
                         LOG.warning("online search exceeded %.1fs total budget", self.total_timeout)
                         break
-                    except Exception:
+                    except Exception as exc:
+                        meta["online_error"] = str(exc)
                         batches.append([])
             else:
                 # 并行：到点就停止等待，已返回的结果照常合并
@@ -346,7 +354,8 @@ class FallbackProvider:
                     for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
                         try:
                             batches.append(future.result())
-                        except Exception:
+                        except Exception as exc:
+                            meta["online_error"] = str(exc)
                             batches.append([])
                 except FuturesTimeoutError:
                     LOG.warning("online search exceeded %.1fs total budget", self.total_timeout)
@@ -361,8 +370,25 @@ class FallbackProvider:
                 have.add(key)
                 rows.append(track)
                 if len(rows) >= cap:
+                    meta["online_count"] = max(0, len(rows) - meta["local_count"])
                     return rows[:cap]
+        meta["online_count"] = max(0, len(rows) - meta["local_count"])
         return rows[:cap]
+
+    def last_search_meta(self):
+        """最近一次 search 的诊断信息（同请求线程）。"""
+        return dict(getattr(self._search_meta, "value", {}) or {})
+
+    def track_info(self, guid):
+        """按 guid 取曲目元数据；在线曲目尽量从本地缓存还原标题/歌手。"""
+        if is_ext_guid(guid):
+            ext = self._ext(guid)
+            fn = getattr(ext, "track_info", None)
+            return fn(guid) if callable(fn) else None
+        if self.base is None:
+            return None
+        fn = getattr(self.base, "track_info", None)
+        return fn(guid) if callable(fn) else None
 
     def _ext(self, guid):
         svc, _ = ext_split(guid)

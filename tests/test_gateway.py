@@ -1058,6 +1058,100 @@ class TestExtProviderHttp(unittest.TestCase):
         self.assertGreater(n, 100)
 
 
+class TestFnMusicInvalidToken(unittest.TestCase):
+    """飞牛 token 失效时 HTTP 200 + code=99999 也要自动重登录并重试。"""
+
+    @classmethod
+    def setUpClass(cls):
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, obj, status=200):
+                body = json.dumps(obj).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0") or 0)
+                self.rfile.read(n)
+                if self.path.startswith("/music/api/v1/user/password-login"):
+                    self.server.login_count += 1
+                    self._json({"code": 0, "data": {"userToken": "new-token"}})
+                else:
+                    self._json({"code": 99999, "msg": "INVALID TOKEN", "data": None})
+
+            def do_GET(self):
+                cookie = self.headers.get("Cookie", "")
+                old = "old-token" in cookie
+                if "/music/api/v1/search/track" in self.path:
+                    if old:
+                        self._json({"code": 99999, "msg": "INVALID TOKEN", "data": None})
+                    else:
+                        self._json({"code": 0, "data": {"list": [{"guid": "g1", "title": "晴天"}]}})
+                    return
+                if "/music/api/v1/track/stream" in self.path:
+                    if old:
+                        self._json({"code": 99999, "msg": "INVALID TOKEN", "data": None})
+                    else:
+                        body = b"ID3fakeaudio" * 10
+                        self.send_response(200)
+                        self.send_header("Content-Type", "audio/mpeg")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        cls.srv.login_count = 0
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def client(self):
+        return fnmusic_client.FnMusicClient(
+            "http://127.0.0.1:%d" % self.port, username="KID", password="{{SECRET_1l78j5kv}}",
+            token="old-token", timeout=5)
+
+    def setUp(self):
+        self.srv.login_count = 0
+
+    def test_request_relogin_on_http200_invalid_token(self):
+        c = self.client()
+        data = c.search_track("晴天")
+        self.assertEqual(data["list"][0]["title"], "晴天")
+        self.assertEqual(self.srv.login_count, 1)
+        self.assertEqual(c.token, "new-token")
+
+    def test_stream_to_path_relogin_on_json_error(self):
+        c = self.client()
+        d = tempfile.mkdtemp(prefix="gw-fn-token-", dir=DATA)
+        fp = os.path.join(d, "a.mp3")
+        ctype, n = c.stream_to_path("g1", fp)
+        self.assertIn("mpeg", ctype)
+        self.assertGreater(n, 0)
+        self.assertEqual(self.srv.login_count, 1)
+        with open(fp, "rb") as fh:
+            self.assertTrue(fh.read().startswith(b"ID3"))
+
+    def test_stream_bytes_relogin_on_json_error(self):
+        c = self.client()
+        ctype, raw = c.stream_bytes("g1")
+        self.assertIn("mpeg", ctype)
+        self.assertTrue(raw.startswith(b"ID3"))
+        self.assertEqual(self.srv.login_count, 1)
+
+
 class TestSearchApi(Base):
     """REST 搜索走排序与别名纠正。"""
 
@@ -1306,7 +1400,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.10.1")
+        self.assertEqual(app.VERSION, "2.10.2")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

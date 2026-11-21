@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2.10.2 (2026-11-21)
+
+### 修复：飞牛 token 失效后本地搜索一直为空
+- 飞牛接口在 token 失效时可能返回 HTTP 200，但 body 为 {"code":99999,"msg":"INVALID TOKEN"}；旧客户端只在 HTTP 401 时重新登录，导致本地库搜索永远失败。
+- `FnMusicClient.request()` 现在同时识别 HTTP 401 与 body code=99999 / INVALID TOKEN：清空旧 token、重新登录并重试一次。
+- `stream_to_path()` / `stream_bytes()` 同样识别 200+JSON 的失效响应，避免把错误 JSON 当音频写盘。
+- 版本 2.10.1 → **2.10.2**；测试 **112 个用例**（新增失效 token HTTP 200 重登录、流式播放重登录用例）。
+
 ## 2.10.1 (2026-11-21)
 
 ### 修复：WebUI 播放按钮无反馈/无法播放

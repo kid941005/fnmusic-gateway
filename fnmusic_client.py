@@ -146,6 +146,26 @@ class FnMusicClient:
             pass
 
     # ---------- 底层 ----------
+    @staticmethod
+    def _invalid_token(status, env=None):
+        """飞牛失效 token 可能返回 HTTP 401，也可能返回 HTTP 200 + body code=99999。"""
+        if status == 401:
+            return True
+        if isinstance(env, dict):
+            if env.get("code") == 99999:
+                return True
+            if "INVALID TOKEN" in str(env.get("msg") or "").upper():
+                return True
+        return False
+
+    @staticmethod
+    def _decode_json(raw):
+        try:
+            env = json.loads(raw.decode("utf-8", "replace")) if raw else None
+        except Exception:
+            return None
+        return env if isinstance(env, dict) else None
+
     def _http(self, url, method, headers, payload=None):
         req = urllib.request.Request(url, data=payload, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl) as resp:
@@ -175,11 +195,11 @@ class FnMusicClient:
             status, raw = e.code, e.read()
         except Exception as e:
             raise FnMusicError("network: %s (%s)" % (e, url))
-        try:
-            env = json.loads(raw.decode("utf-8", "replace")) if raw else None
-        except Exception:
-            env = None
-        if status == 401 and retry and self.username and self.password:
+        env = self._decode_json(raw)
+        # 旧 token 失效时飞牛常返回 HTTP 200 + {"code":99999,"msg":"INVALID TOKEN"}，
+        # 不能只靠 HTTP 401；这里无论哪种形态都清 token、重新登录并重试一次。
+        if retry and self.username and self.password and self._invalid_token(status, env):
+            self.token = None
             self.login()
             return self.request(method, path, params, body, retry=False)
         if not isinstance(env, dict):
@@ -312,15 +332,27 @@ class FnMusicClient:
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl)
         except urllib.error.HTTPError as e:
-            head = e.read()[:80]
+            head = e.read()[:200]
             e.close()
-            if e.code == 401 and retry and self.username and self.password:
+            if retry and self.username and self.password and self._invalid_token(e.code, self._decode_json(head)):
+                self.token = None
                 self.login()
                 return self.stream_to_path(track_guid, path, retry=False)
             raise FnMusicError("stream status=%s head=%r" % (e.code, head), e.code)
         except Exception as e:
             raise FnMusicError("stream network: %s (%s)" % (e, url))
         ctype = resp.headers.get("Content-Type", "")
+        # 失效 token 时 /track/stream 也可能返回 HTTP 200 + JSON 错误，不能把 JSON 当音频写盘。
+        if "json" in ctype.lower():
+            raw = resp.read()
+            resp.close()
+            env = self._decode_json(raw)
+            if retry and self.username and self.password and self._invalid_token(200, env):
+                self.token = None
+                self.login()
+                return self.stream_to_path(track_guid, path, retry=False)
+            raise FnMusicError("stream error body=%r" % raw[:200], 200,
+                               (env or {}).get("code"))
         total = 0
         with resp, open(path, "wb") as fh:
             while True:
@@ -342,9 +374,15 @@ class FnMusicClient:
             status, raw, hdr = e.code, e.read(), {}
         except Exception as e:
             raise FnMusicError("stream network: %s (%s)" % (e, url))
-        if status == 401 and retry and self.username and self.password:
+        ctype = hdr.get("Content-Type", "")
+        env = self._decode_json(raw) if "json" in ctype.lower() else None
+        if retry and self.username and self.password and self._invalid_token(status, env):
+            self.token = None
             self.login()
             return self.stream_bytes(track_guid, retry=False)
         if status != 200 or not raw:
             raise FnMusicError("stream status=%s head=%r" % (status, raw[:80]), status)
-        return hdr.get("Content-Type", ""), raw
+        if env is not None and env.get("code") not in SUCCESS_CODES:
+            raise FnMusicError("stream error code=%s msg=%s" % (env.get("code"), env.get("msg")),
+                               status, env.get("code"))
+        return ctype, raw

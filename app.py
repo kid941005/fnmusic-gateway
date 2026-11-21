@@ -134,10 +134,10 @@ os.makedirs(LYRICS_DIR, exist_ok=True)
 # 或只写 URL（按端口猜类型：8768 musicdl / 8770 musicbox / 8772 lxmusic / 8776 neteasefree）。
 # 在线音源只在这些地址里搜索/播放/下载，作为飞牛音乐之外的兜底；为空则只走飞牛。
 FALLBACK_URLS = [x.strip() for x in (_env("GW_FALLBACK_URLS", "") or "").split(",") if x.strip()]
-FALLBACK_TIMEOUT = max(1, _env_int("GW_FALLBACK_TIMEOUT", 8))
+FALLBACK_TIMEOUT = max(1, _env_int("GW_FALLBACK_TIMEOUT", 25))
 FALLBACK_SEARCH_LIMIT = max(1, _env_int("GW_FALLBACK_SEARCH_LIMIT", 10))
 FALLBACK_TOTAL_LIMIT = max(1, _env_int("GW_FALLBACK_TOTAL_LIMIT", MAX_LIMIT))
-FALLBACK_TOTAL_TIMEOUT = max(1, _env_int("GW_FALLBACK_TOTAL_TIMEOUT", 15))
+FALLBACK_TOTAL_TIMEOUT = max(1, _env_int("GW_FALLBACK_TOTAL_TIMEOUT", 40))
 DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
 # 飞牛音乐（可选，优先级最高的音源）。地址/账号/密码优先读 data/config.json（网页「网关设置」写入），
 # 环境变量只作为首次启动的默认值。留空则只走 GW_FALLBACK_URLS 里的在线音源。

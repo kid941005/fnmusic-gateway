@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.6.0**（2026-11-20） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.6.1**（2026-11-21） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、在线音源兜底的播放网关。一个进程，一个端口，WebUI 同端口；飞牛地址与账号在网页里填，不用改环境变量：
 
@@ -223,10 +223,10 @@ docker compose up -d
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GW_FALLBACK_URLS` | 空 | 在线音源，逗号分隔；默认 compose 已设为 `musicdl@http://fnmusic-sources:8001`，也可只写 URL 按端口推断类型 |
-| `GW_FALLBACK_TIMEOUT` | 8 | 在线音源请求超时（秒） |
+| `GW_FALLBACK_TIMEOUT` | 25 | 在线音源请求超时（秒） |
 | `GW_FALLBACK_SEARCH_LIMIT` | 10 | 每个在线音源最多取几条 |
 | `GW_FALLBACK_TOTAL_LIMIT` | 50 | 所有音源合并后的总结果上限 |
-| `GW_FALLBACK_TOTAL_TIMEOUT` | 15 | 多源检索总超时预算（秒），到点返回已有结果 |
+| `GW_FALLBACK_TOTAL_TIMEOUT` | 40 | 多源检索总超时预算（秒），到点返回已有结果 |
 | `GW_DOWNLOAD_DIR` | 空 | 下载与边播边存的落盘目录；不配则下载/边播边存关闭 |
 | `GW_PREVIEW_MIN_SECONDS` | 35 | 转码后时长低于此值判为试听片段（很多在线源未登录只给 30 秒） |
 
@@ -504,7 +504,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 92 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/飞牛设置持久化与测试连接/自签证书开关/兜底音源增删改与逐条测试/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 93 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源/飞牛设置持久化与测试连接/自签证书开关/兜底音源增删改与逐条测试/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -528,7 +528,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（92 用例，含官方 MCPServer 2.3、管理令牌、飞牛设置页与纯在线回退） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、飞牛配置读写/测试连接/登出、自签证书开关、兜底音源增删改与逐条测试、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（93 用例，含官方 MCPServer 2.3、管理令牌、飞牛设置页与纯在线回退） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源、飞牛配置读写/测试连接/登出、自签证书开关、兜底音源增删改与逐条测试、音质档位与缓存分键、新 REST |
 
 真实音源容器与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（默认 compose 里的 `fnmusic-sources` 只在内网监听，开发机直连不到；飞牛可在网页「网关设置」里点测试连接确认）。
 
@@ -553,6 +553,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（92 用例）、bridge_selftest.py
+tests/                    test_gateway.py（93 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 桥接器 + 音源 + 同端口 WebUI（只发布 8766）
 ~~~

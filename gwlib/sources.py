@@ -146,7 +146,8 @@ class ExtProvider:
 
     def search(self, q, limit=10):
         quoted = urllib.parse.quote(str(q or ""))
-        limit = max(1, int(limit))
+        # 上游 musicdl 的 /search 限制 limit<=10，统一夹取，避免 HTTP 422。
+        limit = min(max(1, int(limit)), 10)
         try:
             if self.svc == "musicdl":
                 data = self._get("%s/search?keyword=%s&limit=%d" % (self.base, quoted, limit))

@@ -877,6 +877,7 @@ class TestExtProviderHttp(unittest.TestCase):
                 if u.path == "/healthz":
                     body = b'{"ok": true}'
                 elif u.path == "/search":
+                    self.server.last_search_query = u.query
                     body = json.dumps({"data": [{"id": "s1", "name": "晴天", "artist": "周杰伦"}]}).encode()
                 elif u.path == "/info":
                     body = json.dumps({"lyric": "[00:01.00]hello"}).encode()
@@ -914,6 +915,12 @@ class TestExtProviderHttp(unittest.TestCase):
         self.assertEqual(rows[0]["guid"], "ext:musicdl:s1")
         self.assertEqual(rows[0]["title"], "晴天")
         self.assertEqual(rows[0]["source"], "musicdl")
+
+    def test_search_limit_capped_at_10(self):
+        e = gw_sources.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
+        e.search("晴天", 50)
+        q = urllib.parse.parse_qs(self.srv.last_search_query)
+        self.assertEqual(q.get("limit"), ["10"])
 
     def test_stream_and_lyrics(self):
         e = gw_sources.ExtProvider("http://127.0.0.1:%d" % self.port, "musicdl")
@@ -1159,7 +1166,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.6.0")
+        self.assertEqual(app.VERSION, "2.6.1")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

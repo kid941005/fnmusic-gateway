@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 2.6.1 (2026-11-21)
+
+### 修复
+- 在线音源搜索的 `limit` 统一夹取到 1–10，避免上游 musicdl `/search` 对 `limit>10` 返回 HTTP 422；新增回归测试 `test_search_limit_capped_at_10`。
+- 默认 `GW_FALLBACK_TIMEOUT` 由 8 秒调至 25 秒、`GW_FALLBACK_TOTAL_TIMEOUT` 由 15 秒调至 40 秒，给咪咕等慢源更多响应时间；README 默认值与设置页高级参数同步。
+- 版本 2.6.0 → **2.6.1**；测试 92 → **93** 个用例。
+
 ## 2.6.0 (2026-11-20)
 
 ### 变更：移除心情选曲

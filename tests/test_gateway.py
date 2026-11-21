@@ -347,6 +347,7 @@ class TestHome(Base):
         r, body = self.req("GET", "/", headers={"Cookie": cookie}, raw=True)
         self.assertEqual(r.status, 200)
         self.assertIn(b"fnmusic-gateway", body)
+        self.assertIn(("v" + app.VERSION).encode("utf-8"), body)
         self.assertIn("在线音源".encode("utf-8"), body)
 
     def test_settings_page_has_online_card(self):
@@ -354,6 +355,7 @@ class TestHome(Base):
         r, body = self.req("GET", "/settings", headers={"Cookie": cookie}, raw=True)
         self.assertEqual(r.status, 200)
         self.assertIn("在线音源".encode("utf-8"), body)
+        self.assertIn(("v" + app.VERSION).encode("utf-8"), body)
         self.assertIn("/api/settings/online".encode("utf-8"), body)
 
     def test_healthz_reports_online(self):
@@ -395,6 +397,7 @@ class TestLoginPage(Base):
         self.assertEqual(r.status, 200)
         self.assertIn(b'type="password"', body)
         self.assertIn(b'name="next"', body)
+        self.assertIn(("v" + app.VERSION).encode("utf-8"), body)
         self.assertNotIn(b"login-secret", body)
 
     def test_wrong_password_rejected(self):
@@ -1173,7 +1176,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.9.0")
+        self.assertEqual(app.VERSION, "2.9.1")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

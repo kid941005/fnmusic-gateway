@@ -328,7 +328,7 @@ def _log_level(name):
 
 
 logging.basicConfig(level=_log_level(_env("GW_LOG_LEVEL", "INFO")),
-                    format="%(asctime)s %(levelname)s %(message)s")
+                    format="%(asctime)s %(levelname)s [v" + VERSION + "] %(message)s")
 LOG = logging.getLogger("fnmusic-gw")
 FNOS_CONFIG.log = LOG
 

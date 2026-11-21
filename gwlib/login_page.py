@@ -3,12 +3,14 @@
 
 import html
 
+from . import __version__ as VERSION
+
 _TEMPLATE = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>登录 · fnmusic-gateway</title>
+<title>登录 · fnmusic-gateway v__VERSION__</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--card:#141b2d;--line:#263149;--mut:#93a4c4;--acc:#4f8cff;--bad:#ff6b6b}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:#e8eefc;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;padding:18px}
@@ -24,7 +26,7 @@ button{width:100%;margin-top:14px;border:0;border-radius:9px;background:var(--ac
 <body>
 <div class="card">
   <h1>fnmusic-gateway</h1>
-  <div class="sub">输入管理密码进入 WebUI</div>
+  <div class="sub">v__VERSION__ · 输入管理密码进入 WebUI</div>
   __ERROR__
   <form method="post" action="/login">
     <input type="hidden" name="next" value="__NEXT__">
@@ -37,6 +39,8 @@ button{width:100%;margin-top:14px;border:0;border-radius:9px;background:var(--ac
 </body>
 </html>
 """
+
+_TEMPLATE = _TEMPLATE.replace("__VERSION__", VERSION)
 
 
 def login_html(next_path="/", error=""):

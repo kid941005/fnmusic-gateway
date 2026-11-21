@@ -16,6 +16,8 @@ import os
 import sys
 import threading
 
+from . import __version__ as VERSION
+
 
 def _emit(proto_fd: int, message: dict) -> None:
     data = (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -31,7 +33,7 @@ def main() -> int:
 
     import logging
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+                        format="%(asctime)s [%(levelname)s] [v" + VERSION + "] %(name)s: %(message)s")
     logging.getLogger("musicdl").setLevel(logging.ERROR)
 
     try:

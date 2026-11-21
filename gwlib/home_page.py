@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """网关首页：搜索 / 播放 / 下载 / 状态，同端口原生页面。"""
 
+from . import __version__ as VERSION
+
 HOME_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fnmusic-gateway 音乐管理台</title>
+<title>fnmusic-gateway v__VERSION__ · 音乐管理台</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--card:#141b2d;--line:#263149;--mut:#93a4c4;--acc:#4f8cff;--ok:#37c98a;--bad:#ff6b6b}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e8eefc;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -34,12 +36,12 @@ input{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radiu
 <body>
 <div class="wrap">
 <header>
-  <div><h1>fnmusic-gateway</h1><div class="sub">飞牛音乐优先 · 内置在线音源补足</div></div>
+  <div><h1>fnmusic-gateway <span class="pill">v__VERSION__</span></h1><div class="sub">飞牛音乐优先 · 内置在线音源补足</div></div>
   <div><a class="btn" href="/settings">设置</a> <a class="btn" href="/logout">退出</a></div>
 </header>
 
 <div class="card">
-  <h2>运行状态 <span id="ver" class="pill"></span></h2>
+  <h2>运行状态 <span id="ver" class="pill">v__VERSION__</span></h2>
   <div class="grid">
     <div class="kv"><b>模式</b><span id="mode">-</span></div>
     <div class="kv"><b>飞牛音乐</b><span id="fnos">-</span></div>
@@ -115,3 +117,5 @@ loadStatus()
 </body>
 </html>
 """
+
+HOME_HTML = HOME_HTML.replace("__VERSION__", VERSION)

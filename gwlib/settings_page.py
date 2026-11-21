@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """网关设置页：飞牛音乐、内置在线音源、高级设置。"""
 
+from . import __version__ as VERSION
+
 SETTINGS_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>网关设置 · 飞牛音乐</title>
+<title>网关设置 · fnmusic-gateway v__VERSION__</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--card:#141b2d;--line:#263149;--mut:#93a4c4;--acc:#4f8cff;--ok:#37c98a;--bad:#ff6b6b}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e8eefc;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -33,7 +35,7 @@ input[type=text],input[type=password],input[type=number]{background:#0e1526;bord
 <body>
 <div class="wrap">
 <header>
-  <div><h1>网关设置</h1><div class="sub">配置会写入 data/config.json，保存后立即生效</div></div>
+  <div><h1>网关设置</h1><div class="sub">v__VERSION__ · 配置会写入 data/config.json，保存后立即生效</div></div>
   <div><a class="btn" href="/">返回首页</a> <a class="btn" href="/logout">退出</a></div>
 </header>
 
@@ -168,3 +170,5 @@ loadFnos();loadOnline();loadAdvanced()
 </body>
 </html>
 """
+
+SETTINGS_HTML = SETTINGS_HTML.replace("__VERSION__", VERSION)

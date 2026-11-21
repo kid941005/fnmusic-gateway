@@ -9,10 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "要构建的 Git ref，留空则用当前分支；补推历史版本可填 v2.6.1"
+        description: "要构建的 Git ref，留空则用当前分支；补推历史版本可填 v2.7.0"
         required: false
       tag:
-        description: "额外推送的 Docker 标签，留空则不追加；补推历史版本可填 2.6.1"
+        description: "额外推送的 Docker 标签，留空则不追加；补推历史版本可填 2.7.0"
         required: false
 
 env:

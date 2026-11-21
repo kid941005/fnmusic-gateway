@@ -11,7 +11,7 @@ LOG = logging.getLogger("fnmusic-gw.playback")
 
 class PlaybackService:
     def __init__(self, cache, library, make_url, lyric_url_for, audio_seconds,
-                 save_state, default_quality="standard", ttl=900, prewarm=True,
+                 save_state, default_quality="standard", ttl=900,
                  preview_min_seconds=35, tee_save=True):
         self.cache = cache
         self.library = library
@@ -21,7 +21,6 @@ class PlaybackService:
         self.save_state = save_state
         self.default_quality = normalize_quality(default_quality)
         self.ttl = ttl
-        self.prewarm = prewarm
         self.preview_min_seconds = preview_min_seconds
         self.tee_save = tee_save
 

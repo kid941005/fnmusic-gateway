@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from gwlib import __version__ as VERSION
 from gwlib.errors import BadRequest, GatewayError, as_payload
 from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, normalize_quality
-from gwlib.storage import LibraryStore, MediaCache, audio_seconds
+from gwlib.storage import LibraryStore, MediaCache, TranscodeSlots, audio_seconds
 from gwlib.sources import FallbackProvider, is_ext_guid
 from gwlib.native_source import (NativeMusicDLProvider,
                                   deps_available as online_deps_available,
@@ -124,10 +124,6 @@ PUBLIC_BASE = (_env("GW_PUBLIC_BASE", "") or "").rstrip("/")
 URL_TTL = _env_int("GW_URL_TTL", 900)
 CACHE_DIR = _env("GW_CACHE_DIR", os.path.join(DATA_DIR, "cache"))
 CACHE_MAX = _env_int("GW_CACHE_MAX_BYTES", 8 * 1024 ** 3)
-MP3_BITRATE = _env("GW_MP3_BITRATE", "128k")
-MP3_SR = _env_int("GW_MP3_SR", 44100)
-MP3_CHANNELS = _env_int("GW_MP3_CHANNELS", 2)
-PREWARM = _env_bool("GW_PREWARM", True)
 MOCK = _env_bool("GW_MOCK", False)
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
@@ -172,7 +168,6 @@ PREVIEW_MIN_SECONDS = max(1, _env_int("GW_PREVIEW_MIN_SECONDS", 35))
 # 音质与存储策略
 QUALITY_DEFAULT = normalize_quality(_env("GW_QUALITY_DEFAULT", DEFAULT_QUALITY))
 TEE_SAVE = _env_bool("GW_TEE_SAVE", True)
-SOURCE_SEARCH_PARALLEL = _env_bool("GW_SOURCES_SEARCH_PARALLEL", True)
 LIBRARY_MAX_BYTES = _env_int("GW_LIBRARY_MAX_BYTES", 0)
 
 # 搜索：别名纠错 + 相关度打分（中文 ASR 常把歌名/歌手听成同音字）
@@ -290,8 +285,8 @@ def apply_advanced_settings():
     SMART_SEARCH = vals["smart_search"]
     cache = globals().get("CACHE")
     if cache is not None:
-        cache.max = vals["cache_max_mb"] * _MIB
-        cache._slots = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
+        cache.reconfigure(max_bytes=vals["cache_max_mb"] * _MIB,
+                          transcode_slots=TRANSCODE_CONCURRENCY)
     library = globals().get("LIBRARY")
     if library is not None:
         library.max_bytes = vals["library_max_mb"] * _MIB
@@ -333,7 +328,7 @@ LOG = logging.getLogger("fnmusic-gw")
 FNOS_CONFIG.log = LOG
 
 # 同时最多几个 ffmpeg：防止多台设备同时点播把宿主机 CPU 打满
-_TRANSCODE_SLOTS = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
+_TRANSCODE_SLOTS = TranscodeSlots(TRANSCODE_CONCURRENCY)
 
 
 # ---------------------------------------------------------------- 签名
@@ -691,7 +686,8 @@ class FnProvider:
             base=s["base"], username=s.get("username") or "",
             password=s.get("password") or None,
             device_id=s.get("device_id") or None,
-            token_file=FNOS_TOKEN_FILE, timeout=FNOS_TIMEOUT)
+            token_file=FNOS_TOKEN_FILE, timeout=FNOS_TIMEOUT,
+            insecure_tls=bool(s.get("insecure_tls")))
         self.client.ensure_token()
 
     def search(self, q, limit=10):
@@ -719,6 +715,9 @@ class FnProvider:
 
     def stream(self, guid):
         return self.client.stream_bytes(guid)
+
+    def stream_to_path(self, guid, path, quality=None):
+        return self.client.stream_to_path(guid, path)
 
     def add_favorite(self, guid):
         self.client.favorite_add(guid)
@@ -935,7 +934,6 @@ def provider():
                             search_limit=settings["search_limit"],
                             download_dir_getter=lambda: DOWNLOAD_DIR,
                             max_bytes=LIBRARY_MAX_BYTES,
-                            parallel=SOURCE_SEARCH_PARALLEL,
                             total_limit=settings["total_limit"],
                             total_timeout=settings["total_timeout"])
                     elif base is not None:
@@ -1144,7 +1142,7 @@ def lyric_url_for(base, track, ttl=None):
 
 PLAYBACK = PlaybackService(CACHE, LIBRARY, make_url, lyric_url_for, audio_seconds,
                            save_state, default_quality=_ADV_BOOT["quality_default"],
-                           ttl=_ADV_BOOT["url_ttl"], prewarm=PREWARM,
+                           ttl=_ADV_BOOT["url_ttl"],
                            preview_min_seconds=_ADV_BOOT["preview_min_seconds"],
                            tee_save=_ADV_BOOT["tee_save"])
 apply_advanced_settings()
@@ -1156,151 +1154,180 @@ EXT_PREFIX = "ext:"
 TOOLS = build_tools()
 
 
-def call_tool(name, args, base):
-    args = args or {}
-    p = _LazyProvider()
-    limit = clamp_limit(args.get("limit"), 10)
-    quality = args.get("quality")
+def _tool_music_search(args, p, base, limit, quality):
+    q = str(args.get("query") or "").strip()
+    if not q:
+        raise BadRequest("query 不能为空")
+    if SMART_SEARCH:
+        rows, fixed = search_tracks(p, q, limit)
+    else:
+        rows, fixed = p.search(q, limit), ""
+    tail = ("（已按别名纠正为「%s」）" % fixed) if fixed and fixed != _norm_text(q) else ""
+    return "搜索「%s」%s找到 %d 首：\n%s" % (q, tail, len(rows), fmt_tracks(rows, limit))
 
-    if name == "music_search":
-        q = str(args.get("query") or "").strip()
-        if not q:
-            raise BadRequest("query 不能为空")
-        if SMART_SEARCH:
-            rows, fixed = search_tracks(p, q, limit)
-        else:
-            rows, fixed = p.search(q, limit), ""
-        tail = ("（已按别名纠正为「%s」）" % fixed) if fixed and fixed != _norm_text(q) else ""
-        return "搜索「%s」%s找到 %d 首：\n%s" % (q, tail, len(rows), fmt_tracks(rows, limit))
 
-    if name == "music_browse":
-        cat = str(args.get("category") or "track")
-        if cat not in ("track", "album", "artist", "playlist"):
-            raise BadRequest("category 只能是 track / album / artist / playlist")
-        if cat == "playlist":
-            pls = p.playlists()
-            return "歌单 %d 个：\n%s" % (len(pls), "\n".join(
-                "%d. %s（%d 首）" % (i, x["name"], x["count"]) for i, x in enumerate(pls, 1)) or "（空）")
-        if cat in ("album", "artist"):
-            names = p.albums(limit) if cat == "album" else p.artists(limit)
-            label = "专辑" if cat == "album" else "歌手"
-            return "%s %d 个：\n%s" % (label, len(names), "\n".join(
-                "%d. %s" % (i, n) for i, n in enumerate(names, 1)) or "（空）")
-        rows = p.list_tracks(limit)
-        return "全部歌曲（前 %d 首）：\n%s" % (len(rows), fmt_tracks(rows, limit))
-
-    if name == "music_playlists":
+def _tool_music_browse(args, p, base, limit, quality):
+    cat = str(args.get("category") or "track")
+    if cat not in ("track", "album", "artist", "playlist"):
+        raise BadRequest("category 只能是 track / album / artist / playlist")
+    if cat == "playlist":
         pls = p.playlists()
-        return "我的歌单 %d 个：\n%s" % (len(pls), "\n".join(
+        return "歌单 %d 个：\n%s" % (len(pls), "\n".join(
             "%d. %s（%d 首）" % (i, x["name"], x["count"]) for i, x in enumerate(pls, 1)) or "（空）")
+    if cat in ("album", "artist"):
+        names = p.albums(limit) if cat == "album" else p.artists(limit)
+        label = "专辑" if cat == "album" else "歌手"
+        return "%s %d 个：\n%s" % (label, len(names), "\n".join(
+            "%d. %s" % (i, n) for i, n in enumerate(names, 1)) or "（空）")
+    rows = p.list_tracks(limit)
+    return "全部歌曲（前 %d 首）：\n%s" % (len(rows), fmt_tracks(rows, limit))
 
-    if name == "music_playlist_tracks":
-        pl = resolve_playlist(p, str(args.get("name") or ""))
-        if not pl:
-            raise BadRequest("没有找到歌单「%s」" % args.get("name"))
-        rows = p.playlist_tracks(pl["guid"], 200)[:limit]
-        return "歌单「%s」共 %d 首：\n%s" % (pl["name"], len(rows), fmt_tracks(rows, limit))
 
-    if name == "music_favorites":
-        rows = p.favorites(limit)
-        return "收藏 %d 首：\n%s" % (len(rows), fmt_tracks(rows, limit))
+def _tool_music_playlists(args, p, base, limit, quality):
+    pls = p.playlists()
+    return "我的歌单 %d 个：\n%s" % (len(pls), "\n".join(
+        "%d. %s（%d 首）" % (i, x["name"], x["count"]) for i, x in enumerate(pls, 1)) or "（空）")
 
-    if name == "music_play":
-        rows, label = pick_tracks(p, str(args.get("query") or ""),
-                                  str(args.get("playlist") or ""), 20)
-        idx = _to_int(args.get("index"), 1)
-        if idx < 1 or idx > len(rows):
-            raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
-        info = PLAYBACK.prepare(rows[idx - 1], p, base, quality=quality)
-        src_line = ("\n来源：在线音源 %s" % info["source"]) if info["source"] != "local" else ""
-        prev_line = ""
-        if info["preview"]:
-            prev_line = ("\n注意：在线音源只给到试听片段（约 %d 秒）；说「下载」可保存完整版到本地曲库。" % int(info["duration"] or 0))
-        save_line = "，正在后台保存到本地曲库" if info["saving"] else ""
-        return ("准备播放：%s%s\n%s 第 %d 首，音质 %s（%s kbps）%s%s\n直链（%d 分钟内有效）：%s\n"
-                "歌词直链：%s\n"
-                "总时长：%d 秒\n"
-                "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
-                "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空），"
-                "duration 填 %d（总秒数，整数）。" % (
-                    info["title"], (" - " + info["artist"]) if info["artist"] else "", label, idx,
-                    info["quality_label"], info["bitrate"], src_line, prev_line + save_line,
-                    max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
-                    info["lyric_url"] or "（这首歌查不到歌词，留空即可）",
-                    int(info.get("duration") or 0),
-                    info["title"], info["artist"] or "", int(info.get("duration") or 0)))
 
-    if name == "music_favorite":
-        action = str(args.get("action") or "").lower()
-        q = str(args.get("query") or "").strip()
-        if not q:
-            raise BadRequest("query 不能为空")
+def _tool_music_playlist_tracks(args, p, base, limit, quality):
+    pl = resolve_playlist(p, str(args.get("name") or ""))
+    if not pl:
+        raise BadRequest("没有找到歌单「%s」" % args.get("name"))
+    rows = p.playlist_tracks(pl["guid"], 200)[:limit]
+    return "歌单「%s」共 %d 首：\n%s" % (pl["name"], len(rows), fmt_tracks(rows, limit))
+
+
+def _tool_music_favorites(args, p, base, limit, quality):
+    rows = p.favorites(limit)
+    return "收藏 %d 首：\n%s" % (len(rows), fmt_tracks(rows, limit))
+
+
+def _tool_music_play(args, p, base, limit, quality):
+    rows, label = pick_tracks(p, str(args.get("query") or ""),
+                              str(args.get("playlist") or ""), 20)
+    idx = _to_int(args.get("index"), 1)
+    if idx < 1 or idx > len(rows):
+        raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
+    info = PLAYBACK.prepare(rows[idx - 1], p, base, quality=quality)
+    src_line = ("\n来源：在线音源 %s" % info["source"]) if info["source"] != "local" else ""
+    prev_line = ""
+    if info["preview"]:
+        prev_line = ("\n注意：在线音源只给到试听片段（约 %d 秒）；说「下载」可保存完整版到本地曲库。" % int(info["duration"] or 0))
+    save_line = "，正在后台保存到本地曲库" if info["saving"] else ""
+    return ("准备播放：%s%s\n%s 第 %d 首，音质 %s（%s kbps）%s%s\n直链（%d 分钟内有效）：%s\n"
+            "歌词直链：%s\n"
+            "总时长：%d 秒\n"
+            "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
+            "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空），"
+            "duration 填 %d（总秒数，整数）。" % (
+                info["title"], (" - " + info["artist"]) if info["artist"] else "", label, idx,
+                info["quality_label"], info["bitrate"], src_line, prev_line + save_line,
+                max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
+                info["lyric_url"] or "（这首歌查不到歌词，留空即可）",
+                int(info.get("duration") or 0),
+                info["title"], info["artist"] or "", int(info.get("duration") or 0)))
+
+
+def _tool_music_favorite(args, p, base, limit, quality):
+    action = str(args.get("action") or "").lower()
+    q = str(args.get("query") or "").strip()
+    if not q:
+        raise BadRequest("query 不能为空")
+    rows = p.search(q, 5)
+    if not rows:
+        raise BadRequest("没找到「%s」" % q)
+    t = rows[0]
+    if action == "add":
+        if is_ext_guid(t["guid"]) and hasattr(p, "download_ext"):
+            fp, n = p.download_ext(t, quality or "lossless")
+            return "已收藏并下载到本地曲库：%s（%s，%.1f MB）" % (
+                t["title"], fp, n / 1048576.0)
+        p.add_favorite(t["guid"])
+        return "已收藏：%s" % t["title"]
+    if action == "remove":
+        p.remove_favorite(t["guid"])
+        return "已取消收藏：%s" % t["title"]
+    raise BadRequest("action 只能是 add 或 remove")
+
+
+def _tool_music_download(args, p, base, limit, quality):
+    guid = str(args.get("guid") or "").strip()
+    q = str(args.get("query") or "").strip()
+    if not LIBRARY.enabled():
+        raise BadRequest("未配置 GW_DOWNLOAD_DIR，无法保存到本地")
+    if guid:
+        st = load_state()
+        track = {"guid": guid, "title": (st.get("title") if st.get("guid") == guid else "") or guid,
+                 "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
+                 "source": "ext"}
+    elif q:
         rows = p.search(q, 5)
         if not rows:
             raise BadRequest("没找到「%s」" % q)
-        t = rows[0]
-        if action == "add":
-            if is_ext_guid(t["guid"]) and hasattr(p, "download_ext"):
-                fp, n = p.download_ext(t, quality or "lossless")
-                return "已收藏并下载到本地曲库：%s（%s，%.1f MB）" % (
-                    t["title"], fp, n / 1048576.0)
-            p.add_favorite(t["guid"])
-            return "已收藏：%s" % t["title"]
-        if action == "remove":
-            p.remove_favorite(t["guid"])
-            return "已取消收藏：%s" % t["title"]
-        raise BadRequest("action 只能是 add 或 remove")
+        track = rows[0]
+    else:
+        raise BadRequest("guid 或 query 至少给一个")
+    fp, n = LIBRARY.save_from_provider(p, track, quality or DEFAULT_QUALITY)
+    return "已保存到本地曲库：%s（%s，%.1f MB）" % (track.get("title") or track["guid"], fp, n / 1048576.0)
 
-    if name == "music_download":
-        guid = str(args.get("guid") or "").strip()
-        q = str(args.get("query") or "").strip()
-        if not LIBRARY.enabled():
-            raise BadRequest("未配置 GW_DOWNLOAD_DIR，无法保存到本地")
-        if guid:
-            st = load_state()
-            track = {"guid": guid, "title": (st.get("title") if st.get("guid") == guid else "") or guid,
-                     "artist": (st.get("artist") if st.get("guid") == guid else "") or "",
-                     "source": "ext"}
-        elif q:
-            rows = p.search(q, 5)
-            if not rows:
-                raise BadRequest("没找到「%s」" % q)
-            track = rows[0]
-        else:
-            raise BadRequest("guid 或 query 至少给一个")
-        fp, n = LIBRARY.save_from_provider(p, track, quality or DEFAULT_QUALITY)
-        return "已保存到本地曲库：%s（%s，%.1f MB）" % (track.get("title") or track["guid"], fp, n / 1048576.0)
 
-    if name == "music_sources":
-        settings = online_settings()
-        if not online_active(settings):
-            return "未启用在线音源：请在网页「设置 → 在线音源」选择平台并启用。"
-        rows = online_status()
-        lines = ["在线音源 %d 个：" % len(rows)]
-        for item in rows:
-            lines.append("%s / %s %s" % (item.get("source"), item.get("platform") or item.get("url"),
-                                         " 正常" if item.get("healthy") else " 不可用"))
-        return "\n".join(lines)
+def _tool_music_sources(args, p, base, limit, quality):
+    settings = online_settings()
+    if not online_active(settings):
+        return "未启用在线音源：请在网页「设置 → 在线音源」选择平台并启用。"
+    rows = online_status()
+    lines = ["在线音源 %d 个：" % len(rows)]
+    for item in rows:
+        lines.append("%s / %s %s" % (item.get("source"), item.get("platform") or item.get("url"),
+                                     " 正常" if item.get("healthy") else " 不可用"))
+    return "\n".join(lines)
 
-    if name == "music_storage":
-        c = CACHE.stats()
-        lib = LIBRARY.stats()
-        return ("播放缓存：%d 个文件，%.1f MB（上限 %.1f MB）\n本地曲库：%s，%d 个文件，%.1f MB" % (
-            c.get("files", 0), c.get("bytes", 0) / 1048576.0,
-            c.get("limit_bytes", 0) / 1048576.0,
-            lib.get("dir") or "未配置", lib.get("files", 0), lib.get("bytes", 0) / 1048576.0))
 
-    if name == "music_status":
-        st = load_state()
-        if not st.get("title"):
-            return "还没播放过。"
-        at = _to_int(st.get("at"))
-        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)) if at > 0 else "时间未知"
-        qn = ("（音质 %s）" % st.get("quality")) if st.get("quality") else ""
-        return "上一次播放：%s%s%s（%s）" % (
-            st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", qn, when)
+def _tool_music_storage(args, p, base, limit, quality):
+    c = CACHE.stats()
+    lib = LIBRARY.stats()
+    return ("播放缓存：%d 个文件，%.1f MB（上限 %.1f MB）\n本地曲库：%s，%d 个文件，%.1f MB" % (
+        c.get("files", 0), c.get("bytes", 0) / 1048576.0,
+        c.get("limit_bytes", 0) / 1048576.0,
+        lib.get("dir") or "未配置", lib.get("files", 0), lib.get("bytes", 0) / 1048576.0))
 
-    raise RuntimeError("未知工具：%s" % name)
+
+def _tool_music_status(args, p, base, limit, quality):
+    st = load_state()
+    if not st.get("title"):
+        return "还没播放过。"
+    at = _to_int(st.get("at"))
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)) if at > 0 else "时间未知"
+    qn = ("（音质 %s）" % st.get("quality")) if st.get("quality") else ""
+    return "上一次播放：%s%s%s（%s）" % (
+        st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", qn, when)
+
+
+_TOOL_HANDLERS = {
+    "music_search": _tool_music_search,
+    "music_browse": _tool_music_browse,
+    "music_playlists": _tool_music_playlists,
+    "music_playlist_tracks": _tool_music_playlist_tracks,
+    "music_favorites": _tool_music_favorites,
+    "music_play": _tool_music_play,
+    "music_favorite": _tool_music_favorite,
+    "music_download": _tool_music_download,
+    "music_sources": _tool_music_sources,
+    "music_storage": _tool_music_storage,
+    "music_status": _tool_music_status,
+}
+
+
+def call_tool(name, args, base):
+    """按工具名分派到独立实现，便于阅读、单测和后续扩展。"""
+    args = args or {}
+    handler = _TOOL_HANDLERS.get(name)
+    if handler is None:
+        raise RuntimeError("未知工具：%s" % name)
+    p = _LazyProvider()
+    limit = clamp_limit(args.get("limit"), 10)
+    quality = args.get("quality")
+    return handler(args, p, base, limit, quality)
 
 
 # 官方 MCPServer 2.3：工具注册/Schema/校验/错误包装由官方库负责；
@@ -1515,17 +1542,17 @@ class Handler(BaseHTTPRequestHandler):
         if not cfg["username"]:
             raise BadRequest("请先填写账号")
         from fnmusic_client import FnMusicClient
-        old_tls = os.environ.get("FNMUSIC_INSECURE_TLS")
         if "insecure_tls" in body:
-            os.environ["FNMUSIC_INSECURE_TLS"] = "1" if _truthy(body.get("insecure_tls")) else ""
+            insecure_tls = _truthy(body.get("insecure_tls"))
         else:
-            apply_fnos_tls()
+            insecure_tls = bool(s.get("insecure_tls"))
         started = time.time()
         try:
             client = FnMusicClient(base=cfg["base"], username=cfg["username"],
                                    password=cfg["password"] or None,
                                    device_id=cfg["device_id"] or None,
-                                   token_file=None, timeout=min(FNOS_TIMEOUT, 10))
+                                   token_file=None, timeout=min(FNOS_TIMEOUT, 10),
+                                   insecure_tls=insecure_tls)
             client.ensure_token()
             tracks = _rows(client.track_list(1, 3))
             return self._json({"ok": True, "ms": int((time.time() - started) * 1000),
@@ -1533,11 +1560,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json({"ok": False, "ms": int((time.time() - started) * 1000),
                                "error": str(e), "message": "连接失败"})
-        finally:
-            if old_tls is None:
-                os.environ.pop("FNMUSIC_INSECURE_TLS", None)
-            else:
-                os.environ["FNMUSIC_INSECURE_TLS"] = old_tls
 
     def _handle_settings_logout(self):
         try:
@@ -1922,11 +1944,20 @@ class Handler(BaseHTTPRequestHandler):
             return 0.0
 
     def _handle_api_play(self, qs):
+        guid = (qs.get("guid") or [""])[0].strip()
         query = (qs.get("query") or qs.get("q") or [""])[0]
         playlist = (qs.get("playlist") or [""])[0]
         index = self._qs_int(qs, "index", 1)
         quality = (qs.get("quality") or [""])[0] or None
         p = provider()
+        if guid:
+            # WebUI 直接按 guid 播放：不再按标题重搜，避免同名曲/排序变化点错歌。
+            track = {"guid": guid,
+                     "title": (qs.get("title") or [guid])[0],
+                     "artist": (qs.get("artist") or [""])[0]}
+            info = PLAYBACK.prepare(track, p, self._base(), quality=quality)
+            info.update({"label": "直链", "index": 1, "count": 1})
+            return self._json(info)
         rows, label = pick_tracks(p, query, playlist, 20)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)

@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.9.1**（2026-11-21） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.9.2**（2026-11-21） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -51,7 +51,7 @@
 | `gwlib/storage.py` | MP3 转码缓存 + 本地下载目录落盘 | `MediaCache.ensure` / `LibraryStore.save_from_provider` |
 | `gwlib/config.py` | 网页设置持久化（`/data/config.json`，0600 原子写） | `ConfigStore.update/section` |
 | `gwlib/settings_page.py` | `/settings` 网关设置页（纯静态 HTML） | `SETTINGS_HTML` |
-| `gwlib/sources.py` | 在线音源适配、探活、多源并行检索 | `ExtProvider` / `FallbackProvider` / `source_status` |
+| `gwlib/sources.py` | 在线音源适配、探活、多源并行检索 | `ExtProvider` / `FallbackProvider` |
 | `gwlib/playback.py` | 选源→音质→缓存→直链→边播边存 | `PlaybackService.prepare` |
 | `gwlib/native_source.py` | 内置在线音源（musicdl 子进程 worker、直链缓存） | `NativeMusicDLProvider` |
 | `gwlib/musicdl_core.py` | musicdl 搜索/归一化/可播性探测 | `normalize` / `run_search_task` |
@@ -168,10 +168,6 @@ docker compose up -d
 | `GW_DATA` | `./data` | 状态/密钥/token/歌词落盘目录 |
 | `GW_CACHE_DIR` | `$GW_DATA/cache` | MP3 缓存目录 |
 | `GW_CACHE_MAX_BYTES` | 8 GiB | 缓存上限，超了按最久未用淘汰 |
-| `GW_MP3_BITRATE` | 128k | 转码码率 |
-| `GW_MP3_SR` | 44100 | 采样率 |
-| `GW_MP3_CHANNELS` | 2 | 声道数 |
-| `GW_PREWARM` | 1 | `/api/play` 返回前先转码，设备连上即可读 |
 | `GW_MAX_LIMIT` | 50 | 单次查询返回条数上限（LLM 传再大也会被收敛） |
 | `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把宿主机 CPU 打满 |
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
@@ -198,7 +194,6 @@ docker compose up -d
 | `GW_QUALITY_DEFAULT` | `standard` | 默认音质：`standard`(128k) / `high`(192k) / `exhigh`(320k) / `lossless`(下载原始音质，播放仍 320k MP3) |
 | `GW_TEE_SAVE` | 1 | 在线歌曲播放时是否边播边存到 `GW_DOWNLOAD_DIR`；0=关闭 |
 | `GW_LIBRARY_MAX_BYTES` | 0 | 本地下载目录容量上限（字节，0=不限）；超出后下载报错 |
-| `GW_SOURCES_SEARCH_PARALLEL` | 1 | 多音源检索是否并行；0=串行 |
 
 ### 歌词（设备屏显）
 
@@ -489,7 +484,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 99 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 100 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -513,7 +508,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（99 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（100 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
 
 内置 musicdl 平台与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（平台可用性取决于上游风控与网络；飞牛可在网页「设置」里点测试连接确认）。
 
@@ -538,6 +533,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（99 用例）、bridge_selftest.py
+tests/                    test_gateway.py（100 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 可选桥接器（只发布 8766）
 ~~~

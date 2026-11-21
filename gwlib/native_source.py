@@ -198,18 +198,25 @@ class NativeMusicDLProvider:
         self.total_timeout = max(1.0, float(total_timeout or 40))
         self.ttl = max(60, int(ttl or 1800))
         self._workers = {}
+        self._worker_locks = {}
         self._cache = {}
         self._cache_order = []
         self._lock = threading.Lock()
 
     # ---- worker / cache ----
     def _worker(self, platform):
+        # 每个平台独立锁：启动 worker 最多等 30s，不能阻塞其他平台/缓存/status。
         with self._lock:
-            worker = self._workers.get(platform)
-            if worker is None or not worker.alive():
-                if worker is not None:
-                    worker.close()
-                worker = _Worker(platform, self.work_dir, self.timeout)
+            lock = self._worker_locks.setdefault(platform, threading.Lock())
+        with lock:
+            with self._lock:
+                worker = self._workers.get(platform)
+            if worker is not None and worker.alive():
+                return worker
+            if worker is not None:
+                worker.close()
+            worker = _Worker(platform, self.work_dir, self.timeout)
+            with self._lock:
                 self._workers[platform] = worker
             return worker
 
@@ -220,6 +227,11 @@ class NativeMusicDLProvider:
         now = time.time()
         with self._lock:
             self._cache[eid] = (item, headers, lyric, now + self.ttl)
+            # 同一曲目重复搜索时先移除旧位置，避免重复 eid 在淘汰时误删仍有效的缓存。
+            try:
+                self._cache_order.remove(eid)
+            except ValueError:
+                pass
             self._cache_order.append(eid)
             while len(self._cache_order) > 1000:
                 old = self._cache_order.pop(0)

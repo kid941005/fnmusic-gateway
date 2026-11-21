@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 2.9.2 (2026-11-21)
+
+### 代码审查修复与内部重构
+- 修复 WebUI 点播按标题重搜可能放错歌：`/api/play` 支持 `guid`，首页直接按 guid 点播，并新增回归用例。
+- 飞牛音乐流式落盘：新增 `FnMusicClient.stream_to_path`，缓存不再把整首 FLAC/MP3 读入内存；token 文件写盘后设为 0600。
+- 高级设置热更新改用可调 `TranscodeSlots`，不再替换正在使用的信号量；ffmpeg 超时/失败统一包装为 `StorageError`。
+- 内置 musicdl worker 启动改为每平台独立锁；缓存淘汰先去重，避免误删仍有效的缓存。
+- 清理失效配置 `GW_MP3_BITRATE`/`GW_MP3_SR`/`GW_MP3_CHANNELS`/`GW_PREWARM`/`GW_SOURCES_SEARCH_PARALLEL` 及对应文档。
+- `call_tool` 拆分为 11 个独立 handler 按名分派；`FallbackProvider.search` 改用常驻线程池；删除死代码 `fallback_services()`/`source_status()`。
+- 修复 MCP 桥关闭后端口/线程未重置、未知在线音源错误回退到首个源等问题。
+- 版本 2.9.1 → **2.9.2**；测试 **100 个用例**（新增 guid 点播回归）。
+
 ## 2.9.1 (2026-11-21)
 
 ### 新功能：WebUI 与日志显示版本号

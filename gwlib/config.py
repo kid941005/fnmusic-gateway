@@ -18,9 +18,7 @@ FIELDS = {
         "quality_default", "max_limit", "preview_min_seconds", "url_ttl",
         "cache_max_mb", "library_max_mb", "transcode_concurrency",
         "smart_search", "tee_save", "lyrics_enabled", "lrclib_url",
-        "lyrics_retry", "fallback_timeout", "fallback_search_limit",
-        "fallback_total_limit", "fallback_total_timeout", "fnos_timeout",
-        "mcp_timeout",
+        "lyrics_retry", "fnos_timeout", "mcp_timeout",
     ),
 }
 

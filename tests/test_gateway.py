@@ -271,6 +271,17 @@ class TestHttp(Base):
         r4, _ = self.req("GET", "/lyrics/", raw=True)
         self.assertEqual(r4.status, 400)
 
+    def test_api_play_by_guid(self):
+        row = app.MockProvider().search("晴天", 1)[0]
+        guid = row["guid"]
+        qs = urllib.parse.urlencode({"guid": guid, "title": row["title"],
+                                     "artist": row.get("artist", "")})
+        r, d = self.req("GET", "/api/play?" + qs)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(d["guid"], guid)
+        self.assertEqual(d["label"], "直链")
+        self.assertEqual((d["index"], d["count"]), (1, 1))
+
     def test_api_play_has_metadata(self):
         r, d = self.req("GET", "/api/play?query=" + urllib.parse.quote("晴天"))
         self.assertEqual(r.status, 200)
@@ -1176,7 +1187,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.9.1")
+        self.assertEqual(app.VERSION, "2.9.2")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

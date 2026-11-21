@@ -226,5 +226,7 @@ class McpHttpBridge:
         except Exception:
             pass
         thread = self._thread
+        self._thread = None
+        self._port = None
         if thread is not None:
             thread.join(timeout=5)

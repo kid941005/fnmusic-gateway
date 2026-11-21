@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -104,10 +105,6 @@ def parse_spec(spec):
     svc = svc.strip().lower()
     svc = SERVICE_ALIASES.get(svc, svc) if svc else (guess_service(url) or "musicdl")
     return svc, str(url or "").strip()
-
-
-def fallback_services(urls):
-    return [parse_spec(spec)[0] for spec in urls]
 
 
 def _http_json(url, timeout):
@@ -270,6 +267,10 @@ class FallbackProvider:
         self.parallel = parallel
         self.total_limit = max(1, int(total_limit or 50))
         self.total_timeout = max(1.0, float(total_timeout or 15))
+        # 常驻线程池：避免每次 search 新建/销毁线程；并行与否在构造时固定。
+        workers = min(4, len(self.exts)) if (self.parallel and len(self.exts) > 1) else 1
+        self._pool = ThreadPoolExecutor(max_workers=max(1, workers),
+                                        thread_name_prefix="gw-search")
         self.library = LibraryStore(
             download_dir_getter or (lambda: os.environ.get("GW_DOWNLOAD_DIR", "")),
             LOG,
@@ -324,7 +325,7 @@ class FallbackProvider:
         deadline = time.monotonic() + self.total_timeout
         batches = []
         workers = min(4, len(self.exts)) if (self.parallel and len(self.exts) > 1) else 1
-        pool = ThreadPoolExecutor(max_workers=workers)
+        pool = self._pool
         futures = {}
         try:
             futures = {pool.submit(ext.search, q, per_source): ext for ext in self.exts}
@@ -352,7 +353,6 @@ class FallbackProvider:
         finally:
             for future in futures:
                 future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
         for batch in batches:
             for track in batch:
                 key = (_norm_text(track.get("title")), _norm_text(track.get("artist")))
@@ -369,7 +369,7 @@ class FallbackProvider:
         for ext in self.exts:
             if ext.svc == svc:
                 return ext
-        return self.exts[0] if self.exts else None
+        raise RuntimeError("未知在线音源: %s" % svc)
 
     def stream(self, guid, quality=None):
         if is_ext_guid(guid):
@@ -397,7 +397,14 @@ class FallbackProvider:
         return self.library.save_from_provider(self, track, quality=quality)
 
     def close(self):
-        """释放内置音源的 worker 子进程等资源。"""
+        """释放内置音源的 worker 子进程与检索线程池。"""
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         for ext in self.exts:
             close_fn = getattr(ext, "close", None)
             if callable(close_fn):
@@ -420,12 +427,3 @@ class FallbackProvider:
                         "url": getattr(ext, "base", ""),
                         "healthy": bool(ext.health())})
         return out
-
-
-def source_status(urls, timeout=3):
-    out = []
-    for spec in urls:
-        svc, url = parse_spec(spec)
-        ext = ExtProvider(url, svc, timeout=timeout)
-        out.append({"source": svc, "url": url, "healthy": ext.health()})
-    return out

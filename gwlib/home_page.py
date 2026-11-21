@@ -103,7 +103,7 @@ async function search(){
 }
 async function play(t,i){
   if(!t)return;say('准备播放 '+t.title+'…')
-  try{var d=await getJSON('/api/play?query='+encodeURIComponent(t.title)+'&index='+((i||0)+1)+'&quality=standard')
+  try{var d=await getJSON('/api/play?guid='+encodeURIComponent(t.guid||'')+'&title='+encodeURIComponent(t.title||'')+'&artist='+encodeURIComponent(t.artist||'')+'&quality=standard')
     var a=new Audio(d.url);a.play();say('正在播放：'+t.title+'\\n直链：'+d.url)}catch(e){say('播放失败：'+e.message)}
 }
 async function download(t){

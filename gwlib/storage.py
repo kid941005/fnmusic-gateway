@@ -54,6 +54,38 @@ def audio_seconds(path):
         return None
 
 
+class TranscodeSlots:
+    """可在线调整上限的转码闸门；替代直接替换 BoundedSemaphore 的竞态做法。"""
+
+    def __init__(self, limit=2):
+        self._limit = max(1, int(limit or 1))
+        self._active = 0
+        self._cond = threading.Condition()
+
+    @property
+    def limit(self):
+        with self._cond:
+            return self._limit
+
+    def resize(self, limit):
+        with self._cond:
+            self._limit = max(1, int(limit or 1))
+            self._cond.notify_all()
+
+    def __enter__(self):
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify()
+        return False
+
+
 class MediaCache:
     """按 guid + 音质档位缓存 MP3；大小按 atime LRU 淘汰。"""
 
@@ -69,8 +101,15 @@ class MediaCache:
         # 弱引用：锁只在有线程持有/等待时存活，避免 guid 越多锁越多
         self._locks = weakref.WeakValueDictionary()
         self._guard = threading.Lock()
-        self._slots = transcode_slots or threading.BoundedSemaphore(2)
+        self._slots = transcode_slots or TranscodeSlots(2)
         self._cleanup_stale()
+
+    def reconfigure(self, max_bytes=None, transcode_slots=None):
+        """在线调整缓存上限/转码并发，不替换正在使用的闸门对象。"""
+        if max_bytes is not None:
+            self.max = max(0, int(max_bytes))
+        if transcode_slots is not None:
+            self._slots.resize(transcode_slots)
 
     def _cleanup_stale(self):
         try:
@@ -122,8 +161,15 @@ class MediaCache:
                        "-ac", str(channels), "-ar", str(sample_rate),
                        "-c:a", "libmp3lame", "-b:a", bitrate, "-f", "mp3", tmp]
                 with self._slots:
-                    subprocess.run(cmd, check=True, timeout=timeout,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    try:
+                        subprocess.run(cmd, check=True, timeout=timeout,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    except subprocess.TimeoutExpired:
+                        raise StorageError("ffmpeg 转码超时: %s" % guid)
+                    except subprocess.CalledProcessError as exc:
+                        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()[:200]
+                        raise StorageError("ffmpeg 转码失败: %s%s" % (
+                            guid, ("（%s）" % detail) if detail else ""))
                 if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
                     raise StorageError("ffmpeg 转码失败: %s" % guid)
                 os.replace(tmp, dst)
@@ -204,7 +250,7 @@ class LibraryStore:
             raise BadRequest("保存到本地曲库需要先配置 GW_DOWNLOAD_DIR")
         name = "%s - %s" % (track.get("title") or track.get("guid") or "unknown",
                             track.get("artist") or "未知")
-        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()[:150] or "unknown"
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().lstrip(".")[:150] or "unknown"
         os.makedirs(directory, exist_ok=True)
         return os.path.join(directory, name + ext)
 

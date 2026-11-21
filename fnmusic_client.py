@@ -85,7 +85,7 @@ def encode_query(params):
 
 class FnMusicClient:
     def __init__(self, base=DEFAULT_BASE, username=DEFAULT_USERNAME, password=None, device_id=None,
-                 token=None, token_file=None, timeout=12.0):
+                 token=None, token_file=None, timeout=12.0, insecure_tls=None):
         self.base = (base or DEFAULT_BASE).rstrip("/")
         self.username = username or DEFAULT_USERNAME
         self.password = password
@@ -95,8 +95,12 @@ class FnMusicClient:
         self.timeout = timeout
         self._lock = threading.Lock()
         self._ssl = ssl.create_default_context()
-        # 默认校验证书；内网自签 HTTPS 才显式设置 FNMUSIC_INSECURE_TLS=1。
-        if os.environ.get("FNMUSIC_INSECURE_TLS", "").strip().lower() in ("1", "true", "yes", "on"):
+        # 默认校验证书；内网自签 HTTPS 才显式关闭。insecure_tls 显式传参优先于环境变量，
+        # 避免「测试连接」临时改 os.environ 影响并发请求。
+        if insecure_tls is None:
+            insecure_tls = os.environ.get("FNMUSIC_INSECURE_TLS", "").strip().lower() in (
+                "1", "true", "yes", "on")
+        if insecure_tls:
             self._ssl.check_hostname = False
             self._ssl.verify_mode = ssl.CERT_NONE
         if not self.token and token_file:
@@ -120,6 +124,10 @@ class FnMusicClient:
             tmp = self.token_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             os.replace(tmp, self.token_file)
         except Exception:
             pass
@@ -283,6 +291,34 @@ class FnMusicClient:
     # ---------- 播放 ----------
     def track_metadata(self, track_guid):
         return self.get("/track/metadata", {"guid": track_guid})
+
+    def stream_to_path(self, track_guid, path, retry=True):
+        """把 /track/stream 直接流式写入 path，返回 (content_type, bytes)。"""
+        url, headers, _ = self._build("/track/stream", {"guid": track_guid}, None)
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl)
+        except urllib.error.HTTPError as e:
+            head = e.read()[:80]
+            e.close()
+            if e.code == 401 and retry and self.username and self.password:
+                self.login()
+                return self.stream_to_path(track_guid, path, retry=False)
+            raise FnMusicError("stream status=%s head=%r" % (e.code, head), e.code)
+        except Exception as e:
+            raise FnMusicError("stream network: %s (%s)" % (e, url))
+        ctype = resp.headers.get("Content-Type", "")
+        total = 0
+        with resp, open(path, "wb") as fh:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                total += len(chunk)
+        if not total:
+            raise FnMusicError("stream empty body (%s)" % url)
+        return ctype, total
 
     def stream_bytes(self, track_guid, retry=True):
         """下载 /track/stream 原始音频字节，返回 (content_type, bytes)。"""

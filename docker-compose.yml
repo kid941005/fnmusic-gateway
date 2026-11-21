@@ -18,7 +18,7 @@
 services:
   # ---- 网关：REST / MCP / WebUI 反代 / 播放直链，全部走 8766 ----
   fnmusic-gateway:
-    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:latest}
+    image: ${GW_IMAGE:-docker.io/kid941005/fnmusic-gateway:latest}
     container_name: fnmusic-gateway
     restart: unless-stopped
     ports:
@@ -42,7 +42,7 @@ services:
 
   # ---- 桥接器：仅在用「小智 MCP 接入点(wss)」时需要；不用可整段删掉 ----
   fnmusic-bridge:
-    image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:latest}
+    image: ${GW_IMAGE:-docker.io/kid941005/fnmusic-gateway:latest}
     container_name: fnmusic-bridge
     restart: unless-stopped
     networks: [fnmusic]

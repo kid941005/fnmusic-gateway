@@ -1,0 +1,44 @@
+name: retag-latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "源版本号，例如 2.10.1"
+        required: true
+        default: "2.10.1"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Retag GHCR latest
+        run: >-
+          docker buildx imagetools create
+          -t ghcr.io/kid941005/fnmusic-gateway:latest
+          ghcr.io/kid941005/fnmusic-gateway:${{ github.event.inputs.source }}
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ github.repository_owner }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - name: Retag Docker Hub latest
+        if: env.DOCKERHUB_TOKEN != ''
+        run: >-
+          docker buildx imagetools create
+          -t docker.io/kid941005/fnmusic-gateway:latest
+          docker.io/kid941005/fnmusic-gateway:${{ github.event.inputs.source }}

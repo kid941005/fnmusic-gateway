@@ -1,0 +1,31 @@
+name: cleanup-ghcr-tags
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true 才真正删除；false 仅打印计划"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Clean tags
+        env:
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLY: ${{ github.event.inputs.apply }}
+        run: python3 scripts/cleanup_ghcr_tags.py

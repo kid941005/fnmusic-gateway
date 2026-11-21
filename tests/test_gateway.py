@@ -339,7 +339,8 @@ class TestHome(Base):
 
     def test_root_requires_auth(self):
         r, _ = self.req("GET", "/", raw=True)
-        self.assertEqual(r.status, 401)
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/login?next=%2F")
 
     def test_token_sets_cookie_and_shows_home(self):
         cookie = self._cookie()
@@ -360,6 +361,80 @@ class TestHome(Base):
         self.assertEqual(r.status, 200)
         self.assertIn("online", body)
         self.assertIn("enabled", body["online"])
+
+    def test_settings_redirects_to_login(self):
+        r, _ = self.req("GET", "/settings", raw=True)
+        self.assertEqual(r.status, 302)
+        loc = r.getheader("Location") or ""
+        self.assertTrue(loc.startswith("/login?next="))
+        self.assertIn("settings", loc)
+
+
+class TestLoginPage(Base):
+    """登录页：密码换 Cookie，支持 next 回跳，拒绝开放重定向。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._old_token = app.ADMIN_TOKEN
+        app.ADMIN_TOKEN = "login-secret"
+
+    @classmethod
+    def tearDownClass(cls):
+        app.ADMIN_TOKEN = cls._old_token
+        super().tearDownClass()
+
+    def _post(self, password, nxt="/"):
+        payload = urllib.parse.urlencode({"password": password, "next": nxt}).encode()
+        return self.req("POST", "/login", body=payload,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        raw=True)
+
+    def test_login_page_renders(self):
+        r, body = self.req("GET", "/login", raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn(b'type="password"', body)
+        self.assertIn(b'name="next"', body)
+        self.assertNotIn(b"login-secret", body)
+
+    def test_wrong_password_rejected(self):
+        r, body = self._post("bad")
+        self.assertEqual(r.status, 401)
+        self.assertIn("密码错误".encode("utf-8"), body)
+        self.assertIsNone(r.getheader("Set-Cookie"))
+
+    def test_correct_password_sets_cookie(self):
+        r, _ = self._post("login-secret")
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/")
+        raw = r.getheader("Set-Cookie") or ""
+        self.assertIn("fnmusic_admin=", raw)
+        self.assertIn("HttpOnly", raw)
+        cookie = raw.split(";")[0]
+        r, body = self.req("GET", "/", headers={"Cookie": cookie}, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn(b"fnmusic-gateway", body)
+
+    def test_next_settings_honored(self):
+        r, _ = self._post("login-secret", "/settings")
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/settings")
+        cookie = (r.getheader("Set-Cookie") or "").split(";")[0]
+        r, body = self.req("GET", "/settings", headers={"Cookie": cookie}, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIn("网关设置".encode("utf-8"), body)
+
+    def test_open_redirect_rejected(self):
+        r, _ = self._post("login-secret", "//evil.example/x")
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/")
+
+    def test_logout_clears_cookie(self):
+        r, _ = self.req("GET", "/logout", raw=True)
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.getheader("Location"), "/login")
+        raw = r.getheader("Set-Cookie") or ""
+        self.assertIn("Max-Age=0", raw)
 
 
 class TestConfigStore(unittest.TestCase):
@@ -1098,7 +1173,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.8.0")
+        self.assertEqual(app.VERSION, "2.9.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

@@ -34,7 +34,7 @@ input[type=text],input[type=password],input[type=number]{background:#0e1526;bord
 <div class="wrap">
 <header>
   <div><h1>网关设置</h1><div class="sub">配置会写入 data/config.json，保存后立即生效</div></div>
-  <div><a class="btn" href="/">返回首页</a></div>
+  <div><a class="btn" href="/">返回首页</a> <a class="btn" href="/logout">退出</a></div>
 </header>
 
 <div class="card">

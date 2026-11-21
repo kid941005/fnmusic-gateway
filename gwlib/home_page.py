@@ -35,7 +35,7 @@ input{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radiu
 <div class="wrap">
 <header>
   <div><h1>fnmusic-gateway</h1><div class="sub">飞牛音乐优先 · 内置在线音源补足</div></div>
-  <div><a class="btn" href="/settings">设置</a></div>
+  <div><a class="btn" href="/settings">设置</a> <a class="btn" href="/logout">退出</a></div>
 </header>
 
 <div class="card">

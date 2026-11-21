@@ -61,6 +61,7 @@ from gwlib.mcp_server import McpHttpBridge, McpService
 from gwlib.config import ConfigStore
 from gwlib.settings_page import SETTINGS_HTML
 from gwlib.home_page import HOME_HTML
+from gwlib.login_page import login_html
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -87,6 +88,30 @@ def _env_bool(k, d=False):
 
 def _truthy(v):
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _safe_next_path(raw, default="/"):
+    """登录后跳转只允许站内路径，防开放重定向。"""
+    raw = str(raw or "").strip()
+    if not raw:
+        return default
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return default
+    if parts.scheme or parts.netloc:
+        return default
+    path = parts.path or default
+    if (not path.startswith("/") or path.startswith("//") or "\\" in path
+            or any(ord(c) < 0x20 or ord(c) == 0x7f for c in path)):
+        return default
+    if path in ("/login", "/login/", "/logout", "/logout/"):
+        return default
+    if parts.query:
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in parts.query):
+            return default
+        path += "?" + parts.query
+    return path
 
 
 DATA_DIR = _env("GW_DATA", os.path.join(BASE_DIR, "data"))
@@ -1351,6 +1376,19 @@ class Handler(BaseHTTPRequestHandler):
             morsel["secure"] = True
         return ("Set-Cookie", morsel.OutputString())
 
+    def _admin_cookie_clear_header(self):
+        jar = SimpleCookie()
+        jar[ADMIN_COOKIE] = ""
+        morsel = jar[ADMIN_COOKIE]
+        morsel["path"] = "/"
+        morsel["max-age"] = "0"
+        morsel["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+        morsel["httponly"] = True
+        morsel["samesite"] = "Lax"
+        if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+            morsel["secure"] = True
+        return ("Set-Cookie", morsel.OutputString())
+
     def _admin_ok(self, path):
         """管理面鉴权：未配置令牌时保持旧行为；/play/ 与 /lyrics/ 永远放行。
 
@@ -1396,6 +1434,30 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.urlencode(pairs)
         return u.path + (("?" + q) if q else "")
 
+    def _login_url(self, next_path="/"):
+        return "/login?next=" + urllib.parse.quote(next_path or "/", safe="")
+
+    def _handle_login_get(self, u, qs):
+        nxt = _safe_next_path((qs.get("next") or ["/"])[0])
+        if not ADMIN_TOKEN or self._admin_credential_ok():
+            return self._redirect(nxt)
+        return self._raw(login_html(nxt).encode("utf-8"), 200,
+                         "text/html; charset=utf-8", [("Cache-Control", "no-store")])
+
+    def _handle_login_post(self):
+        body = self._form_body()
+        nxt = _safe_next_path(str(body.get("next") or "/"))
+        if not ADMIN_TOKEN:
+            return self._redirect(nxt)
+        password = str(body.get("password") or "")
+        if password and hmac.compare_digest(password, ADMIN_TOKEN):
+            return self._redirect(nxt, [self._admin_cookie_header()])
+        return self._raw(login_html(nxt, "密码错误").encode("utf-8"), 401,
+                         "text/html; charset=utf-8", [("Cache-Control", "no-store")])
+
+    def _handle_logout(self):
+        return self._redirect("/login", [self._admin_cookie_clear_header()])
+
     def _handle_settings(self, u, qs):
         """网关设置页：支持 ?token= 引导 Cookie，其余走 Cookie 鉴权。"""
         token = (qs.get("token") or [""])[0]
@@ -1404,7 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._unauthorized()
             return self._redirect(self._strip_token(u) or "/settings", [self._admin_cookie_header()])
         if not self._admin_credential_ok():
-            return self._unauthorized()
+            return self._redirect(self._login_url("/settings"))
         return self._raw(SETTINGS_HTML.encode("utf-8"), 200, "text/html; charset=utf-8")
 
     def _handle_settings_get(self):
@@ -1539,7 +1601,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._unauthorized()
             return self._redirect(self._strip_token(u) or "/", [self._admin_cookie_header()])
         if not self._admin_credential_ok():
-            return self._unauthorized()
+            return self._redirect(self._login_url("/"))
         return self._raw(HOME_HTML.encode("utf-8"), 200, "text/html; charset=utf-8")
 
     def _qs(self):
@@ -1555,13 +1617,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise BadRequest("参数 %s 必须是整数" % key)
 
-    def _body(self, cap=HTTP_BODY_CAP):
+    def _raw_body(self, cap=HTTP_BODY_CAP):
         n = _to_int(self.headers.get("Content-Length"), 0)
         if n < 0:
             raise BadRequest("Content-Length 非法")
         if n > cap:
             raise BadRequest("请求体过大（上限 %d 字节）" % cap)
-        raw = self.rfile.read(n) if n else b""
+        return self.rfile.read(n) if n else b""
+
+    def _body(self, cap=HTTP_BODY_CAP):
+        raw = self._raw_body(cap)
         if not raw.strip():
             return {}
         try:
@@ -1572,10 +1637,33 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest("请求体必须是 JSON 对象")
         return data
 
+    def _form_body(self):
+        raw = self._raw_body()
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype == "application/json":
+            if not raw.strip():
+                return {}
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                raise BadRequest("请求体不是合法 JSON")
+            if not isinstance(data, dict):
+                raise BadRequest("请求体必须是 JSON 对象")
+            return data
+        try:
+            fields = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        except Exception:
+            raise BadRequest("请求体不是合法表单")
+        return {k: (v[0] if v else "") for k, v in fields.items()}
+
     def do_GET(self):
         try:
             u, qs = self._qs()
             path = u.path
+            if path in ("/login", "/login/"):
+                return self._handle_login_get(u, qs)
+            if path in ("/logout", "/logout/"):
+                return self._handle_logout()
             if path == "/":
                 return self._handle_root(u, qs)
             if path in ("/settings", "/settings/"):
@@ -1674,6 +1762,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             u, qs = self._qs()
+            if u.path in ("/login", "/login/"):
+                return self._handle_login_post()
             if not self._admin_ok(u.path):
                 return self._unauthorized()
             if u.path == "/api/settings/fnos/test":

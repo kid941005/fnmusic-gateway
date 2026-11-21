@@ -1,5 +1,5 @@
 # ============================================================================
-# fnmusic-gateway 单端口版 compose
+# fnmusic-gateway 单端口版 compose（完整环境变量版）
 #
 # 只发布 1 个宿主机端口 8766，三个容器都在内部网络 fnmusic 上：
 #   浏览器 → http://NAS_IP:8766/             WebUI（音源管理台 + 网关设置）
@@ -8,11 +8,14 @@
 #
 # 首次使用：
 #   mkdir -p data sources-data sources-repo music && chown -R 1000:1000 sources-data sources-repo music
-#   cp .env.example .env && chmod 600 .env    # 至少要填 GW_ADMIN_TOKEN
+#   cp .env.example .env && chmod 600 .env    # 只需填 GW_ADMIN_TOKEN（其它变量已写在下面）
 #   docker compose pull && docker compose up -d
 #
-# 说明：这里只写“必须在 compose 里给定”的变量；其余参数都有代码默认值，
-#       需要调（缓存大小/转码并发/歌词/音质等）时看 README 的「环境变量」再往 environment 里加。
+# 说明：
+#   1. 所有可配置环境变量均已写入下方 environment，方括号内为默认值；
+#      需要覆盖时可直接改这里，也可在 .env 中写同名变量（.env 优先）。
+#   2. 旧版 FNMUSIC_BASE/USER/PASS/DEVICE_ID -> 新版 GW_FNOS_*；
+#      旧版 GW_PUBLIC_PORT、GW_LIBRARY_SCAN_CMD 已移除，不再生效。
 # ============================================================================
 
 services:
@@ -27,15 +30,68 @@ services:
     depends_on:
       - fnmusic-sources                  # 只保证启动顺序，不等待健康
     environment:
-      GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"   # 管理接口/MCP/WebUI 的令牌
-      GW_WEBUI_URL: "${GW_WEBUI_URL:-http://fnmusic-sources:8004}"           # WebUI 上游（音源容器的管理台）
-      GW_FALLBACK_URLS: "${GW_FALLBACK_URLS:-musicdl@http://fnmusic-sources:8001}"  # 在线兜底音源
-      GW_DOWNLOAD_DIR: "/music"          # 下载/边播边存的容器内目录，必须与下面的挂载右侧一致
+      # ---- 基础 ----
+      GW_HOST: "${GW_HOST:-0.0.0.0}"
+      GW_PORT: "${GW_PORT:-8766}"
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-}"
+      GW_DATA: "${GW_DATA:-/data}"
+      GW_LOG_LEVEL: "${GW_LOG_LEVEL:-INFO}"
+      GW_MOCK: "${GW_MOCK:-0}"
 
-      # 飞牛音乐（可选）：也可以启动后在 WebUI「网关设置」里填，网页填的值优先
+      # ---- 鉴权 / WebUI ----
+      GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"
+      GW_WEBUI_URL: "${GW_WEBUI_URL:-http://fnmusic-sources:8004}"
+      GW_WEBUI_TIMEOUT: "${GW_WEBUI_TIMEOUT:-30}"
+      GW_WEBUI_BODY_CAP: "${GW_WEBUI_BODY_CAP:-33554432}"
+
+      # ---- 直链签名 / 音质 / 缓存 ----
+      GW_URL_TTL: "${GW_URL_TTL:-900}"
+      GW_SIGN_SECRET: "${GW_SIGN_SECRET:-}"
+      GW_CACHE_DIR: "${GW_CACHE_DIR:-/data/cache}"
+      GW_CACHE_MAX_BYTES: "${GW_CACHE_MAX_BYTES:-8589934592}"
+      GW_MP3_BITRATE: "${GW_MP3_BITRATE:-128k}"
+      GW_MP3_SR: "${GW_MP3_SR:-44100}"
+      GW_MP3_CHANNELS: "${GW_MP3_CHANNELS:-2}"
+      GW_PREWARM: "${GW_PREWARM:-1}"
+      GW_QUALITY_DEFAULT: "${GW_QUALITY_DEFAULT:-standard}"
+      GW_TRANSCODE_CONCURRENCY: "${GW_TRANSCODE_CONCURRENCY:-2}"
+      GW_PREVIEW_MIN_SECONDS: "${GW_PREVIEW_MIN_SECONDS:-35}"
+      GW_MAX_LIMIT: "${GW_MAX_LIMIT:-50}"
+
+      # ---- 下载 / 边播边存 ----
+      GW_DOWNLOAD_DIR: "${GW_DOWNLOAD_DIR:-/music}"
+      GW_TEE_SAVE: "${GW_TEE_SAVE:-1}"
+      GW_LIBRARY_MAX_BYTES: "${GW_LIBRARY_MAX_BYTES:-0}"
+
+      # ---- 歌词 ----
+      GW_LYRICS: "${GW_LYRICS:-1}"
+      GW_LYRICS_DIR: "${GW_LYRICS_DIR:-/data/lyrics}"
+      GW_LRCLIB_URL: "${GW_LRCLIB_URL:-https://lrclib.net/api/get}"
+      GW_LRCLIB_TIMEOUT: "${GW_LRCLIB_TIMEOUT:-6}"
+      GW_LYRICS_RETRY: "${GW_LYRICS_RETRY:-86400}"
+
+      # ---- 在线兜底音源 ----
+      GW_FALLBACK_URLS: "${GW_FALLBACK_URLS:-musicdl@http://fnmusic-sources:8001}"
+      GW_FALLBACK_TIMEOUT: "${GW_FALLBACK_TIMEOUT:-25}"
+      GW_FALLBACK_SEARCH_LIMIT: "${GW_FALLBACK_SEARCH_LIMIT:-10}"
+      GW_FALLBACK_TOTAL_LIMIT: "${GW_FALLBACK_TOTAL_LIMIT:-50}"
+      GW_FALLBACK_TOTAL_TIMEOUT: "${GW_FALLBACK_TOTAL_TIMEOUT:-40}"
+      GW_SOURCES_SEARCH_PARALLEL: "${GW_SOURCES_SEARCH_PARALLEL:-1}"
+
+      # ---- 搜索 / 别名 ----
+      GW_SMART_SEARCH: "${GW_SMART_SEARCH:-1}"
+      GW_ALIASES_FILE: "${GW_ALIASES_FILE:-/data/music_aliases.json}"
+
+      # ---- 飞牛音乐（也可启动后在 WebUI「网关设置」里填，网页值优先）----
       GW_FNOS_BASE: "${GW_FNOS_BASE:-}"
       GW_FNOS_USER: "${GW_FNOS_USER:-}"
       GW_FNOS_PASS: "${GW_FNOS_PASS:-}"
+      GW_FNOS_DEVICE_ID: "${GW_FNOS_DEVICE_ID:-}"
+      GW_FNOS_TIMEOUT: "${GW_FNOS_TIMEOUT:-12}"
+      GW_FNOS_INSECURE_TLS: "${GW_FNOS_INSECURE_TLS:-0}"
+
+      # ---- MCP ----
+      GW_MCP_TIMEOUT: "${GW_MCP_TIMEOUT:-300}"
     volumes:
       - ./data:/data                     # 配置、签名密钥、缓存、歌词、飞牛 token
       - "${GW_MUSIC_DIR:-./music}:/music"   # 本地下载目录（宿主机目录可改）
@@ -55,6 +111,7 @@ services:
       MCP_ENDPOINT: "${MCP_ENDPOINT:-}"                           # 小智接入点地址；留空会一直重连（不影响网关）
       GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"                # 容器内直连网关
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"
+      GW_TIMEOUT: "${GW_TIMEOUT:-120}"
 
   # ---- 音源容器：musicdl + WebUI，只在内部网络，不映射任何宿主机端口 ----
   fnmusic-sources:
@@ -66,11 +123,19 @@ services:
       - ./sources-data:/data             # 音源容器数据（登录态、缓存）
       - ./sources-repo:/repo             # 音源插件/脚本目录
     environment:
-      FNMUSIC_MUSICDL_ENABLED: "true"    # 启用 musicdl 搜索源（内部 8001）
-      FNMUSIC_WEBUI_ENABLED: "true"      # 启用 WebUI（内部 8004，由网关反代）
-      MUSICDL_SOURCES: "${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}"   # 启用的音乐站
-      MUSICDL_LIMIT_PER_SOURCE: "${MUSICDL_LIMIT_PER_SOURCE:-10}"              # 每站返回条数
-      FNMUSIC_MUSICDL_OFFICIAL_SEARCH: "false"   # 用旧版逐站搜索（上游新装默认 true，这里保持原行为）
+      # ---- 音源开关（同一时刻只启用一个）----
+      FNMUSIC_MUSICDL_ENABLED: "${FNMUSIC_MUSICDL_ENABLED:-true}"
+      FNMUSIC_NETEASE_ENABLED: "${FNMUSIC_NETEASE_ENABLED:-false}"
+      FNMUSIC_LX_ENABLED: "${FNMUSIC_LX_ENABLED:-false}"
+      FNMUSIC_WEBUI_ENABLED: "${FNMUSIC_WEBUI_ENABLED:-true}"
+      # ---- musicdl ----
+      MUSICDL_SOURCES: "${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}"
+      MUSICDL_LIMIT_PER_SOURCE: "${MUSICDL_LIMIT_PER_SOURCE:-10}"
+      FNMUSIC_MUSICDL_OFFICIAL_SEARCH: "${FNMUSIC_MUSICDL_OFFICIAL_SEARCH:-false}"
+      # ---- 边听边存（可选；需同时挂载 /music）----
+      FNMUSIC_TEE_SAVE_DIR: "${FNMUSIC_TEE_SAVE_DIR:-}"
+      # ---- 洛雪自定义源（启用 lxmusic 时再填）----
+      LX_SOURCE_URL: "${LX_SOURCE_URL:-}"
 
 networks:
   fnmusic:

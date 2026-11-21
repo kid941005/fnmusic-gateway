@@ -290,6 +290,7 @@ class TestHttp(Base):
         self.assertEqual(d["guid"], guid)
         self.assertEqual(d["label"], "直链")
         self.assertEqual((d["index"], d["count"]), (1, 1))
+        self.assertTrue(d["web_url"].startswith("/play/"), d["web_url"])
 
     def test_api_play_has_metadata(self):
         r, d = self.req("GET", "/api/play?query=" + urllib.parse.quote("晴天"))
@@ -369,6 +370,7 @@ class TestHome(Base):
         self.assertIn(b"fnmusic-gateway", body)
         self.assertIn(("v" + app.VERSION).encode("utf-8"), body)
         self.assertIn("在线音源".encode("utf-8"), body)
+        self.assertIn(b'id="player"', body)
 
     def test_settings_page_has_online_card(self):
         cookie = self._cookie()
@@ -1304,7 +1306,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.10.0")
+        self.assertEqual(app.VERSION, "2.10.1")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

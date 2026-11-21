@@ -1059,10 +1059,26 @@ def make_url(base, guid, ttl=None, quality=None):
         base, g, exp, sign(guid, exp), urllib.parse.quote(q, safe=""))
 
 
-def make_lyric_url(base, guid, ttl=None):
+def with_web_url(info):
+    """给 WebUI 的同源播放地址，避免 PUBLIC_BASE 与当前访问主机不一致导致播放失败。"""
+    out = dict(info)
+    try:
+        out["web_url"] = make_url("", out.get("guid") or "",
+                                  ttl=out.get("expires_in"), quality=out.get("quality"))
+    except Exception:
+        out["web_url"] = out.get("url") or ""
+    return out
+
+
+def make_lyric_url(base, guid, ttl=None, title=None, artist=None):
     exp = int(time.time()) + (ttl or URL_TTL)
     g = urllib.parse.quote(guid, safe="")
-    return "%s/lyrics/%s.lrc?exp=%d&sig=%s" % (base, g, exp, sign(guid, exp))
+    url = "%s/lyrics/%s.lrc?exp=%d&sig=%s" % (base, g, exp, sign(guid, exp))
+    if title:
+        url += "&title=" + urllib.parse.quote(str(title), safe="")
+    if artist:
+        url += "&artist=" + urllib.parse.quote(str(artist), safe="")
+    return url
 
 
 def lyric_cache_path(guid):
@@ -1136,7 +1152,7 @@ def _as_lrc(text):
     return plain_to_lrc(t)
 
 
-def lyrics_for(track):
+def lyrics_for(track, force=False):
     """取（必要时抓取并缓存）一首歌的 LRC 文件路径；空文件表示查不到。"""
     if not LYRICS_ENABLED:
         return ""
@@ -1146,7 +1162,9 @@ def lyrics_for(track):
     path = lyric_cache_path(guid)
     try:
         st = os.stat(path)
-        if st.st_size > 0 or (time.time() - st.st_mtime) < LYRICS_RETRY:
+        if st.st_size > 0:
+            return path
+        if not force and (time.time() - st.st_mtime) < LYRICS_RETRY:
             return path
     except OSError:
         pass
@@ -1176,17 +1194,48 @@ def lyrics_for(track):
     return path
 
 
+_LYRIC_FETCH_LOCK = threading.Lock()
+_LYRIC_FETCHING = set()
+
+
+def _kick_lyric_fetch(track):
+    """后台预热歌词，绝不让 /api/play 阻塞在外部歌词站点的网络超时上。"""
+    guid = str(track.get("guid") or "")
+    if not guid:
+        return
+    with _LYRIC_FETCH_LOCK:
+        if guid in _LYRIC_FETCHING:
+            return
+        _LYRIC_FETCHING.add(guid)
+
+    def run():
+        try:
+            lyrics_for(dict(track))
+        except Exception as exc:
+            LOG.info("lyrics warmup %s failed: %s", guid, exc)
+        finally:
+            with _LYRIC_FETCH_LOCK:
+                _LYRIC_FETCHING.discard(guid)
+
+    threading.Thread(target=run, name="lyrics-%s" % guid[:16], daemon=True).start()
+
+
 def lyric_url_for(base, track, ttl=None):
-    """有歌词才返回签名直链；没有则返回空串（设备页面只显示歌名/歌手）。"""
-    path = lyrics_for(track)
-    if not path:
+    """返回签名歌词直链；缓存未命中时后台预热，设备来取时再同步抓取，不阻塞播放。"""
+    if not LYRICS_ENABLED:
         return ""
+    guid = str(track.get("guid") or "")
+    if not guid:
+        return ""
+    path = lyric_cache_path(guid)
     try:
-        if os.path.getsize(path) <= 0:
-            return ""
+        if os.path.getsize(path) > 0:
+            return make_lyric_url(base, guid, ttl, track.get("title"), track.get("artist"))
     except OSError:
-        return ""
-    return make_lyric_url(base, track["guid"], ttl)
+        pass
+    # 先返回可用的签名歌词直链，同时后台预热；设备真正来取 /lyrics 时再同步抓取。
+    _kick_lyric_fetch(track)
+    return make_lyric_url(base, guid, ttl, track.get("title"), track.get("artist"))
 
 
 PLAYBACK = PlaybackService(CACHE, LIBRARY, make_url, lyric_url_for, audio_seconds,
@@ -2089,13 +2138,13 @@ class Handler(BaseHTTPRequestHandler):
                      "artist": (qs.get("artist") or [""])[0]}
             info = PLAYBACK.prepare(track, p, self._base(), quality=quality)
             info.update({"label": "直链", "index": 1, "count": 1})
-            return self._json(info)
+            return self._json(with_web_url(info))
         rows, label = pick_tracks(p, query, playlist, 20)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)
         info = PLAYBACK.prepare(rows[index - 1], p, self._base(), quality=quality)
         info.update({"label": label, "index": index, "count": len(rows)})
-        return self._json(info)
+        return self._json(with_web_url(info))
 
     def _handle_lyrics(self, u, qs):
         """签名歌词直链：设备 self.music.play_url 的 lyric_url 会自己来拉 LRC。"""
@@ -2116,7 +2165,17 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as fp:
                 body = fp.read(LYRIC_MAX_BYTES)
         except OSError:
-            return self._json({"error": "no lyrics"}, 404)
+            body = b""
+        if not body:
+            # 首次播放只返回签名歌词直链，真正来取时才查歌词，避免阻塞 /api/play。
+            title = (qs.get("title") or [""])[0]
+            artist = (qs.get("artist") or [""])[0]
+            try:
+                lyrics_for({"guid": guid, "title": title, "artist": artist}, force=True)
+                with open(path, "rb") as fp:
+                    body = fp.read(LYRIC_MAX_BYTES)
+            except OSError:
+                body = b""
         if not body:
             return self._json({"error": "no lyrics"}, 404)
         self.send_response(200)

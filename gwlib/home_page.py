@@ -51,6 +51,15 @@ input{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radiu
 </div>
 
 <div class="card">
+  <h2>播放器</h2>
+  <audio id="player" controls preload="none" style="width:100%"></audio>
+  <div class="row" style="margin-top:10px">
+    <span id="now" class="sub">尚未播放</span>
+    <a id="rawlink" class="btn" target="_blank" rel="noreferrer" style="display:none">打开直链</a>
+  </div>
+</div>
+
+<div class="card">
   <h2>搜索歌曲</h2>
   <div class="row">
     <input id="q" placeholder="输入歌名 / 歌手，例如 周杰伦 晴天" autocomplete="off">
@@ -138,10 +147,25 @@ async function search(){
     else{legacySearch(q)}
   }
 }
+function errText(e){return (e&&e.message)?e.message:String(e||'未知错误')}
 async function play(t,i){
-  if(!t)return;say('准备播放 '+t.title+'…')
-  try{var d=await getJSON('/api/play?guid='+encodeURIComponent(t.guid||'')+'&title='+encodeURIComponent(t.title||'')+'&artist='+encodeURIComponent(t.artist||'')+'&quality=standard')
-    var a=new Audio(d.url);a.play();say('正在播放：'+t.title+'\\n直链：'+d.url)}catch(e){say('播放失败：'+e.message)}
+  if(!t)return
+  if(!t.guid){say('播放失败：这首歌没有 guid');return}
+  var a=el('player'),link=el('rawlink')
+  say('正在准备播放 '+t.title+'…（首次播放需要缓存/转码，可能要几秒）')
+  var t0=Date.now(),timer=setInterval(function(){say('正在准备播放 '+t.title+'…已等 '+Math.round((Date.now()-t0)/1000)+' 秒')},1000)
+  try{
+    var d=await getJSON('/api/play?guid='+encodeURIComponent(t.guid)+'&title='+encodeURIComponent(t.title||'')+'&artist='+encodeURIComponent(t.artist||'')+'&quality=standard')
+    clearInterval(timer)
+    var u=d.web_url||d.url
+    a.pause();a.src=u;a.load()
+    link.href=u;link.style.display='inline-block'
+    el('now').textContent='已就绪：'+(d.title||t.title)+(d.artist?(' - '+d.artist):'')+' · '+(d.quality_label||d.quality||'')+(d.preview?'（试听）':'')
+    var played=a.play()
+    if(played&&played.then){
+      played.then(function(){say('正在播放：'+(d.title||t.title))}).catch(function(e){say('直链已生成，但浏览器拦截了自动播放。请点击上方播放器播放，或点「打开直链」。'+errText(e))})
+    }else{say('已就绪：'+(d.title||t.title))}
+  }catch(e){clearInterval(timer);say('播放失败：'+errText(e))}
 }
 async function download(t){
   if(!t)return;say('正在保存 '+t.title+'…')
@@ -149,6 +173,7 @@ async function download(t){
     var d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status));say('已保存：'+d.path+'（'+Math.round(d.bytes/1024)+' KB）')}catch(e){say('下载失败：'+e.message)}
 }
 el('go').onclick=search;el('q').addEventListener('keydown',function(e){if(e.key==='Enter')search()})
+var initialQ=new URLSearchParams(location.search).get('q');if(initialQ){el('q').value=initialQ;search()}
 loadStatus()
 </script>
 </body>

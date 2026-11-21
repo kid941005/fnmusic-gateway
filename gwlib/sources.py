@@ -375,6 +375,57 @@ class FallbackProvider:
         meta["online_count"] = max(0, len(rows) - meta["local_count"])
         return rows[:cap]
 
+    def search_stream(self, q, limit=10):
+        """本地优先，在线音源边搜边出；每拿到一首就 yield，不等全部完成。"""
+        cap = min(max(1, int(limit or 1)), self.total_limit)
+        meta = {"local_count": 0, "online_count": 0,
+                "local_error": "", "online_error": ""}
+        self._search_meta.value = meta
+        rows = []
+        have = set()
+
+        def add(track):
+            key = (_norm_text(track.get("title")), _norm_text(track.get("artist")))
+            if key in have:
+                return False
+            have.add(key)
+            rows.append(track)
+            return True
+
+        if self.base is not None:
+            try:
+                local = list(self.base.search(q, cap) or [])[:cap]
+            except Exception as exc:
+                LOG.warning("local search failed: %s", exc)
+                meta["local_error"] = str(exc)
+                local = []
+            for track in local:
+                if add(track):
+                    yield track
+            meta["local_count"] = len(rows)
+
+        if len(rows) >= cap or not self.exts:
+            meta["online_count"] = 0
+            return
+        deadline = time.monotonic() + self.total_timeout
+        per_source = max(1, max(cap - len(rows), self.search_limit))
+        for ext in self.exts:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                stream = getattr(ext, "search_stream", None)
+                batch = stream(q, per_source) if callable(stream) else [ext.search(q, per_source)]
+                for track in batch:
+                    if add(track):
+                        yield track
+                    if len(rows) >= cap:
+                        meta["online_count"] = max(0, len(rows) - meta["local_count"])
+                        return
+            except Exception as exc:
+                LOG.warning("online search failed: %s", exc)
+                meta["online_error"] = str(exc)
+        meta["online_count"] = max(0, len(rows) - meta["local_count"])
+
     def last_search_meta(self):
         """最近一次 search 的诊断信息（同请求线程）。"""
         return dict(getattr(self._search_meta, "value", {}) or {})

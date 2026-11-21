@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.9.3**（2026-11-21） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.10.0**（2026-11-21） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -363,7 +363,7 @@ curl -s "<上一步的 lyric_url>" | head -3   # 期望 [00:29.36] 故事的小�
 
 行为：
 
-- **搜索**：并行问所有勾选平台，按「歌名+歌手」跨平台去重，受总条数与总超时约束。
+- **搜索**：并行问所有勾选平台，按「歌名+歌手」跨平台去重，受总条数与总超时约束；WebUI 通过 `/api/search/stream`（SSE）逐条展示，本地先出、在线边搜边出，出现即可播放。
 - **播放**：`/api/play` / MCP `music_play` 对在线歌曲出签名直链；网关按需拉流 → ffmpeg 转 MP3 → 落缓存。
 - **试听识别**：转码后时长 < `GW_PREVIEW_MIN_SECONDS`（默认 35 秒）判为试听片段，返回 `preview=true`。
 - **收藏即下载**：`music_favorite(action=add)` / `music_download` / `POST /api/download` 按源给的最高音质原样落盘。
@@ -420,6 +420,7 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | GET | `/healthz` | 存活探针：只证明进程活着，不探音源；含 `mode`（mock/fnos/fnos+online/online）与 `fnos` 配置状态 |
 | GET | `/readyz` | 就绪探针：优先真连飞牛取 1 首，失败再看在线音源；都不可用返回 503 |
 | GET | `/api/search?q=&limit=` | 搜歌（含别名纠正与排序） |
+| GET | `/api/search/stream?q=&limit=` | 流式搜歌（SSE，逐条返回，出现即可播放） |
 | GET | `/api/playlists` | 列出飞牛音乐歌单（未配飞牛返回 400） |
 | GET | `/api/playlist?name=&limit=` | 按歌单名列出飞牛曲目（未配飞牛返回 400） |
 | GET | `/api/favorites?limit=` | 列出飞牛收藏（未配飞牛返回 400） |
@@ -484,7 +485,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 106 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 109 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -508,7 +509,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（106 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（109 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
 
 内置 musicdl 平台与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（平台可用性取决于上游风控与网络；飞牛可在网页「设置」里点测试连接确认）。
 
@@ -533,6 +534,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（106 用例）、bridge_selftest.py
+tests/                    test_gateway.py（109 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 可选桥接器（只发布 8766）
 ~~~

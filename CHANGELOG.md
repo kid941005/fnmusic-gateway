@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2.10.0 (2026-11-21)
+
+### 新增：搜索结果流式返回
+- 新增 `GET /api/search/stream?q=&limit=`（Server-Sent Events）：本地结果先到先出，在线音源每探活出一首就推一首，不必等所有平台/所有结果完成。
+- 首页搜索改用 `EventSource`，结果逐条追加；已出现的曲目可立即播放/下载。SSE 响应带 `X-Accel-Buffering: no`，并保留 `/api/search` 旧接口兼容其他调用方。
+- musicdl worker 增加 `iter_search()` 逐条产出 entry；`NativeMusicDLProvider.search_stream()` 多平台并发、按完成先后产出；`FallbackProvider.search_stream()` 本地优先后再接在线流。
+- 版本 2.9.3 → **2.10.0**；测试 **109 个用例**（新增流式 provider 与 SSE 接口用例）。
+
 ## 2.9.3 (2026-11-21)
 
 ### 修复：本地库未命中与下载文件名

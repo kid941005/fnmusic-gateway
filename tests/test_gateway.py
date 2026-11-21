@@ -104,6 +104,14 @@ class TestAdminToken(Base):
         r, _ = self.req("GET", "/play/not-a-guid.mp3?exp=1&sig=bad")
         self.assertNotEqual(r.status, 401)
 
+    def test_search_stream_sse(self):
+        r, data = self.req("GET", "/api/search/stream?q=" + urllib.parse.quote("晴天") + "&limit=5",
+                           raw=True, headers={"X-Admin-Token": "test-secret"})
+        self.assertEqual(r.status, 200)
+        self.assertIn("text/event-stream", r.getheader("Content-Type"))
+        self.assertIn(b'"type": "track"', data)
+        self.assertIn(b'"type": "done"', data)
+
 
 class TestPure(unittest.TestCase):
     def test_sign_verify(self):
@@ -783,6 +791,22 @@ class _FakeLocal:
 
 
 class TestFallback(unittest.TestCase):
+    def test_native_search_stream_yields_entries(self):
+        class FakeWorker:
+            def iter_search(self, keyword, limit, timeout, stop_event=None):
+                yield [{"id": "kuwo:1", "source": "KuwoMusicClient", "title": "晴天",
+                        "artist": "周杰伦", "download_url": "http://x/a.flac",
+                        "ext": "flac"}, {}, ""]
+        p = app.NativeMusicDLProvider(["KuwoMusicClient"], work_dir=DATA)
+        p._worker = lambda platform: FakeWorker()
+        try:
+            rows = list(p.search_stream("晴天", 3))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["guid"], "ext:musicdl:kuwo:1")
+            self.assertEqual(p.track_info("ext:musicdl:kuwo:1")["title"], "晴天")
+        finally:
+            p.close()
+
     def test_ext_guid_helpers(self):
         self.assertTrue(app.is_ext_guid("ext:musicdl:123"))
         self.assertFalse(app.is_ext_guid("mock-1"))
@@ -809,6 +833,22 @@ class TestFallback(unittest.TestCase):
         fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"])
         fp.exts = [_FakeExt(wav=b"RIFFxxxx")]
         self.assertEqual(fp.stream("ext:musicdl:abc"), ("audio/wav", b"RIFFxxxx"))
+
+    def test_search_stream_local_first_and_online_incremental(self):
+        class StreamExt:
+            def search_stream(self, q, limit=10):
+                yield {"guid": "ext:musicdl:e3", "title": "晴天", "artist": "周杰伦",
+                       "source": "musicdl"}
+                yield {"guid": "ext:musicdl:e4", "title": "七里香", "artist": "周杰伦",
+                       "source": "musicdl"}
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [StreamExt()]
+        rows = list(fp.search_stream("晴天", 5))
+        self.assertEqual([r["guid"] for r in rows], ["l1", "ext:musicdl:e4"])
+        meta = fp.last_search_meta()
+        self.assertEqual(meta["local_count"], 1)
+        self.assertEqual(meta["online_count"], 1)
 
     def test_search_meta_counts_local_and_online(self):
         local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
@@ -1264,7 +1304,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.9.3")
+        self.assertEqual(app.VERSION, "2.10.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

@@ -80,9 +80,11 @@ async function loadStatus(){
   }catch(e){el('ver').textContent='未连接';say('状态读取失败：'+e.message)}
 }
 var lastRows=[]
-function render(rows,q){
+var searchES=null
+function stopSearch(){if(searchES){searchES.close();searchES=null}}
+function render(rows,emptyText){
   var box=el('results')
-  if(!rows.length){box.innerHTML='<div class="empty">没有搜到结果，请换个关键词或到设置页检查在线音源。</div>';return}
+  if(!rows.length){box.innerHTML='<div class="empty">'+esc(emptyText||'没有搜到结果，请换个关键词或到设置页检查在线音源。')+'</div>';return}
   box.innerHTML=rows.map(function(t,i){
     var src=t.source==='local'?'本地':(t.platform||t.source||'在线')
     var meta=[src,t.artist,t.album].filter(Boolean).join(' · ')+(t.duration_s?(' · '+dur(t.duration_s)):'')
@@ -93,17 +95,48 @@ function render(rows,q){
   box.querySelectorAll('[data-play]').forEach(function(b){b.onclick=function(){var i=Number(b.getAttribute('data-play'));play(lastRows[i],i)}})
   box.querySelectorAll('[data-dl]').forEach(function(b){b.onclick=function(){download(lastRows[Number(b.getAttribute('data-dl'))])}})
 }
-async function search(){
-  var q=el('q').value.trim();if(!q){say('请输入关键词');return}
-  el('go').disabled=true;say('搜索中…（在线音源首次启动会慢一些）')
+async function legacySearch(q){
   try{
     var d=await getJSON('/api/search?q='+encodeURIComponent(q)+'&limit=20')
-    lastRows=d.tracks||[];render(lastRows,q)
+    lastRows=d.tracks||[];render(lastRows)
     var stat=''
     if(typeof d.local_count==='number')stat='（本地 '+d.local_count+' · 在线 '+(d.online_count||0)+'）'
     if(d.local_error)stat+='，本地搜索失败：'+d.local_error
     say('共 '+d.count+' 条'+stat+(d.corrected?'（已按别名纠正为「'+d.corrected+'」）':''))
   }catch(e){say('搜索失败：'+e.message)}finally{el('go').disabled=false}
+}
+async function search(){
+  var q=el('q').value.trim();if(!q){say('请输入关键词');return}
+  stopSearch();lastRows=[];render([], '正在搜索…')
+  el('go').disabled=true;say('搜索中…结果会陆续出现，出现即可播放')
+  if(!window.EventSource){return legacySearch(q)}
+  var got=false,finished=false
+  var es=new EventSource('/api/search/stream?q='+encodeURIComponent(q)+'&limit=20')
+  searchES=es
+  es.onmessage=function(ev){
+    var d=null;try{d=JSON.parse(ev.data)}catch(e){return}
+    if(d.type==='track'&&d.track){
+      got=true;lastRows.push(d.track);render(lastRows,'没有搜到结果')
+      say('搜索中…已出现 '+lastRows.length+' 条，可直接播放')
+    }else if(d.type==='done'){
+      finished=true;es.close();if(searchES===es)searchES=null;el('go').disabled=false
+      var stat=''
+      if(typeof d.local_count==='number')stat='（本地 '+d.local_count+' · 在线 '+(d.online_count||0)+'）'
+      if(d.local_error)stat+=',本地搜索失败：'+d.local_error
+      if(d.online_error)stat+=',在线搜索异常：'+d.online_error
+      say('共 '+d.count+' 条'+stat)
+      if(!lastRows.length)render([], '没有搜到结果，请换个关键词或到设置页检查在线音源。')
+    }else if(d.type==='error'){
+      finished=true;es.close();if(searchES===es)searchES=null;el('go').disabled=false
+      say('搜索失败：'+(d.error||'未知错误'))
+    }
+  }
+  es.onerror=function(){
+    if(finished)return
+    es.close();if(searchES===es)searchES=null
+    if(got){el('go').disabled=false;say('搜索已中断，已显示 '+lastRows.length+' 条，可直接播放')}
+    else{legacySearch(q)}
+  }
 }
 async function play(t,i){
   if(!t)return;say('准备播放 '+t.title+'…')

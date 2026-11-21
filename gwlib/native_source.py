@@ -121,7 +121,8 @@ class _Worker:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def search(self, keyword, limit, timeout):
+    def iter_search(self, keyword, limit, timeout, stop_event=None):
+        """逐条产出 entry；调用方提前结束时关闭 worker，避免残留任务污染下一次搜索。"""
         with self._lock:
             if not self.alive():
                 self.close()
@@ -137,31 +138,40 @@ class _Worker:
             except Exception as exc:
                 self.close()
                 raise RuntimeError("musicdl worker 写入失败：%s" % exc)
-            entries = []
             deadline = time.monotonic() + max(1.0, float(timeout))
-            while True:
-                remain = deadline - time.monotonic()
-                if remain <= 0:
+            completed = False
+            try:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    remain = deadline - time.monotonic()
+                    if remain <= 0:
+                        raise RuntimeError("搜索超时（%.1fs）" % timeout)
+                    wait = min(remain, 0.5) if stop_event is not None else remain
+                    msg = self._next(wait)
+                    if msg is None:
+                        # 可中断模式下只等 0.5s，回到循环顶部检查停止标志/超时
+                        continue
+                    kind = msg.get("type")
+                    if kind == "entry":
+                        entry = msg.get("entry")
+                        if isinstance(entry, list) and len(entry) >= 3:
+                            yield entry
+                    elif kind == "result":
+                        completed = True
+                        if msg.get("partial"):
+                            self.close()
+                        return
+                    elif kind == "error":
+                        raise RuntimeError(str(msg.get("error") or "musicdl 搜索失败"))
+                    else:
+                        LOG.debug("online worker ignored message: %s", kind)
+            finally:
+                if not completed:
                     self.close()
-                    raise RuntimeError("搜索超时（%.1fs）" % timeout)
-                msg = self._next(remain)
-                if msg is None:
-                    self.close()
-                    raise RuntimeError("musicdl worker 无响应：%s" % (self._stderr_tail() or "已退出"))
-                kind = msg.get("type")
-                if kind == "entry":
-                    entry = msg.get("entry")
-                    if isinstance(entry, list) and len(entry) >= 3:
-                        entries.append(entry)
-                elif kind == "result":
-                    if msg.get("partial"):
-                        self.close()
-                    return entries
-                elif kind == "error":
-                    self.close()
-                    raise RuntimeError(str(msg.get("error") or "musicdl 搜索失败"))
-                else:
-                    LOG.debug("online worker ignored message: %s", kind)
+
+    def search(self, keyword, limit, timeout):
+        return list(self.iter_search(keyword, limit, timeout))
 
     def close(self):
         proc, self.proc = self.proc, None
@@ -267,22 +277,31 @@ class NativeMusicDLProvider:
             "ext_id": eid,
         }
 
+    def _entry_track(self, entry):
+        """把 worker 的一条 entry 转成前端曲目并写入播放缓存。"""
+        try:
+            item, headers, lyric = entry[0], entry[1] or {}, str(entry[2] or "")
+        except (IndexError, TypeError):
+            return None
+        if not isinstance(item, dict) or not item.get("download_url"):
+            return None
+        self._remember(item, headers, lyric)
+        return self._track(item)
+
     def _search_platform(self, platform, keyword, limit):
         deadline = time.monotonic() + self.timeout
         worker = self._worker(platform)
-        entries = worker.search(keyword, limit, max(1.0, deadline - time.monotonic()))
         tracks = []
         seen = set()
-        for entry in entries:
-            item, headers, lyric = entry[0], entry[1] or {}, str(entry[2] or "")
-            if not isinstance(item, dict) or not item.get("download_url"):
+        for entry in worker.iter_search(keyword, limit,
+                                        max(1.0, deadline - time.monotonic())):
+            track = self._entry_track(entry)
+            if not track:
                 continue
-            track = self._track(item)
             key = (track["title"].casefold(), track["artist"].casefold())
             if key in seen:
                 continue
             seen.add(key)
-            self._remember(item, headers, lyric)
             tracks.append(track)
             if len(tracks) >= limit:
                 break
@@ -323,6 +342,76 @@ class NativeMusicDLProvider:
                 if len(rows) >= cap:
                     return rows[:cap]
         return rows[:cap]
+
+    def search_stream(self, q, limit=10):
+        """多平台并行搜索，哪个平台先探活成功就先产出哪首，不等全部完成。"""
+        q = str(q or "").strip()
+        if not q or not self.platforms:
+            return
+        per = max(1, min(10, int(limit or 10)))
+        cap = min(max(1, int(limit or 1)), self.total_limit)
+        deadline = time.monotonic() + self.total_timeout
+        out = queue.Queue()
+        stop = threading.Event()
+
+        def run(platform):
+            try:
+                worker = self._worker(platform)
+                seen = set()
+                for entry in worker.iter_search(
+                        q, per, self.timeout, stop_event=stop):
+                    if stop.is_set():
+                        break
+                    track = self._entry_track(entry)
+                    if not track:
+                        continue
+                    key = (track["title"].casefold(), track["artist"].casefold())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.put(("track", track))
+            except Exception as exc:
+                out.put(("error", (platform, str(exc))))
+            finally:
+                out.put(("done", platform))
+
+        threads = [threading.Thread(target=run, args=(p,), daemon=True,
+                                    name="musicdl-stream-" + str(p))
+                   for p in self.platforms]
+        for thread in threads:
+            thread.start()
+        active = len(threads)
+        seen_global = set()
+        count = 0
+        try:
+            while active > 0:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    LOG.warning("online stream exceeded %.1fs total budget",
+                                self.total_timeout)
+                    break
+                try:
+                    kind, payload = out.get(timeout=min(0.25, remain))
+                except queue.Empty:
+                    continue
+                if kind == "track":
+                    key = (payload["title"].casefold(), payload["artist"].casefold())
+                    if key in seen_global:
+                        continue
+                    seen_global.add(key)
+                    count += 1
+                    yield payload
+                    if count >= cap:
+                        stop.set()
+                        return
+                elif kind == "error":
+                    platform, error = payload
+                    LOG.warning("online platform %s streaming search failed: %s",
+                                platform, error)
+                else:
+                    active -= 1
+        finally:
+            stop.set()
 
     @staticmethod
     def _guid_eid(guid):

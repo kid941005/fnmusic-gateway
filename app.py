@@ -1413,6 +1413,85 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _sse_start(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self._sse_broken = False
+
+    def _sse_send(self, obj):
+        if getattr(self, "_sse_broken", False):
+            return False
+        data = ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+        try:
+            self.wfile.write(("%X\r\n" % len(data)).encode("ascii") + data + b"\r\n")
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            self._sse_broken = True
+            return False
+
+    def _sse_end(self):
+        if getattr(self, "_sse_broken", False):
+            return
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self._sse_broken = True
+
+    def _handle_api_search_stream(self, qs):
+        q = (qs.get("q") or [""])[0].strip()
+        if not q:
+            raise BadRequest("参数 q 不能为空")
+        limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
+        p = provider()
+        self._sse_start()
+        self._sse_send({"type": "start", "query": q})
+        count = 0
+        try:
+            stream = getattr(p, "search_stream", None)
+            if callable(stream):
+                for track in stream(q, limit):
+                    if not self._sse_send({"type": "track", "track": track}):
+                        break
+                    count += 1
+            else:
+                rows, _fixed = p.search(q, limit), ""
+                for track in rows:
+                    if not self._sse_send({"type": "track", "track": track}):
+                        break
+                    count += 1
+            meta = {}
+            meta_fn = getattr(p, "last_search_meta", None)
+            if callable(meta_fn):
+                try:
+                    meta = meta_fn() or {}
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            local_count = meta.get("local_count")
+            if not isinstance(local_count, int):
+                local_count = 0
+            online_count = meta.get("online_count")
+            if not isinstance(online_count, int):
+                online_count = max(0, count - local_count)
+            self._sse_send({"type": "done", "query": q, "count": count,
+                            "local_count": local_count,
+                            "online_count": online_count,
+                            "local_error": meta.get("local_error") or "",
+                            "online_error": meta.get("online_error") or ""})
+        except Exception as exc:
+            LOG.exception("GET /api/search/stream failed")
+            self._sse_send({"type": "error", "error": str(exc)})
+        finally:
+            self._sse_end()
+
     def _empty(self, code=202):
         self.send_response(code)
         self.send_header("Content-Length", "0")
@@ -1774,6 +1853,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_play(u, qs)
             if path == "/lyrics" or path.startswith("/lyrics/"):
                 return self._handle_lyrics(u, qs)
+            if path == "/api/search/stream":
+                return self._handle_api_search_stream(qs)
             if path == "/api/search":
                 q = (qs.get("q") or [""])[0].strip()
                 if not q:

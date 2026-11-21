@@ -196,12 +196,21 @@ def main():
         return 1
 
     failed = []
+    deleted = 0
     for version in versions:
         tags_of = version_tags(version)
+        # Untagged versions are platform-specific child manifests of a
+        # multi-arch index; deleting them would corrupt a release image.
+        if not tags_of:
+            continue
         if any(is_release(t) for t in tags_of):
             continue
-        if not delete_version(version.get("id"), version.get("name")):
+        print(f"deleting version {version.get('id')} tags={tags_of}", flush=True)
+        if delete_version(version.get("id"), version.get("name")):
+            deleted += 1
+        else:
             failed.append((version.get("id"), tags_of))
+    print(f"deleted versions: {deleted}", flush=True)
 
     versions = list_versions()
     remaining = sorted(t for version in versions for t in version_tags(version))

@@ -42,9 +42,9 @@ def build_tools():
         },
         {
             "name": "music_play",
-            "description": ("拿一首歌的可播放直链，同时给出歌名、歌手、歌词直链和音质（设备屏显要用）。"
+            "description": ("拿一首歌的可播放直链，同时给出歌名、歌手、歌词直链、总时长（秒）和音质（设备屏显要用）。"
                             "query/playlist 二选一，index 从 1 开始。"
-                            "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url 四个参数都填上。"),
+                            "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url/duration 五个参数都填上。"),
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string"},
                 "playlist": {"type": "string"}, "index": {"type": "integer"},

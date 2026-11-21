@@ -1104,13 +1104,16 @@ def call_tool(name, args, base):
         save_line = "，正在后台保存到本地曲库" if info["saving"] else ""
         return ("准备播放：%s%s\n%s 第 %d 首，音质 %s（%s kbps）%s%s\n直链（%d 分钟内有效）：%s\n"
                 "歌词直链：%s\n"
+                "总时长：%d 秒\n"
                 "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
-                "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空）。" % (
+                "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空），"
+                "duration 填 %d（总秒数，整数）。" % (
                     info["title"], (" - " + info["artist"]) if info["artist"] else "", label, idx,
                     info["quality_label"], info["bitrate"], src_line, prev_line + save_line,
                     max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
                     info["lyric_url"] or "（这首歌查不到歌词，留空即可）",
-                    info["title"], info["artist"] or ""))
+                    int(info.get("duration") or 0),
+                    info["title"], info["artist"] or "", int(info.get("duration") or 0)))
 
     if name == "music_favorite":
         action = str(args.get("action") or "").lower()
@@ -1917,9 +1920,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             LOG.exception("transcode %s failed", guid)
             return self._json({"error": "transcode failed: %s" % e}, 502)
-        return self._serve_file(path)
+        duration_ms = 0
+        try:
+            secs = PLAYBACK.audio_seconds(path)
+            if secs:
+                duration_ms = int(round(float(secs) * 1000))
+        except Exception:
+            duration_ms = 0
+        lyric_url = ""
+        try:
+            lyric_path = lyric_cache_path(guid)
+            if os.path.getsize(lyric_path) > 0:
+                lyric_url = make_lyric_url(self._base(), guid)
+        except OSError:
+            lyric_url = ""
+        return self._serve_file(path, duration_ms=duration_ms, lyric_url=lyric_url)
 
-    def _serve_file(self, path):
+    def _serve_file(self, path, duration_ms=0, lyric_url=""):
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -1953,6 +1970,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
+        if duration_ms > 0:
+            self.send_header("X-Audio-Duration-Ms", str(int(duration_ms)))
+        if lyric_url:
+            self.send_header("X-Lyric-Url", lyric_url)
         if code == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.end_headers()

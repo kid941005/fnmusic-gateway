@@ -1,22 +1,22 @@
 # ============================================================================
-# fnmusic-gateway 单端口版 compose
+# fnmusic-gateway 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
 #
-# 只发布 1 个宿主机端口 8766，三个容器都在内部网络 fnmusic 上：
-#   浏览器 → http://NAS_IP:8766/             WebUI（音源管理台 + 网关设置）
-#   小智   → http://NAS_IP:8766/mcp          MCP
-#   设备   → http://NAS_IP:8766/play/...     签名直链
+# 只发布 1 个宿主机端口 8766：
+#   浏览器 → http://NAS_IP:8766/          原生首页与设置页
+#   小智   → http://NAS_IP:8766/mcp        MCP
+#   设备   → http://NAS_IP:8766/play/...   签名直链
 #
 # 首次使用：
-#   mkdir -p data sources-data sources-repo music && chown -R 1000:1000 sources-data sources-repo music
+#   mkdir -p data music
 #   cp .env.example .env && chmod 600 .env    # 至少要填 GW_ADMIN_TOKEN
 #   docker compose pull && docker compose up -d
 #
-# 说明：这里只写“必须在 compose 里给定”的变量；其余参数都有代码默认值，
-#       需要调（缓存大小/转码并发/歌词/音质等）时看 README 的「环境变量」再往 environment 里加。
+# 在线音源（musicdl）已内置在网关镜像里，平台、条数、超时都能在网页「设置」里改，
+# 保存后写 data/config.json 并立即生效；下面的 GW_ONLINE_* 只是首次启动的默认值。
 # ============================================================================
 
 services:
-  # ---- 网关：REST / MCP / WebUI 反代 / 播放直链，全部走 8766 ----
+  # ---- 网关：REST / MCP / 原生 WebUI / 播放直链 / 内置在线音源，全部走 8766 ----
   fnmusic-gateway:
     image: ${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:latest}
     container_name: fnmusic-gateway
@@ -24,20 +24,25 @@ services:
     ports:
       - "8766:8766"                      # 唯一对外端口；不要加别的映射
     networks: [fnmusic]
-    depends_on:
-      - fnmusic-sources                  # 只保证启动顺序，不等待健康
     environment:
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"   # 管理接口/MCP/WebUI 的令牌
-      GW_WEBUI_URL: "${GW_WEBUI_URL:-http://fnmusic-sources:8004}"           # WebUI 上游（音源容器的管理台）
-      GW_FALLBACK_URLS: "${GW_FALLBACK_URLS:-musicdl@http://fnmusic-sources:8001}"  # 在线兜底音源
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-}"   # 返回给设备的直链前缀，必须是设备可访问的宿主机地址
       GW_DOWNLOAD_DIR: "/music"          # 下载/边播边存的容器内目录，必须与下面的挂载右侧一致
 
-      # 飞牛音乐（可选）：也可以启动后在 WebUI「网关设置」里填，网页填的值优先
+      # 在线音源（musicdl）首次启动默认值；启动后可在网页「设置 → 在线音源」修改
+      GW_ONLINE_ENABLED: "${GW_ONLINE_ENABLED:-true}"
+      GW_ONLINE_PLATFORMS: "${GW_ONLINE_PLATFORMS:-KuwoMusicClient,MiguMusicClient}"
+      GW_ONLINE_SEARCH_LIMIT: "${GW_ONLINE_SEARCH_LIMIT:-10}"
+      GW_ONLINE_TIMEOUT: "${GW_ONLINE_TIMEOUT:-25}"
+      GW_ONLINE_TOTAL_LIMIT: "${GW_ONLINE_TOTAL_LIMIT:-50}"
+      GW_ONLINE_TOTAL_TIMEOUT: "${GW_ONLINE_TOTAL_TIMEOUT:-40}"
+
+      # 飞牛音乐（可选）：也可以启动后在网页「设置」里填，网页填的值优先
       GW_FNOS_BASE: "${GW_FNOS_BASE:-}"
       GW_FNOS_USER: "${GW_FNOS_USER:-}"
       GW_FNOS_PASS: "${GW_FNOS_PASS:-}"
     volumes:
-      - ./data:/data                     # 配置、签名密钥、缓存、歌词、飞牛 token
+      - ./data:/data                     # 配置、签名密钥、缓存、歌词、飞牛 token、musicdl 临时文件
       - "${GW_MUSIC_DIR:-./music}:/music"   # 本地下载目录（宿主机目录可改）
 
   # ---- 桥接器：仅在用「小智 MCP 接入点(wss)」时需要；不用可整段删掉 ----
@@ -55,22 +60,6 @@ services:
       MCP_ENDPOINT: "${MCP_ENDPOINT:-}"                           # 小智接入点地址；留空会一直重连（不影响网关）
       GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"                # 容器内直连网关
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"
-
-  # ---- 音源容器：musicdl + WebUI，只在内部网络，不映射任何宿主机端口 ----
-  fnmusic-sources:
-    image: ${FNMUSIC_SOURCES_IMAGE:-ghcr.io/kid941005/fnos_music_ext:musicdl-webui}
-    container_name: fnmusic-sources
-    restart: unless-stopped
-    networks: [fnmusic]
-    volumes:
-      - ./sources-data:/data             # 音源容器数据（登录态、缓存）
-      - ./sources-repo:/repo             # 音源插件/脚本目录
-    environment:
-      FNMUSIC_MUSICDL_ENABLED: "true"    # 启用 musicdl 搜索源（内部 8001）
-      FNMUSIC_WEBUI_ENABLED: "true"      # 启用 WebUI（内部 8004，由网关反代）
-      MUSICDL_SOURCES: "${MUSICDL_SOURCES:-KuwoMusicClient,MiguMusicClient}"   # 启用的音乐站
-      MUSICDL_LIMIT_PER_SOURCE: "${MUSICDL_LIMIT_PER_SOURCE:-10}"              # 每站返回条数
-      FNMUSIC_MUSICDL_OFFICIAL_SEARCH: "false"   # 用旧版逐站搜索（上游新装默认 true，这里保持原行为）
 
 networks:
   fnmusic:

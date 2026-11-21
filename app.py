@@ -44,7 +44,6 @@ import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
-import http.client
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,14 +51,16 @@ from gwlib import __version__ as VERSION
 from gwlib.errors import BadRequest, GatewayError, as_payload
 from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, normalize_quality
 from gwlib.storage import LibraryStore, MediaCache, audio_seconds
-from gwlib.sources import (FallbackProvider, is_ext_guid,
-                           parse_spec as _parse_spec, fallback_services as _fallback_services,
-                           source_status)
+from gwlib.sources import FallbackProvider, is_ext_guid
+from gwlib.native_source import (NativeMusicDLProvider,
+                                  deps_available as online_deps_available,
+                                  deps_error as online_deps_error)
 from gwlib.playback import PlaybackService
 from gwlib.mcp_tools import build_tools
 from gwlib.mcp_server import McpHttpBridge, McpService
 from gwlib.config import ConfigStore
 from gwlib.settings_page import SETTINGS_HTML
+from gwlib.home_page import HOME_HTML
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -95,13 +96,6 @@ HOST = _env("GW_HOST", "0.0.0.0")
 PORT = _env_int("GW_PORT", 8766)
 # 单端口：只监听 GW_PORT。PUBLIC_BASE 只影响返回给设备的直链前缀，不再额外开监听端口。
 PUBLIC_BASE = (_env("GW_PUBLIC_BASE", "") or "").rstrip("/")
-# WebUI 反向代理：留空则关闭；compose 内填 http://fnmusic-sources:8004
-WEBUI_URL = (_env("GW_WEBUI_URL", "") or "").rstrip("/")
-WEBUI_ENABLED = bool(WEBUI_URL)
-WEBUI_PREFIX = "/app/fnmusic-ext"
-WEBUI_TIMEOUT = max(3, _env_int("GW_WEBUI_TIMEOUT", 30))
-WEBUI_BODY_CAP = max(1024 * 1024, _env_int("GW_WEBUI_BODY_CAP", 32 * 1024 * 1024))
-WEBUI_COOKIE = "fnmusic_admin"
 URL_TTL = _env_int("GW_URL_TTL", 900)
 CACHE_DIR = _env("GW_CACHE_DIR", os.path.join(DATA_DIR, "cache"))
 CACHE_MAX = _env_int("GW_CACHE_MAX_BYTES", 8 * 1024 ** 3)
@@ -118,6 +112,7 @@ MCP_TIMEOUT = max(30, _env_int("GW_MCP_TIMEOUT", 300))
 # 管理令牌：为空时不鉴权（兼容旧部署）。单端口模式下强烈建议设置。
 # 带令牌后，/play/ 与 /lyrics/ 之外的接口都必须带 X-Admin-Token 或 Authorization: Bearer。
 ADMIN_TOKEN = (_env("GW_ADMIN_TOKEN", "") or "").strip()
+ADMIN_COOKIE = "fnmusic_admin"
 _HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$")
 TRANSCODE_CONCURRENCY = max(1, _env_int("GW_TRANSCODE_CONCURRENCY", 2))
 
@@ -130,17 +125,20 @@ LYRICS_RETRY = max(60, _env_int("GW_LYRICS_RETRY", 86400))
 LYRIC_MAX_BYTES = 64 * 1024
 os.makedirs(LYRICS_DIR, exist_ok=True)
 
-# 在线音源（fnos_music_ext 音源容器）。格式：逗号分隔，每项 "type@http://host:port"
-# 或只写 URL（按端口猜类型：8768 musicdl / 8770 musicbox / 8772 lxmusic / 8776 neteasefree）。
-# 在线音源只在这些地址里搜索/播放/下载，作为飞牛音乐之外的兜底；为空则只走飞牛。
-FALLBACK_URLS = [x.strip() for x in (_env("GW_FALLBACK_URLS", "") or "").split(",") if x.strip()]
-FALLBACK_TIMEOUT = max(1, _env_int("GW_FALLBACK_TIMEOUT", 25))
-FALLBACK_SEARCH_LIMIT = max(1, _env_int("GW_FALLBACK_SEARCH_LIMIT", 10))
-FALLBACK_TOTAL_LIMIT = max(1, _env_int("GW_FALLBACK_TOTAL_LIMIT", MAX_LIMIT))
-FALLBACK_TOTAL_TIMEOUT = max(1, _env_int("GW_FALLBACK_TOTAL_TIMEOUT", 40))
+# 内置在线音源（musicdl）。数据保存在 data/config.json 的 online 段，网页设置可改；
+# 环境变量只作为首次启动默认值。
+ONLINE_ENABLED = _env_bool("GW_ONLINE_ENABLED", True)
+ONLINE_PLATFORMS = [x.strip() for x in
+                    (_env("GW_ONLINE_PLATFORMS", "KuwoMusicClient,MiguMusicClient") or "").split(",")
+                    if x.strip()]
+ONLINE_EXTRA_PLATFORMS = []
+ONLINE_SEARCH_LIMIT = max(1, _env_int("GW_ONLINE_SEARCH_LIMIT", 10))
+ONLINE_TIMEOUT = max(3, _env_int("GW_ONLINE_TIMEOUT", 25))
+ONLINE_TOTAL_LIMIT = max(1, _env_int("GW_ONLINE_TOTAL_LIMIT", MAX_LIMIT))
+ONLINE_TOTAL_TIMEOUT = max(1, _env_int("GW_ONLINE_TOTAL_TIMEOUT", 40))
 DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
 # 飞牛音乐（可选，优先级最高的音源）。地址/账号/密码优先读 data/config.json（网页「网关设置」写入），
-# 环境变量只作为首次启动的默认值。留空则只走 GW_FALLBACK_URLS 里的在线音源。
+# 环境变量只作为首次启动的默认值。
 FNOS_TOKEN_FILE = os.path.join(DATA_DIR, "fnmusic_token.json")
 FNOS_TIMEOUT = max(3, _env_int("GW_FNOS_TIMEOUT", 12))
 FNOS_CONFIG = ConfigStore(os.path.join(DATA_DIR, "config.json"))
@@ -185,14 +183,6 @@ ADVANCED_SPEC = {
                    "help": "留空或 off 表示关闭在线歌词检索"},
     "lyrics_retry": {"label": "歌词重试间隔", "kind": "int", "default": LYRICS_RETRY,
                      "min": 60, "max": 31536000, "unit": "秒"},
-    "fallback_timeout": {"label": "音源单请求超时", "kind": "int",
-                         "default": FALLBACK_TIMEOUT, "min": 1, "max": 120, "unit": "秒"},
-    "fallback_search_limit": {"label": "单音源搜索条数", "kind": "int",
-                              "default": FALLBACK_SEARCH_LIMIT, "min": 1, "max": 50, "unit": "首"},
-    "fallback_total_limit": {"label": "聚合搜索总条数", "kind": "int",
-                             "default": FALLBACK_TOTAL_LIMIT, "min": 1, "max": 500, "unit": "首"},
-    "fallback_total_timeout": {"label": "聚合搜索总超时", "kind": "int",
-                               "default": FALLBACK_TOTAL_TIMEOUT, "min": 1, "max": 300, "unit": "秒"},
     "fnos_timeout": {"label": "飞牛音乐请求超时", "kind": "int",
                      "default": FNOS_TIMEOUT, "min": 3, "max": 120, "unit": "秒"},
     "mcp_timeout": {"label": "MCP 上游超时", "kind": "int",
@@ -259,8 +249,7 @@ def advanced_settings():
 def apply_advanced_settings():
     """把高级设置同步到模块全局与已创建的服务对象，做到保存即生效。"""
     global URL_TTL, MAX_LIMIT, TRANSCODE_CONCURRENCY, LYRICS_ENABLED, LRCLIB_URL
-    global LYRICS_RETRY, FALLBACK_TIMEOUT, FALLBACK_SEARCH_LIMIT, FALLBACK_TOTAL_LIMIT
-    global FALLBACK_TOTAL_TIMEOUT, FNOS_TIMEOUT, PREVIEW_MIN_SECONDS, QUALITY_DEFAULT
+    global LYRICS_RETRY, FNOS_TIMEOUT, PREVIEW_MIN_SECONDS, QUALITY_DEFAULT
     global TEE_SAVE, SMART_SEARCH
     vals = advanced_settings()
     URL_TTL = vals["url_ttl"]
@@ -269,10 +258,6 @@ def apply_advanced_settings():
     LYRICS_ENABLED = vals["lyrics_enabled"]
     LRCLIB_URL = vals["lrclib_url"]
     LYRICS_RETRY = vals["lyrics_retry"]
-    FALLBACK_TIMEOUT = vals["fallback_timeout"]
-    FALLBACK_SEARCH_LIMIT = vals["fallback_search_limit"]
-    FALLBACK_TOTAL_LIMIT = vals["fallback_total_limit"]
-    FALLBACK_TOTAL_TIMEOUT = vals["fallback_total_timeout"]
     FNOS_TIMEOUT = vals["fnos_timeout"]
     PREVIEW_MIN_SECONDS = vals["preview_min_seconds"]
     QUALITY_DEFAULT = vals["quality_default"]
@@ -743,18 +728,121 @@ def apply_fnos_tls():
     os.environ["FNMUSIC_INSECURE_TLS"] = "1" if fnos_settings()["insecure_tls"] else ""
 
 
-def fallback_urls():
-    """兜底在线音源列表：data/config.json 优先，环境变量兜底。"""
-    raw = FNOS_CONFIG.section("fallback").get("urls")
-    if raw:
-        return [x.strip() for x in str(raw).split(",") if x.strip()]
-    return list(FALLBACK_URLS)
+def _split_csv(value):
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value or "").split(",") if x.strip()]
 
 
-def save_fallback_urls(urls):
-    """保存并热重建 provider。"""
-    FNOS_CONFIG.update("fallback", {"urls": ",".join(urls)})
+def online_settings():
+    """内置在线音源配置：data/config.json 的 online 段优先，环境变量兜底。"""
+    cfg = FNOS_CONFIG.section("online")
+    out = {
+        "enabled": ONLINE_ENABLED,
+        "platforms": list(ONLINE_PLATFORMS),
+        "extra_platforms": list(ONLINE_EXTRA_PLATFORMS),
+        "search_limit": ONLINE_SEARCH_LIMIT,
+        "timeout": ONLINE_TIMEOUT,
+        "total_limit": ONLINE_TOTAL_LIMIT,
+        "total_timeout": ONLINE_TOTAL_TIMEOUT,
+    }
+    if "enabled" in cfg:
+        out["enabled"] = _truthy(cfg["enabled"])
+    if "platforms" in cfg:
+        out["platforms"] = _split_csv(cfg["platforms"])
+    if "extra_platforms" in cfg:
+        out["extra_platforms"] = _split_csv(cfg["extra_platforms"])
+    for key in ("search_limit", "timeout", "total_limit", "total_timeout"):
+        if key in cfg:
+            try:
+                out[key] = int(cfg[key])
+            except ValueError:
+                pass
+    return out
+
+
+def online_platforms(settings=None):
+    s = settings or online_settings()
+    return list(dict.fromkeys(s["platforms"] + s["extra_platforms"]))
+
+
+def online_active(settings=None):
+    s = settings or online_settings()
+    return bool(s["enabled"] and online_platforms(s))
+
+
+def new_native_provider(settings=None, platforms=None, timeout=None):
+    s = settings or online_settings()
+    return NativeMusicDLProvider(
+        platforms=platforms or online_platforms(s),
+        work_dir=os.path.join(DATA_DIR, "musicdl_outputs"),
+        search_limit=s["search_limit"],
+        timeout=timeout or s["timeout"],
+        total_limit=s["total_limit"],
+        total_timeout=s["total_timeout"])
+
+
+def _online_int(patch, key, low, high, label):
+    if key not in patch:
+        return None
+    try:
+        value = int(str(patch.get(key)).strip())
+    except (TypeError, ValueError):
+        raise BadRequest("%s 必须是整数" % label)
+    if value < low or value > high:
+        raise BadRequest("%s 需在 %d~%d 之间" % (label, low, high))
+    return value
+
+
+def save_online_settings(patch):
+    if not isinstance(patch, dict):
+        raise BadRequest("请求体必须是对象")
+    store = {}
+    if "enabled" in patch:
+        store["enabled"] = "1" if _truthy(patch.get("enabled")) else "0"
+    for key, label in (("platforms", "平台列表"), ("extra_platforms", "扩展平台")):
+        if key not in patch:
+            continue
+        rows = _split_csv(patch.get(key))
+        for name in rows:
+            if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,63}$", name):
+                raise BadRequest("%s 含非法平台名：%s" % (label, name))
+        store[key] = ",".join(dict.fromkeys(rows))
+    for key, low, high, label in (
+            ("search_limit", 1, 10, "单平台搜索条数"),
+            ("timeout", 3, 120, "单平台超时"),
+            ("total_limit", 1, 500, "聚合搜索总条数"),
+            ("total_timeout", 1, 300, "聚合搜索总超时")):
+        value = _online_int(patch, key, low, high, label)
+        if value is not None:
+            store[key] = str(value)
+    settings = online_settings()
+    if "enabled" in store:
+        settings["enabled"] = store["enabled"] == "1"
+    if "platforms" in store:
+        settings["platforms"] = _split_csv(store["platforms"])
+    if "extra_platforms" in store:
+        settings["extra_platforms"] = _split_csv(store["extra_platforms"])
+    for key in ("search_limit", "timeout", "total_limit", "total_timeout"):
+        if key in store:
+            settings[key] = int(store[key])
+    if settings["enabled"] and not online_platforms(settings):
+        raise BadRequest("启用在线音源时至少选择一个平台")
+    FNOS_CONFIG.update("online", store)
     reset_provider()
+    return settings
+
+
+def online_status():
+    settings = online_settings()
+    if not online_active(settings):
+        return []
+    return new_native_provider(settings).status()
+
+
+def online_services():
+    settings = online_settings()
+    return online_platforms(settings) if settings["enabled"] else []
 
 
 def fnos_configured():
@@ -768,17 +856,26 @@ apply_fnos_tls()
 def gateway_mode():
     if MOCK:
         return "mock"
+    online = online_active()
     if fnos_configured():
-        return "fnos+online" if fallback_urls() else "fnos"
-    return "online"
+        return "fnos+online" if online else "fnos"
+    return "online" if online else "none"
 
 
 def reset_provider():
     """配置变更后丢弃 provider 单例，下一次请求按新配置重建。"""
     global _PROVIDER, _PROVIDER_ERR
+    old = None
     with _PROVIDER_LOCK:
+        old = _PROVIDER
         _PROVIDER = None
         _PROVIDER_ERR = None
+    close_fn = getattr(old, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            LOG.debug("关闭旧 provider 失败", exc_info=True)
 
 
 _PROVIDER = None
@@ -787,7 +884,7 @@ _PROVIDER_LOCK = threading.Lock()
 
 
 def provider():
-    """惰性单例。飞牛音乐优先，GW_FALLBACK_URLS 的在线音源兜底。"""
+    """惰性单例。飞牛音乐优先，内置在线音源（musicdl）补足。"""
     global _PROVIDER, _PROVIDER_ERR
     p = _PROVIDER
     if p is not None:
@@ -802,23 +899,26 @@ def provider():
                     if fnos_configured():
                         base = FnProvider()
                         LOG.info("飞牛音乐已连接：%s", fnos_settings()["base"])
-                    fb_urls = fallback_urls()
-                    if fb_urls:
+                    settings = online_settings()
+                    exts = []
+                    if online_active(settings):
+                        exts = [new_native_provider(settings)]
+                        LOG.info("内置在线音源：%s", ", ".join(online_platforms(settings)))
+                    if exts:
                         _PROVIDER = FallbackProvider(
-                            base, fb_urls, timeout=FALLBACK_TIMEOUT,
-                            search_limit=FALLBACK_SEARCH_LIMIT,
+                            base, exts=exts, timeout=settings["timeout"],
+                            search_limit=settings["search_limit"],
                             download_dir_getter=lambda: DOWNLOAD_DIR,
                             max_bytes=LIBRARY_MAX_BYTES,
                             parallel=SOURCE_SEARCH_PARALLEL,
-                            total_limit=FALLBACK_TOTAL_LIMIT,
-                            total_timeout=FALLBACK_TOTAL_TIMEOUT)
-                        LOG.info("在线音源兜底：%s", ", ".join(fallback_services()))
+                            total_limit=settings["total_limit"],
+                            total_timeout=settings["total_timeout"])
                     elif base is not None:
                         _PROVIDER = base
                     else:
                         raise RuntimeError(
-                            "未配置音源：请在网页「网关设置」填写飞牛音乐地址与账号，"
-                            "或设置 GW_FALLBACK_URLS（如 musicdl@http://fnmusic-sources:8001）")
+                            "未配置音源：请在网页「设置」填写飞牛音乐地址与账号，"
+                            "或在「在线音源」中启用 musicdl 平台")
                 _PROVIDER_ERR = None
             except Exception as e:
                 _PROVIDER_ERR = str(e)
@@ -1026,17 +1126,7 @@ apply_advanced_settings()
 
 
 # ---------------------------------------------------------------- MCP 工具
-# 在线音源兼容别名（历史测试/脚本仍可使用这些名字）
 EXT_PREFIX = "ext:"
-
-
-def _spec_svc(spec):
-    return _parse_spec(spec)[0]
-
-
-def fallback_services():
-    return _fallback_services(fallback_urls())
-
 
 TOOLS = build_tools()
 
@@ -1157,13 +1247,14 @@ def call_tool(name, args, base):
         return "已保存到本地曲库：%s（%s，%.1f MB）" % (track.get("title") or track["guid"], fp, n / 1048576.0)
 
     if name == "music_sources":
-        if not fallback_urls():
-            return "没有配置任何音源：请在网页「网关设置」填写飞牛音乐地址与账号，或添加兜底音源。"
-        rows = source_status(fallback_urls())
+        settings = online_settings()
+        if not online_active(settings):
+            return "未启用在线音源：请在网页「设置 → 在线音源」选择平台并启用。"
+        rows = online_status()
         lines = ["在线音源 %d 个：" % len(rows)]
         for item in rows:
-            lines.append("%s（%s）%s" % (item.get("source"), item.get("url"),
-                                        " 正常" if item.get("healthy") else " 不可用"))
+            lines.append("%s / %s %s" % (item.get("source"), item.get("platform") or item.get("url"),
+                                         " 正常" if item.get("healthy") else " 不可用"))
         return "\n".join(lines)
 
     if name == "music_storage":
@@ -1246,13 +1337,13 @@ class Handler(BaseHTTPRequestHandler):
             jar.load(raw)
         except Exception:
             return False
-        morsel = jar.get(WEBUI_COOKIE)
+        morsel = jar.get(ADMIN_COOKIE)
         return bool(morsel) and hmac.compare_digest(morsel.value, ADMIN_TOKEN)
 
     def _admin_cookie_header(self):
         jar = SimpleCookie()
-        jar[WEBUI_COOKIE] = ADMIN_TOKEN
-        morsel = jar[WEBUI_COOKIE]
+        jar[ADMIN_COOKIE] = ADMIN_TOKEN
+        morsel = jar[ADMIN_COOKIE]
         morsel["path"] = "/"
         morsel["httponly"] = True
         morsel["samesite"] = "Lax"
@@ -1324,7 +1415,6 @@ class Handler(BaseHTTPRequestHandler):
             "device_id": s["device_id"], "insecure_tls": s["insecure_tls"],
             "source": s["source"], "token_cached": s["token_cached"],
             "configured": fnos_configured(), "download_dir": DOWNLOAD_DIR,
-            "fallback": fallback_services(), "fallback_urls": fallback_urls(),
         })
 
     def _handle_settings_put(self):
@@ -1406,145 +1496,51 @@ class Handler(BaseHTTPRequestHandler):
         LOG.info("高级设置已更新：%s", json.dumps(vals, ensure_ascii=False))
         return self._json(vals)
 
-    def _handle_fallback_get(self):
-        return self._json({"urls": fallback_urls(), "services": fallback_services()})
+    def _handle_online_get(self):
+        s = online_settings()
+        s["services"] = [{"source": "musicdl", "platform": p, "url": "native"}
+                         for p in online_platforms(s)]
+        s["deps_available"] = online_deps_available()
+        s["deps_error"] = online_deps_error()
+        return self._json(s)
 
-    def _handle_fallback_put(self):
+    def _handle_online_put(self):
         body = self._body()
-        raw = body.get("urls")
-        if not isinstance(raw, list):
-            raise BadRequest("urls 必须是数组")
-        urls = []
-        for item in raw:
-            spec = str(item or "").strip()
-            if not spec:
-                continue
-            svc, base = _parse_spec(spec)
-            if svc not in ("musicdl", "lxmusic", "musicbox", "neteasefree") or \
-                    not re.match(r"^https?://", base or ""):
-                raise BadRequest("音源格式不对：%s（示例 musicdl@http://host:8001）" % spec)
-            if spec not in urls:
-                urls.append(spec)
-        save_fallback_urls(urls)
-        LOG.info("兜底音源已更新：%s", ", ".join(urls) or "-")
-        return self._handle_fallback_get()
+        vals = save_online_settings(body)
+        LOG.info("在线音源设置已更新：enabled=%s platforms=%s",
+                 vals["enabled"], ",".join(online_platforms(vals)) or "-")
+        return self._handle_online_get()
 
-    def _handle_fallback_test(self):
+    def _handle_online_test(self):
         body = self._body()
-        spec = str(body.get("spec") or "").strip()
-        if not spec:
-            raise BadRequest("spec 不能为空")
-        svc, base = _parse_spec(spec)
-        if not re.match(r"^https?://", base or ""):
-            raise BadRequest("音源地址必须以 http:// 或 https:// 开头")
-        from gwlib.sources import ExtProvider
+        platform = str(body.get("platform") or "").strip()
+        if platform and not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,63}$", platform):
+            raise BadRequest("平台名非法")
+        settings = online_settings()
+        platforms = [platform] if platform else online_platforms(settings)
+        if not platforms:
+            raise BadRequest("没有可测试的平台，请先选择平台")
         started = time.time()
+        provider = new_native_provider(settings, platforms=platforms,
+                                       timeout=min(15, settings["timeout"]))
         try:
-            ok = ExtProvider(base, svc, timeout=min(FALLBACK_TIMEOUT, 8)).health()
-            return self._json({"ok": bool(ok), "ms": int((time.time() - started) * 1000),
-                               "service": svc, "base": base,
-                               "error": None if ok else "healthz 未通过"})
-        except Exception as e:
-            return self._json({"ok": False, "ms": int((time.time() - started) * 1000),
-                               "service": svc, "base": base, "error": str(e)})
+            results = [provider.probe(name) for name in platforms]
+        finally:
+            provider.close()
+        return self._json({
+            "ok": any(r.get("ok") for r in results),
+            "ms": int((time.time() - started) * 1000),
+            "results": results})
 
     def _handle_root(self, u, qs):
-        if not WEBUI_ENABLED:
-            return self._json({"service": "fnmusic-gateway", "version": VERSION,
-                               "webui": False, "mcp": "/mcp"})
         token = (qs.get("token") or [""])[0]
         if token and ADMIN_TOKEN:
             if not hmac.compare_digest(token, ADMIN_TOKEN):
                 return self._unauthorized()
-            return self._redirect("/", [self._admin_cookie_header()])
+            return self._redirect(self._strip_token(u) or "/", [self._admin_cookie_header()])
         if not self._admin_credential_ok():
             return self._unauthorized()
-        return self._proxy_webui("/")
-
-    def _handle_webui_get(self, u, qs):
-        if u.path == WEBUI_PREFIX:
-            q = ("?" + u.query) if u.query else ""
-            return self._redirect(WEBUI_PREFIX + "/" + q)
-        token = (qs.get("token") or [""])[0]
-        if token and ADMIN_TOKEN:
-            if not hmac.compare_digest(token, ADMIN_TOKEN):
-                return self._unauthorized()
-            return self._redirect(self._strip_token(u), [self._admin_cookie_header()])
-        if not self._admin_ok(u.path):
-            return self._unauthorized()
-        return self._proxy_webui()
-
-    def _proxy_webui(self, upstream_path=None):
-        if not WEBUI_ENABLED:
-            return self._json({"error": {"code": "webui_disabled", "message": "未配置 WebUI"}}, 404)
-        target = urllib.parse.urlparse(WEBUI_URL)
-        if target.scheme not in ("http", "https") or not target.hostname:
-            return self._json({"error": {"code": "webui_bad_url", "message": "GW_WEBUI_URL 非法"}}, 503)
-        n = _to_int(self.headers.get("Content-Length"), 0)
-        if n < 0 or n > WEBUI_BODY_CAP:
-            return self._json({"error": {"code": "payload_too_large", "message": "请求体过大"}}, 413)
-        body = self.rfile.read(n) if n else b""
-        req_path = upstream_path if upstream_path is not None else self.path
-        upath = (target.path.rstrip("/") + req_path) or "/"
-        conn = None
-        try:
-            port = target.port or (443 if target.scheme == "https" else 80)
-            cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
-            conn = cls(target.hostname, port, timeout=WEBUI_TIMEOUT)
-            hdrs = {}
-            skip = {"host", "content-length", "x-trim-isadmin", "connection",
-                    "proxy-connection", "transfer-encoding", "upgrade"}
-            for key, value in self.headers.items():
-                if key.lower() not in skip:
-                    hdrs[key] = value
-            hdrs["X-Trim-IsAdmin"] = "true"
-            fwd_proto = (self.headers.get("X-Forwarded-Proto") or "http").strip()
-            hdrs["X-Forwarded-Proto"] = fwd_proto
-            if self.headers.get("Host"):
-                hdrs["X-Forwarded-Host"] = self.headers.get("Host")
-            if self.headers.get("X-Forwarded-For"):
-                hdrs["X-Forwarded-For"] = self.headers.get("X-Forwarded-For") + ", " + self.client_address[0]
-            else:
-                hdrs["X-Forwarded-For"] = self.client_address[0]
-            if self.command not in ("GET", "HEAD"):
-                hdrs["Content-Length"] = str(len(body))
-            conn.request(self.command, upath, body=body if self.command not in ("GET", "HEAD") else None,
-                         headers=hdrs)
-            resp = conn.getresponse()
-            data = resp.read()
-            ctype = resp.getheader("Content-Type") or "application/octet-stream"
-            if ctype.startswith("text/html") and req_path.split("?")[0] in ("/", "/index.html"):
-                try:
-                    html = data.decode("utf-8")
-                    if 'id="gw-settings-link"' not in html:
-                        link = ('<a id="gw-settings-link" href="/settings" style="position:fixed;'
-                                'right:18px;bottom:18px;z-index:2147483647;background:#2563eb;color:#fff;'
-                                'padding:10px 16px;border-radius:999px;font:14px/1 system-ui,sans-serif;'
-                                'text-decoration:none;box-shadow:0 6px 18px rgba(0,0,0,.25)">'
-                                '网关设置 · 飞牛音乐</a>')
-                        html = html.replace("</body>", link + "</body>", 1) if "</body>" in html else html + link
-                        data = html.encode("utf-8")
-                except Exception as exc:
-                    LOG.debug("注入设置入口失败：%s", exc)
-            out = []
-            for key, value in resp.getheaders():
-                lower = key.lower()
-                if lower in ("content-type", "content-length", "transfer-encoding",
-                             "connection", "date", "server"):
-                    continue
-                if lower == "location" and WEBUI_URL and value.startswith(WEBUI_URL):
-                    value = WEBUI_PREFIX + value[len(WEBUI_URL):]
-                out.append((key, value))
-            return self._raw(data, resp.status, ctype, out)
-        except Exception as exc:
-            LOG.warning("WebUI 反代失败：%s", exc)
-            return self._json({"error": {"code": "webui_unavailable", "message": "WebUI 不可用"}}, 502)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        return self._raw(HOME_HTML.encode("utf-8"), 200, "text/html; charset=utf-8")
 
     def _qs(self):
         u = urllib.parse.urlparse(self.path)
@@ -1582,8 +1578,6 @@ class Handler(BaseHTTPRequestHandler):
             path = u.path
             if path == "/":
                 return self._handle_root(u, qs)
-            if path == WEBUI_PREFIX or path.startswith(WEBUI_PREFIX + "/"):
-                return self._handle_webui_get(u, qs)
             if path in ("/settings", "/settings/"):
                 return self._handle_settings(u, qs)
             if not self._admin_ok(path):
@@ -1597,19 +1591,21 @@ class Handler(BaseHTTPRequestHandler):
                                             "source": fnos_settings()["source"],
                                             "token_cached": fnos_settings()["token_cached"]},
                                    "provider_error": provider_error(),
-                                   "fallback": fallback_services(),
+                                   "online": {"enabled": online_active(),
+                                              "platforms": online_services(),
+                                              "deps": online_deps_available(),
+                                              "error": online_deps_error()},
                                    "quality_default": QUALITY_DEFAULT,
                                    "quality_profiles": describe_quality(),
                                    "mcp_server": {"available": MCP_SERVICE.available,
                                                   "engine": "mcp>=2.3",
                                                   "error": str(MCP_SERVICE.import_error) if MCP_SERVICE.import_error else None},
                                    "auth_required": bool(ADMIN_TOKEN),
-                                   "webui": {"enabled": WEBUI_ENABLED},
                                    "cache_mb": round(self._cache_mb(), 1)})
             if path == "/api/settings/fnos":
                 return self._handle_settings_get()
-            if path == "/api/settings/fallback":
-                return self._handle_fallback_get()
+            if path == "/api/settings/online":
+                return self._handle_online_get()
             if path == "/api/settings/advanced":
                 return self._handle_advanced_get()
             if path == "/readyz":
@@ -1651,7 +1647,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/status":
                 return self._json(load_state() or {"title": None})
             if path == "/api/sources":
-                return self._json({"sources": source_status(fallback_urls()) if fallback_urls() else []})
+                return self._json({"sources": online_status()})
             if path == "/api/storage":
                 return self._json({"cache": CACHE.stats(), "library": LIBRARY.stats()})
             if path == "/api/quality":
@@ -1678,18 +1674,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             u, qs = self._qs()
-            if u.path == WEBUI_PREFIX or u.path.startswith(WEBUI_PREFIX + "/"):
-                if not self._admin_ok(u.path):
-                    return self._unauthorized()
-                return self._proxy_webui()
             if not self._admin_ok(u.path):
                 return self._unauthorized()
             if u.path == "/api/settings/fnos/test":
                 return self._handle_settings_test()
             if u.path == "/api/settings/fnos/logout":
                 return self._handle_settings_logout()
-            if u.path == "/api/settings/fallback/test":
-                return self._handle_fallback_test()
+            if u.path == "/api/settings/online/test":
+                return self._handle_online_test()
             if u.path == "/mcp":
                 return self._handle_mcp()
             if u.path == "/api/favorite":
@@ -1764,12 +1756,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         u, _ = self._qs()
-        if u.path in ("/api/settings/fnos", "/api/settings/fallback", "/api/settings/advanced"):
+        if u.path in ("/api/settings/fnos", "/api/settings/online", "/api/settings/advanced"):
             try:
                 if not self._admin_ok(u.path):
                     return self._unauthorized()
-                if u.path == "/api/settings/fallback":
-                    return self._handle_fallback_put()
+                if u.path == "/api/settings/online":
+                    return self._handle_online_put()
                 if u.path == "/api/settings/advanced":
                     return self._handle_advanced_put()
                 return self._handle_settings_put()
@@ -1779,18 +1771,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 LOG.exception("PUT %s failed", self.path)
                 return self._json({"error": str(e)}, 500)
-        self._do_webui_write()
-
-    def do_PATCH(self):
-        self._do_webui_write()
-
-    def _do_webui_write(self):
-        u, _ = self._qs()
-        if not (u.path == WEBUI_PREFIX or u.path.startswith(WEBUI_PREFIX + "/")):
-            return self._json({"error": "not found", "path": u.path}, 404)
-        if not self._admin_ok(u.path):
-            return self._unauthorized()
-        return self._proxy_webui()
+        return self._json({"error": "not found", "path": u.path}, 404)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1803,8 +1784,6 @@ class Handler(BaseHTTPRequestHandler):
         u, _ = self._qs()
         if not self._admin_ok(u.path):
             return self._unauthorized()
-        if u.path == WEBUI_PREFIX or u.path.startswith(WEBUI_PREFIX + "/"):
-            return self._proxy_webui()
         if u.path == "/mcp":
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1831,11 +1810,11 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     out["fnos"] = {"ok": False, "ms": int((time.time() - started) * 1000),
                                    "error": str(e)}
-            if fallback_urls():
-                out["sources"] = source_status(fallback_urls(), timeout=3)
+            if online_active():
+                out["sources"] = online_status()
             sources_ok = any(r.get("healthy") for r in out["sources"])
             ok = bool(fnos_ok or sources_ok)
-            if not fnos_cfg and not fallback_urls():
+            if not fnos_cfg and not online_active():
                 out["error"] = "未配置任何音源"
             return self._json(dict(ok=ok, **out), 200 if ok else 503)
         except Exception as e:
@@ -2117,9 +2096,8 @@ class GatewayServer(ThreadingHTTPServer):
 
 def main():
     srv = GatewayServer((HOST, PORT), Handler)
-    LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB, webui=%s)",
-             VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576,
-             WEBUI_URL or "off")
+    LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB)",
+             VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
     if not ADMIN_TOKEN:
         LOG.warning("未设置 GW_ADMIN_TOKEN：管理接口、MCP 与 WebUI 均无鉴权，只应内网访问")
     try:

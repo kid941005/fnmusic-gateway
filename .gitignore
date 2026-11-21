@@ -6,6 +6,10 @@ data/sign.key
 data/state.json
 data/moods.json
 data/.fnmusic_token.json
+data/config.json
+data/lyrics/
+data/musicdl_outputs/
+.env
 sources-data/
 sources-repo/
 music/

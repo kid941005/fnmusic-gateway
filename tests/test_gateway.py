@@ -315,74 +315,18 @@ class TestCache(Base):
         self.assertEqual(app.CACHE.ensure("mock-1", p), path)  # 命中缓存
 
 
-class _FakeWebUIHandler(BaseHTTPRequestHandler):
-    """最小 WebUI 上游：记录收到的头，验证网关注入 X-Trim-IsAdmin。"""
-
-    protocol_version = "HTTP/1.1"
-    seen = []
-
-    def log_message(self, *_args):
-        pass
-
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _record(self):
-        _FakeWebUIHandler.seen.append((self.command, self.path, dict(self.headers)))
-
-    def do_GET(self):
-        self._record()
-        if self.path.endswith("/api/state"):
-            return self._send(200, json.dumps({"ok": True, "path": self.path}).encode())
-        if self.path.endswith("/static/app.js"):
-            return self._send(200, b"window.APP_BASE='/app/fnmusic-ext';",
-                              "application/javascript; charset=utf-8")
-        return self._send(200, b"<html>webui</html>", "text/html; charset=utf-8")
-
-    def do_POST(self):
-        self._do_write()
-
-    def do_PUT(self):
-        self._do_write()
-
-    def _do_write(self):
-        self._record()
-        n = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(n) if n else b""
-        out = {"method": self.command, "body": body.decode("utf-8", "replace"),
-               "admin": self.headers.get("X-Trim-IsAdmin")}
-        self._send(200, json.dumps(out).encode())
-
-
-class TestWebUI(Base):
-    """单端口 WebUI：/app/fnmusic-ext 同端口反代 + Cookie 管理鉴权。"""
+class TestHome(Base):
+    """单端口原生首页：Cookie 管理鉴权、首页与设置页。"""
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls._old_token = app.ADMIN_TOKEN
-        cls._old_url = app.WEBUI_URL
-        cls._old_enabled = app.WEBUI_ENABLED
         app.ADMIN_TOKEN = "test-secret"
-        cls.up = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWebUIHandler)
-        cls.up_port = cls.up.server_address[1]
-        threading.Thread(target=cls.up.serve_forever, daemon=True).start()
-        app.WEBUI_URL = "http://127.0.0.1:%d" % cls.up_port
-        app.WEBUI_ENABLED = True
-        _FakeWebUIHandler.seen.clear()
 
     @classmethod
     def tearDownClass(cls):
-        cls.up.shutdown()
-        cls.up.server_close()
         app.ADMIN_TOKEN = cls._old_token
-        app.WEBUI_URL = cls._old_url
-        app.WEBUI_ENABLED = cls._old_enabled
         super().tearDownClass()
 
     def _cookie(self):
@@ -393,49 +337,29 @@ class TestWebUI(Base):
         self.assertIn("fnmusic_admin=", raw)
         return raw.split(";")[0]
 
-    def test_root_is_webui(self):
-        # 未登录：根路径直接 401（不再跳转长前缀）
+    def test_root_requires_auth(self):
         r, _ = self.req("GET", "/", raw=True)
         self.assertEqual(r.status, 401)
-        # ?token= 校验后写 Cookie 并回到根
+
+    def test_token_sets_cookie_and_shows_home(self):
         cookie = self._cookie()
         r, body = self.req("GET", "/", headers={"Cookie": cookie}, raw=True)
         self.assertEqual(r.status, 200)
-        self.assertIn(b"webui", body)
-        # 上游收到的就是 "/"
-        self.assertEqual(_FakeWebUIHandler.seen[-1][1], "/")
+        self.assertIn(b"fnmusic-gateway", body)
+        self.assertIn("在线音源".encode("utf-8"), body)
 
-    def test_legacy_prefix_still_proxied_for_assets(self):
+    def test_settings_page_has_online_card(self):
         cookie = self._cookie()
-        r, body = self.req("GET", "/app/fnmusic-ext/static/app.js", headers={"Cookie": cookie}, raw=True)
+        r, body = self.req("GET", "/settings", headers={"Cookie": cookie}, raw=True)
         self.assertEqual(r.status, 200)
-        self.assertIn(b"APP_BASE", body)
+        self.assertIn("在线音源".encode("utf-8"), body)
+        self.assertIn("/api/settings/online".encode("utf-8"), body)
 
-    def test_webui_proxies_api_and_injects_admin_header(self):
-        cookie = self._cookie()
-        r, body = self.req("GET", "/app/fnmusic-ext/api/state", headers={"Cookie": cookie})
-        self.assertEqual(r.status, 200)
-        self.assertTrue(body.get("ok"))
-        self.assertTrue(_FakeWebUIHandler.seen)
-        self.assertEqual(_FakeWebUIHandler.seen[-1][2].get("X-Trim-IsAdmin"), "true")
-
-    def test_webui_proxies_post_and_put(self):
-        cookie = self._cookie()
-        r, body = self.req("POST", "/app/fnmusic-ext/api/action", body={"x": 1},
-                           headers={"Cookie": cookie})
-        self.assertEqual(r.status, 200)
-        self.assertEqual(body.get("method"), "POST")
-        self.assertEqual(body.get("admin"), "true")
-        self.assertIn('"x": 1', body.get("body", ""))
-        r, body = self.req("PUT", "/app/fnmusic-ext/api/action", body={"x": 2},
-                           headers={"Cookie": cookie})
-        self.assertEqual(r.status, 200)
-        self.assertEqual(body.get("method"), "PUT")
-
-    def test_healthz_reports_webui_enabled(self):
+    def test_healthz_reports_online(self):
         r, body = self.req("GET", "/healthz")
         self.assertEqual(r.status, 200)
-        self.assertTrue(body["webui"]["enabled"])
+        self.assertIn("online", body)
+        self.assertIn("enabled", body["online"])
 
 
 class TestConfigStore(unittest.TestCase):
@@ -546,61 +470,61 @@ class TestFnSettings(Base):
         self.assertFalse(body["insecure_tls"])
         self.assertNotIn("insecure_tls", app.FNOS_CONFIG.section("fnos"))
 
-    def test_settings_fallback_roundtrip(self):
-        urls = ["musicdl@http://127.0.0.1:8001", "lxmusic@http://127.0.0.1:8002"]
-        r, body = self.req("PUT", "/api/settings/fallback", body={"urls": urls},
+    def test_settings_online_roundtrip(self):
+        r, body = self.req("PUT", "/api/settings/online",
+                           body={"enabled": True, "platforms": ["KuwoMusicClient"],
+                                 "extra_platforms": ["QQMusicClient"],
+                                 "search_limit": 8, "timeout": 12,
+                                 "total_limit": 20, "total_timeout": 30},
                            headers=self._h())
         self.assertEqual(r.status, 200)
-        self.assertEqual(body["urls"], urls)
-        self.assertEqual(body["services"], ["musicdl", "lxmusic"])
-        self.assertEqual(app.fallback_urls(), urls)
-        r, body = self.req("GET", "/api/settings/fallback", headers=self._h())
-        self.assertEqual(body["urls"], urls)
-        # 空列表清空配置，回退到环境变量（此处为空）
-        r, body = self.req("PUT", "/api/settings/fallback", body={"urls": []}, headers=self._h())
-        self.assertEqual(r.status, 200)
-        self.assertEqual(body["urls"], [])
+        self.assertTrue(body["enabled"])
+        self.assertEqual(body["platforms"], ["KuwoMusicClient"])
+        self.assertEqual(body["extra_platforms"], ["QQMusicClient"])
+        self.assertEqual(body["search_limit"], 8)
+        self.assertEqual(body["timeout"], 12)
+        self.assertIn("services", body)
+        r, got = self.req("GET", "/api/settings/online", headers=self._h())
+        self.assertEqual(got["platforms"], ["KuwoMusicClient"])
+        self.assertEqual(got["total_timeout"], 30)
+        self.assertIn("deps_available", got)
 
-    def test_settings_fallback_rejects_bad_spec(self):
-        r, _ = self.req("PUT", "/api/settings/fallback",
-                        body={"urls": ["bogus-spec"]}, headers=self._h())
+    def test_settings_online_rejects_bad_platform(self):
+        r, _ = self.req("PUT", "/api/settings/online",
+                        body={"platforms": ["../evil"]}, headers=self._h())
         self.assertEqual(r.status, 400)
 
-    def test_settings_fallback_test_failure(self):
-        r, body = self.req("POST", "/api/settings/fallback/test",
-                           body={"spec": "musicdl@http://127.0.0.1:1"}, headers=self._h())
-        self.assertEqual(r.status, 200)
-        self.assertFalse(body["ok"])
-        self.assertTrue(body["error"])
-        self.assertEqual(body["service"], "musicdl")
+    def test_settings_online_requires_platform_when_enabled(self):
+        before = app.FNOS_CONFIG.section("online")
+        r, _ = self.req("PUT", "/api/settings/online",
+                        body={"enabled": True, "platforms": []}, headers=self._h())
+        self.assertEqual(r.status, 400)
+        self.assertEqual(app.FNOS_CONFIG.section("online"), before)
 
-    def test_settings_fallback_test_ok(self):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-        class H(BaseHTTPRequestHandler):
-            def do_GET(self):
-                payload = b'{"ok": true}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def log_message(self, *a):
-                pass
-
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    def test_settings_online_test_calls_probe(self):
+        class FakeProvider:
+            def __init__(self):
+                self.closed = False
+            def probe(self, name):
+                return {"platform": name, "ok": True, "count": 3, "ms": 1, "error": ""}
+            def close(self):
+                self.closed = True
+        old = app.new_native_provider
+        made = []
+        def fake(*a, **k):
+            p = FakeProvider()
+            made.append(p)
+            return p
+        app.new_native_provider = fake
         try:
-            spec = "musicdl@http://127.0.0.1:%d" % srv.server_address[1]
-            r, body = self.req("POST", "/api/settings/fallback/test",
-                               body={"spec": spec}, headers=self._h())
-            self.assertEqual(r.status, 200)
-            self.assertTrue(body["ok"])
-            self.assertEqual(body["service"], "musicdl")
+            r, body = self.req("POST", "/api/settings/online/test",
+                               body={"platform": "KuwoMusicClient"}, headers=self._h())
         finally:
-            srv.shutdown()
-            srv.server_close()
+            app.new_native_provider = old
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["results"][0]["count"], 3)
+        self.assertTrue(made and made[0].closed)
 
 
 class TestAdvancedSettings(Base):
@@ -636,8 +560,6 @@ class TestAdvancedSettings(Base):
                 "transcode_concurrency": 3, "smart_search": False,
                 "tee_save": False, "lyrics_enabled": False,
                 "lrclib_url": "off", "lyrics_retry": 120,
-                "fallback_timeout": 5, "fallback_search_limit": 6,
-                "fallback_total_limit": 20, "fallback_total_timeout": 10,
                 "fnos_timeout": 8, "mcp_timeout": 120}
         r, resp = self.req("PUT", "/api/settings/advanced", body=body, headers=self._h())
         self.assertEqual(r.status, 200)
@@ -758,9 +680,9 @@ class TestFallback(unittest.TestCase):
         self.assertEqual(gw_sources.ext_split("ext:lxmusic:ab:cd"), ("lxmusic", "ab:cd"))
 
     def test_spec_svc(self):
-        self.assertEqual(app._spec_svc("musicdl@http://x:1"), "musicdl")
-        self.assertEqual(app._spec_svc("http://127.0.0.1:8772"), "lxmusic")
-        self.assertEqual(app._spec_svc("http://127.0.0.1:8776"), "neteasefree")
+        self.assertEqual(gw_sources.parse_spec("musicdl@http://x:1")[0], "musicdl")
+        self.assertEqual(gw_sources.parse_spec("http://127.0.0.1:8772")[0], "lxmusic")
+        self.assertEqual(gw_sources.parse_spec("http://127.0.0.1:8776")[0], "neteasefree")
 
     def test_local_first_then_ext(self):
         local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
@@ -850,15 +772,18 @@ class TestOnlineOnly(unittest.TestCase):
         self.assertEqual(fp.stream("ext:musicdl:abc"), ("audio/wav", b"RIFFxxxx"))
 
     def test_provider_requires_online_sources(self):
-        old = (app._PROVIDER, app._PROVIDER_ERR, app.MOCK, app.FALLBACK_URLS)
+        old = (app._PROVIDER, app._PROVIDER_ERR, app.MOCK, app.online_settings)
         app._PROVIDER, app._PROVIDER_ERR, app.MOCK = None, None, False
-        app.FALLBACK_URLS = []
+        app.online_settings = lambda: {"enabled": False, "platforms": [],
+                                       "extra_platforms": [], "search_limit": 10,
+                                       "timeout": 25, "total_limit": 50,
+                                       "total_timeout": 40}
         try:
             with self.assertRaises(RuntimeError) as ctx:
                 app.provider()
-            self.assertIn("GW_FALLBACK_URLS", str(ctx.exception))
+            self.assertIn("未配置音源", str(ctx.exception))
         finally:
-            app._PROVIDER, app._PROVIDER_ERR, app.MOCK, app.FALLBACK_URLS = old
+            app._PROVIDER, app._PROVIDER_ERR, app.MOCK, app.online_settings = old
 
 
 class TestExtProviderHttp(unittest.TestCase):
@@ -1112,14 +1037,18 @@ class TestAuditFixes(unittest.TestCase):
                 os.environ["GW_TEE_SAVE"] = old
 
     def test_music_sources_uses_source_healthy_fields(self):
-        old_status, old_urls = app.source_status, app.FALLBACK_URLS
-        app.source_status = lambda urls: [{"source": "musicdl", "url": "http://x", "healthy": True}]
-        app.FALLBACK_URLS = ["musicdl@http://x"]
+        old_settings, old_status = app.online_settings, app.online_status
+        app.online_settings = lambda: {"enabled": True, "platforms": ["KuwoMusicClient"],
+                                       "extra_platforms": [], "search_limit": 10,
+                                       "timeout": 25, "total_limit": 50,
+                                       "total_timeout": 40}
+        app.online_status = lambda: [{"source": "musicdl", "platform": "KuwoMusicClient",
+                                      "url": "native", "healthy": True}]
         try:
             out = app.call_tool("music_sources", {}, "http://h")
-            self.assertIn("musicdl（http://x） 正常", out)
+            self.assertIn("musicdl / KuwoMusicClient  正常", out)
         finally:
-            app.source_status, app.FALLBACK_URLS = old_status, old_urls
+            app.online_settings, app.online_status = old_settings, old_status
 
     def test_status_and_storage_do_not_need_provider(self):
         old = app.provider
@@ -1127,13 +1056,16 @@ class TestAuditFixes(unittest.TestCase):
         try:
             self.assertIsInstance(app.call_tool("music_status", {}, "http://h"), str)
             self.assertIn("播放缓存", app.call_tool("music_storage", {}, "http://h"))
-            old_urls = app.FALLBACK_URLS
-            app.FALLBACK_URLS = []
+            old_settings = app.online_settings
+            app.online_settings = lambda: {"enabled": False, "platforms": [],
+                                           "extra_platforms": [], "search_limit": 10,
+                                           "timeout": 25, "total_limit": 50,
+                                           "total_timeout": 40}
             try:
                 out = app.call_tool("music_sources", {}, "http://h")
-                self.assertIn("没有配置任何音源", out)
+                self.assertIn("未启用在线音源", out)
             finally:
-                app.FALLBACK_URLS = old_urls
+                app.online_settings = old_settings
         finally:
             app.provider = old
 
@@ -1166,7 +1098,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.7.0")
+        self.assertEqual(app.VERSION, "2.8.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

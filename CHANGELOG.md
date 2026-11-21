@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 2.8.0 (2026-11-21)
+
+### 破坏性变更：废弃 fnmusic-ext 音源容器，在线音源内置到网关
+- 网关镜像直接内置 musicdl 2.14.2：新增 `gwlib/musicdl_core.py`、`gwlib/musicdl_worker.py`、`gwlib/native_source.py`；每个平台独立子进程 worker，搜索/直链缓存与音乐源管理全部在网关内完成。
+- 删除独立音源容器与相关配置：compose 不再有 `fnmusic-sources`，移除 `GW_WEBUI_URL` / `GW_FALLBACK_URLS` / `FNMUSIC_SOURCES_IMAGE` / `MUSICDL_*`；只保留 `fnmusic-gateway` + 可选 `fnmusic-bridge`。
+- 新增内置在线音源配置（网页「设置 → 在线音源」）：启用开关、平台勾选、附加平台、单平台条数/超时、聚合条数/总超时；新增 `GET/PUT /api/settings/online`、`POST /api/settings/online/test`，保存写入 `/data/config.json` 的 `online` 段并热重建。
+- WebUI 改为网关原生页面：`/` 首页（状态/搜索/播放/下载）、`/settings` 设置页；删除对上游管理台 `/app/fnmusic-ext/*` 的反代。
+- `/healthz` 的 `fallback`、`webui` 字段替换为 `online:{enabled,platforms,deps,error}`；`/api/sources` 返回内置平台状态。
+- `GW_FALLBACK_*` 从高级设置移除，替换为 `GW_ONLINE_*` 系列（默认值写入 compose）。
+- Dockerfile / Dockerfile.debian 改为 python:3.12-slim，安装 `musicdl==2.14.2`、`httpx`、`curl_cffi`、`ffmpeg`。
+- 版本 2.7.0 → **2.8.0**；测试 93 → **92 个用例**（删除 WebUI 反代/兜底音源用例，新增原生首页与在线音源设置用例）。
+
 ## 2.7.0 (2026-11-21)
 
 ### 新功能：音乐直链返回总时长与歌词

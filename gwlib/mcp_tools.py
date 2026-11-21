@@ -73,7 +73,7 @@ def build_tools():
         },
         {
             "name": "music_sources",
-            "description": "查看在线兜底音源及健康状态（飞牛音乐的连接状态见网关设置页）。",
+            "description": "查看内置在线音源平台及健康状态（飞牛音乐的连接状态见网关设置页）。",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {

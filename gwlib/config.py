@@ -10,8 +10,9 @@ import threading
 
 FIELDS = {
     "fnos": ("base", "username", "password", "device_id", "insecure_tls"),
-    # 兜底在线音源，逗号分隔的 type@url 列表
-    "fallback": ("urls",),
+    # 内置在线音源（musicdl）
+    "online": ("enabled", "platforms", "extra_platforms", "search_limit",
+               "timeout", "total_limit", "total_timeout"),
     # 网页「高级设置」写入的运行参数（值统一按字符串保存）
     "advanced": (
         "quality_default", "max_limit", "preview_min_seconds", "url_ttl",

@@ -257,12 +257,15 @@ class FallbackProvider:
     传入 base 时保持旧行为：本地曲库优先，本地不足再并行问在线音源补齐。
     """
 
-    def __init__(self, base, urls, timeout=8, search_limit=10,
+    def __init__(self, base, urls=None, timeout=8, search_limit=10,
                  download_dir_getter=None, parallel=True,
-                 max_bytes=0, total_limit=50, total_timeout=15):
+                 max_bytes=0, total_limit=50, total_timeout=15, exts=None):
         self.base = base
-        self.exts = [ExtProvider(url, svc, timeout=timeout) for svc, url in
-                     (parse_spec(spec) for spec in urls)]
+        if exts is not None:
+            self.exts = list(exts)
+        else:
+            self.exts = [ExtProvider(url, svc, timeout=timeout) for svc, url in
+                         (parse_spec(spec) for spec in (urls or []))]
         self.search_limit = max(1, int(search_limit or 10))
         self.parallel = parallel
         self.total_limit = max(1, int(total_limit or 50))
@@ -393,10 +396,29 @@ class FallbackProvider:
     def download_ext(self, track, quality=None):
         return self.library.save_from_provider(self, track, quality=quality)
 
+    def close(self):
+        """释放内置音源的 worker 子进程等资源。"""
+        for ext in self.exts:
+            close_fn = getattr(ext, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
     def status(self):
         out = []
         for ext in self.exts:
-            out.append({"source": ext.svc, "url": ext.base, "healthy": ext.health()})
+            status_fn = getattr(ext, "status", None)
+            if callable(status_fn):
+                try:
+                    out.extend(status_fn() or [])
+                    continue
+                except Exception:
+                    pass
+            out.append({"source": getattr(ext, "svc", "online"),
+                        "url": getattr(ext, "base", ""),
+                        "healthy": bool(ext.health())})
         return out
 
 

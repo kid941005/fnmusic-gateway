@@ -1642,7 +1642,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.3")
+        self.assertEqual(app.VERSION, "2.13.4")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

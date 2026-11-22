@@ -1237,20 +1237,28 @@ def resolve_playlist(p, name):
 
 
 def resolve_artist(p, name):
-    items = getattr(p, "artist_items", None)
-    if callable(items):
-        candidates = items()
-    else:
-        candidates = [{"guid": str(x), "name": str(x)} for x in (p.artists(200) or [])]
+    try:
+        items = getattr(p, "artist_items", None)
+        if callable(items):
+            candidates = items()
+        else:
+            candidates = [{"guid": str(x), "name": str(x)} for x in (p.artists(200) or [])]
+    except Exception as exc:
+        LOG.debug("artist list unavailable: %s", exc)
+        return None
     return _match_named(candidates, name)
 
 
 def resolve_album(p, name):
-    items = getattr(p, "album_items", None)
-    if callable(items):
-        candidates = items()
-    else:
-        candidates = [{"guid": str(x), "name": str(x)} for x in (p.albums(200) or [])]
+    try:
+        items = getattr(p, "album_items", None)
+        if callable(items):
+            candidates = items()
+        else:
+            candidates = [{"guid": str(x), "name": str(x)} for x in (p.albums(200) or [])]
+    except Exception as exc:
+        LOG.debug("album list unavailable: %s", exc)
+        return None
     return _match_named(candidates, name)
 
 

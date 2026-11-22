@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.12.0**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.12.1**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 

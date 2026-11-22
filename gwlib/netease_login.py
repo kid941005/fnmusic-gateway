@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,7 +25,6 @@ _HEADERS = {
     ),
     "Referer": "https://music.163.com/",
     "Accept": "application/json, text/plain, */*",
-    "Cookie": "os=pc",
 }
 
 
@@ -54,26 +54,57 @@ def _cookies_from_response(jar, headers):
     return cookies
 
 
+_LOCK = threading.RLock()
+_OPENER = None
+_COOKIE_JAR = None
+_WARMED = False
+
+
+def _opener():
+    global _OPENER, _COOKIE_JAR
+    if _OPENER is None:
+        _COOKIE_JAR = CookieJar()
+        _OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
+    return _OPENER
+
+
+def _warm_session(opener, timeout=QR_TIMEOUT):
+    """先访问一次网易云首页，避免 unikey 接口被误判为异常网络环境。"""
+    global _WARMED
+    if _WARMED:
+        return
+    try:
+        req = urllib.request.Request("https://music.163.com/", headers=_HEADERS)
+        with opener.open(req, timeout=timeout) as resp:
+            resp.read(1024)
+        _WARMED = True
+    except Exception:
+        # 首页预热失败时仍继续请求 unikey，由 unikey 返回明确错误
+        pass
+
+
 def _request_json(url, timeout=QR_TIMEOUT):
     """GET 一个 JSON 接口，返回 (payload, cookies)。"""
+    opener = _opener()
     req = urllib.request.Request(url, headers=_HEADERS)
-    jar = CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            raw = resp.read()
-            headers = resp.headers
-    except urllib.error.HTTPError as exc:
-        raise NeteaseLoginError("网易云接口返回 HTTP %s" % exc.code) from exc
-    except Exception as exc:
-        raise NeteaseLoginError("连接网易云失败：%s" % exc) from exc
+    with _LOCK:
+        _warm_session(opener, timeout=timeout)
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+                headers = resp.headers
+        except urllib.error.HTTPError as exc:
+            raise NeteaseLoginError("网易云接口返回 HTTP %s" % exc.code) from exc
+        except Exception as exc:
+            raise NeteaseLoginError("连接网易云失败：%s" % exc) from exc
+        cookies = _cookies_from_response(_COOKIE_JAR, headers)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         raise NeteaseLoginError("网易云接口返回非 JSON") from exc
     if not isinstance(payload, dict):
         raise NeteaseLoginError("网易云接口返回格式异常")
-    return payload, _cookies_from_response(jar, headers)
+    return payload, cookies
 
 
 def qr_svg(content):

@@ -1,5 +1,5 @@
 # ============================================================================
-# fnmusic-gateway 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
+# fnmusic-gateway 2.13.6 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
 #
 # 只发布 1 个宿主机端口 8766：
 #   浏览器 → http://NAS_IP:8766/          原生首页与设置页
@@ -37,10 +37,23 @@ services:
       GW_ONLINE_TOTAL_LIMIT: "${GW_ONLINE_TOTAL_LIMIT:-50}"
       GW_ONLINE_TOTAL_TIMEOUT: "${GW_ONLINE_TOTAL_TIMEOUT:-40}"
 
+      # 2.13.0+ 快速返回预算：MCP 搜索最多等几秒、本地库搜索超时几秒
+      GW_MCP_SEARCH_BUDGET: "${GW_MCP_SEARCH_BUDGET:-8}"
+      GW_FNOS_SEARCH_TIMEOUT: "${GW_FNOS_SEARCH_TIMEOUT:-5}"
+
       # 飞牛音乐（可选）：也可以启动后在网页「设置」里填，网页填的值优先
       GW_FNOS_BASE: "${GW_FNOS_BASE:-}"
       GW_FNOS_USER: "${GW_FNOS_USER:-}"
       GW_FNOS_PASS: "${GW_FNOS_PASS:-}"
+    # 若容器访问飞牛域名失败（Docker NAT + 公网回环），取消注释并改成 NAS 内网 IP：
+    # extra_hosts:
+    #   - "fn.hqgg.top:192.168.50.100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     volumes:
       - ./data:/data                     # 配置、签名密钥、缓存、歌词、飞牛 token、musicdl 临时文件
       - "${GW_MUSIC_DIR:-./music}:/music"   # 本地下载目录（宿主机目录可改）
@@ -60,6 +73,7 @@ services:
       MCP_ENDPOINT: "${MCP_ENDPOINT:-}"                           # 小智接入点地址；留空会一直重连（不影响网关）
       GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"                # 容器内直连网关
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"
+      GW_CONCURRENCY: "${GW_CONCURRENCY:-4}"      # 桥接器同时转发的小智请求数
 
 networks:
   fnmusic:

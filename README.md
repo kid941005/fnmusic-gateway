@@ -174,6 +174,7 @@ docker compose up -d
 | `GW_TRANSCODE_CONCURRENCY` | 2 | 同时转码数上限，防止多设备点播把宿主机 CPU 打满 |
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
 | `GW_MCP_TIMEOUT` | 300 | 网关转发到官方 MCPServer 内部回环服务的超时（秒） |
+| `GW_MCP_SEARCH_BUDGET` | 8 | MCP `music_search` 最多等待秒数；到点先返回已搜到的结果，避免小智端超时 |
 | `GW_ADMIN_TOKEN` | 空=不鉴权 | 管理令牌；设置后除 `/play/`、`/lyrics/`、`/healthz` 外的接口都要带 `X-Admin-Token` 或 `Authorization: Bearer`。WebUI 打开 `/` 会跳登录页，密码即令牌；也兼容 `?token=` 换取 Cookie |
 
 ### 飞牛音乐（可选，优先级最高）
@@ -185,6 +186,7 @@ docker compose up -d
 | `GW_FNOS_PASS` | 空 | 登录密码（仅本地保存） |
 | `GW_FNOS_DEVICE_ID` | 空 | 设备 ID，可留空 |
 | `GW_FNOS_TIMEOUT` | 12 | 飞牛接口超时（秒） |
+| `GW_FNOS_SEARCH_TIMEOUT` | 5 | 飞牛本地搜索超时（秒）；超时后跳过本地库、继续返回在线结果 |
 | `GW_FNOS_INSECURE_TLS` | 0 | 1=内网自签 HTTPS 不校验证书 |
 
 网页保存的值（`/data/config.json`）优先于以上环境变量；这些变量只作首次启动默认值。
@@ -292,6 +294,8 @@ docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list ->
 ~~~
 
 不填 `MCP_ENDPOINT` 时桥接器会一直重连、不影响网关本体。
+
+桥接器默认并发处理 4 个小智请求（`GW_CONCURRENCY`，2.13.0+），慢工具不会阻塞后续请求；需要更高吞吐可在 compose 里调大。
 
 接入点会把同一 token 下所有工具端的工具**合并**成一张表，所以：
 

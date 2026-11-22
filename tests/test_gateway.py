@@ -656,6 +656,41 @@ class TestFnSettings(Base):
         self.assertEqual(body["results"][0]["count"], 3)
         self.assertTrue(made and made[0].closed)
 
+    def test_settings_online_qr_login_saves_cookie(self):
+        old_start = app.netease_login.start_qr
+        old_poll = app.netease_login.poll_qr
+
+        def fake_start():
+            return {"key": "abc123", "qr_content": "https://music.163.com/login?codekey=abc123",
+                    "qr_svg": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", "expires_in": 300}
+
+        def fake_poll(key):
+            self.assertEqual(key, "abc123")
+            return {"status": "success", "code": 803, "message": "登录成功",
+                    "cookie": "MUSIC_U=qr-cookie; __csrf=csrf-x"}
+
+        app.netease_login.start_qr = fake_start
+        app.netease_login.poll_qr = fake_poll
+        try:
+            r, body = self.req("POST", "/api/settings/online/qr", body={}, headers=self._h())
+            self.assertEqual(r.status, 200)
+            self.assertEqual(body["key"], "abc123")
+            self.assertIn("qr_svg", body)
+            r, body = self.req("GET", "/api/settings/online/qr?key=abc123", headers=self._h())
+            self.assertEqual(r.status, 200)
+            self.assertEqual(body["status"], "success")
+            self.assertTrue(body["netease_cookie_set"])
+            self.assertNotIn("qr-cookie", json.dumps(body, ensure_ascii=False))
+            self.assertEqual(app.FNOS_CONFIG.section("online").get("netease_cookie"),
+                             "MUSIC_U=qr-cookie; __csrf=csrf-x")
+        finally:
+            app.netease_login.start_qr = old_start
+            app.netease_login.poll_qr = old_poll
+
+    def test_settings_online_qr_requires_key(self):
+        r, _ = self.req("GET", "/api/settings/online/qr", headers=self._h())
+        self.assertEqual(r.status, 400)
+
 
 class TestNeteaseCookie(unittest.TestCase):
     """网易云 MUSIC_U Cookie：解析与传入 musicdl 客户端配置。"""
@@ -1466,7 +1501,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.11.0")
+        self.assertEqual(app.VERSION, "2.12.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

@@ -62,6 +62,7 @@ from gwlib.config import ConfigStore
 from gwlib.settings_page import SETTINGS_HTML
 from gwlib.home_page import HOME_HTML
 from gwlib.login_page import login_html
+from gwlib import netease_login
 from fnmusic_client import normalize_base
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -868,6 +869,18 @@ def _clean_netease_cookie(value):
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
         raise BadRequest("网易云 MUSIC_U Cookie 含非法控制字符")
     return text
+
+
+def save_netease_cookie(cookie):
+    """保存扫码登录得到的 MUSIC_U，并重建在线音源。"""
+    text = _clean_netease_cookie(cookie)
+    if not text:
+        raise BadRequest("扫码登录未返回可保存的 MUSIC_U")
+    if "MUSIC_U=" not in text:
+        raise BadRequest("扫码登录结果缺少 MUSIC_U")
+    FNOS_CONFIG.update("online", {"netease_cookie": text})
+    reset_provider()
+    return True
 
 
 def _online_int(patch, key, low, high, label):
@@ -1816,6 +1829,23 @@ class Handler(BaseHTTPRequestHandler):
             "ms": int((time.time() - started) * 1000),
             "results": results})
 
+    def _handle_online_qr_start(self):
+        # 消费请求体，保持 HTTP keep-alive 正常；只返回 key/二维码，不返回或记录任何 Cookie。
+        self._body()
+        return self._json(netease_login.start_qr())
+
+    def _handle_online_qr_status(self, qs):
+        key = (qs.get("key") or [""])[0].strip()
+        if not key:
+            raise BadRequest("缺少二维码 key")
+        result = netease_login.poll_qr(key)
+        if result.get("status") == "success":
+            cookie = result.pop("cookie", "")
+            save_netease_cookie(cookie)
+            result["netease_cookie_set"] = True
+            LOG.info("网易云扫码登录成功，已保存 MUSIC_U")
+        return self._json(result)
+
     def _handle_root(self, u, qs):
         token = (qs.get("token") or [""])[0]
         if token and ADMIN_TOKEN:
@@ -1916,6 +1946,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_settings_get()
             if path == "/api/settings/online":
                 return self._handle_online_get()
+            if path == "/api/settings/online/qr":
+                return self._handle_online_qr_status(qs)
             if path == "/api/settings/advanced":
                 return self._handle_advanced_get()
             if path == "/readyz":
@@ -2004,6 +2036,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_settings_logout()
             if u.path == "/api/settings/online/test":
                 return self._handle_online_test()
+            if u.path == "/api/settings/online/qr":
+                return self._handle_online_qr_start()
             if u.path == "/mcp":
                 return self._handle_mcp()
             if u.path == "/api/favorite":

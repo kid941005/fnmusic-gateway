@@ -63,6 +63,12 @@ input[type=text],input[type=password],input[type=number]{background:#0e1526;bord
   <div class="field" style="margin-top:12px"><label>附加平台（可选，逗号分隔的 musicdl MusicClient 类名）</label><input id="extra_platforms" type="text" placeholder="例如 QQMusicClient,BilibiliMusicClient"></div>
   <div class="field"><label>网易云 MUSIC_U Cookie（可选，留空不修改）</label><input id="netease_cookie" type="password" autocomplete="off" placeholder="粘贴 MUSIC_U=... 或整段 Cookie"></div>
   <label class="check" style="margin-bottom:12px"><input id="clear_netease_cookie" type="checkbox"> 清除已保存的网易云 Cookie</label>
+  <div class="field"><label>网易云扫码登录（推荐）</label>
+    <div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
+      <div id="qrBox" style="display:none;background:#fff;padding:6px;border-radius:10px"><img id="qrImg" alt="网易云登录二维码" style="width:180px;height:180px;display:block"></div>
+      <div style="flex:1;min-width:220px"><button class="btn" id="qrStart" type="button">生成登录二维码</button><div class="out" id="qrOut"></div></div>
+    </div>
+  </div>
   <div class="row3">
     <div class="field"><label>单平台搜索条数（≤10）</label><input id="search_limit" type="number" min="1" max="10"></div>
     <div class="field"><label>单平台超时（秒）</label><input id="timeout" type="number" min="3" max="120"></div>
@@ -146,6 +152,28 @@ async function testAll(){
   }catch(e){out('onlineOut','测试失败：'+e.message)}
 }
 
+var qrTimer=null
+function stopQr(){if(qrTimer){clearInterval(qrTimer);qrTimer=null}}
+async function startQr(){
+  stopQr();out('qrOut','获取二维码中…');el('qrBox').style.display='none'
+  try{
+    var d=await post('/api/settings/online/qr',{})
+    if(!d.qr_svg)throw new Error('二维码为空')
+    el('qrImg').src=d.qr_svg;el('qrBox').style.display='block'
+    out('qrOut','请用网易云音乐 App 扫码（二维码约 5 分钟内有效）')
+    var deadline=Date.now()+((d.expires_in||300)*1000)
+    qrTimer=setInterval(async function(){
+      if(Date.now()>deadline){stopQr();out('qrOut','二维码已过期，请重新生成');return}
+      try{var s=await api('/api/settings/online/qr?key='+encodeURIComponent(d.key))
+        if(s.status==='success'){stopQr();el('qrBox').style.display='none';await loadOnline();out('qrOut','登录成功，网易云 Cookie 已保存')}
+        else if(s.status==='expired'){stopQr();out('qrOut','二维码已过期，请重新生成')}
+        else out('qrOut',s.message||'等待扫码…')
+      }catch(e){out('qrOut','查询失败：'+e.message)}
+    },2000)
+  }catch(e){out('qrOut','生成失败：'+e.message)}
+}
+window.addEventListener('beforeunload',stopQr)
+
 async function loadAdvanced(){
   try{var d=await api('/api/settings/advanced');var html=''
     Object.keys(d).forEach(function(k){
@@ -169,7 +197,7 @@ async function saveAdvanced(){
   }catch(e){out('advOut','保存失败：'+e.message)}
 }
 
-el('save').onclick=saveFnos;el('onlineSave').onclick=saveOnline;el('onlineTest').onclick=testAll;el('advSave').onclick=saveAdvanced
+el('save').onclick=saveFnos;el('onlineSave').onclick=saveOnline;el('onlineTest').onclick=testAll;el('qrStart').onclick=startQr;el('advSave').onclick=saveAdvanced
 loadFnos();loadOnline();loadAdvanced()
 </script>
 </body>

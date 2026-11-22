@@ -11,7 +11,7 @@ COPY gwlib/ ./gwlib/
 COPY bridge/ ./bridge/
 
 # 内置在线音源（musicdl）与 MCP 桥接器依赖
-RUN pip install --no-cache-dir "musicdl==2.14.2" "httpx>=0.27" "curl_cffi>=0.16" "websockets>=13" "mcp>=2.3,<3"
+RUN pip install --no-cache-dir "musicdl==2.14.2" "httpx>=0.27" "curl_cffi>=0.16" "websockets>=13" "mcp>=2.3,<3" "qrcode>=8,<9"
 
 ENV PYTHONUNBUFFERED=1 \
     GW_DATA=/data \

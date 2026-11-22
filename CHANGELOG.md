@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2.12.0 (2026-11-22)
+
+### 新增：网易云扫码登录
+- WebUI「设置 → 在线音源」新增「生成登录二维码」：手机网易云音乐 App 扫码并在手机确认后，网关自动保存 `MUSIC_U`（必要时含 `__csrf`）到 `/data/config.json`（0600），并重建在线音源。
+- 新增 `POST /api/settings/online/qr` 获取二维码（unikey + SVG data URL），`GET /api/settings/online/qr?key=` 轮询扫码状态；支持等待扫码、已扫码待确认、成功、过期。
+- 扫码结果不回传 Cookie 明文，日志不打印；仍保留手动粘贴 Cookie 与「清除 Cookie」选项。Dockerfile 增加 `qrcode` 依赖。
+- 版本 2.11.0 → **2.12.0**；测试 **117 个用例**（新增扫码接口启动、轮询成功保存 Cookie、缺少 key 校验）。
+
 ## 2.11.0 (2026-11-22)
 
 ### 新增：网易云 MUSIC_U Cookie 配置

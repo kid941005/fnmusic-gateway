@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.13.1**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.2**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -488,7 +488,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 125 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放，全离线（mock）
+python tests/test_gateway.py -v   # 129 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 

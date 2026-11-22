@@ -34,6 +34,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import subprocess
@@ -1112,18 +1113,66 @@ class _LazyProvider:
 
 
 # ---------------------------------------------------------------- 选曲
+_PLAYLIST_NOISE = (
+    "歌单", "列表", "播放", "随机", "随便", "随意", "音乐", "歌曲",
+    "帮我", "请", "一下", "我想", "想听", "听听", "来点", "点播", "全部",
+)
+
+
+def _playlist_core(name):
+    """把「播放儿歌歌单」「随机听睡前」这类口语化成可比较的核心名。"""
+    out = _norm_text(name)
+    for word in _PLAYLIST_NOISE:
+        out = out.replace(word, "")
+    return out
+
+
+def playlist_match_score(query, name):
+    """给多个歌单名打分，优先精确名/核心名，其次包含关系和相似度。"""
+    q_raw, n_raw = _norm_text(query), _norm_text(name)
+    if not q_raw or not n_raw:
+        return 0
+    if q_raw == n_raw:
+        return 1000
+    q, n = _playlist_core(query), _playlist_core(name)
+    if q and q == n:
+        return 950
+    if q and n and (q in n or n in q):
+        shorter, longer = sorted((len(q), len(n)))
+        return 800 + int(100 * shorter / max(1, longer))
+    for a, b in ((q, n), (q_raw, n_raw)):
+        if not a or not b:
+            continue
+        ratio = difflib.SequenceMatcher(None, a, b).ratio()
+        if ratio >= 0.6:
+            return int(600 * ratio)
+    return 0
+
+
 def resolve_playlist(p, name):
+    """在多歌单中选最匹配的一个，避免「儿歌」误中「儿歌大全」等。"""
     key = (name or "").strip()
     if not key:
         return None
-    pls = p.playlists()
-    for pl in pls:
-        if pl["name"] == key:
-            return pl
-    for pl in pls:
-        if key in pl["name"] or pl["name"] in key:
-            return pl
+    best, best_score = None, 0
+    for pl in p.playlists() or []:
+        score = playlist_match_score(key, pl.get("name") or "")
+        if score > best_score or (
+                score == best_score and best is not None and
+                len(str(pl.get("name") or "")) < len(str(best.get("name") or ""))):
+            best, best_score = pl, score
+    if best_score >= 480:
+        if _norm_text(key) != _norm_text(best.get("name") or ""):
+            LOG.info("歌单匹配：%s -> %s（score=%d）", key, best.get("name"), best_score)
+        return best
     return None
+
+
+def shuffle_tracks(tracks):
+    out = [t for t in (tracks or []) if isinstance(t, dict)]
+    if len(out) > 1:
+        random.shuffle(out)
+    return out
 
 
 def pick_tracks(p, query="", playlist="", limit=10):
@@ -1162,7 +1211,7 @@ def make_playlist_url(base, token, ttl=None, quality=None):
         urllib.parse.quote(q, safe=""))
 
 
-def build_playlist_info(p, tracks, label, base, quality=None):
+def build_playlist_info(p, tracks, label, base, quality=None, action="连续播放"):
     """把多首曲目登记为一个连续播放流，返回给设备的直链信息。"""
     rows = [t for t in (tracks or []) if isinstance(t, dict) and t.get("guid")]
     if not rows:
@@ -1195,7 +1244,7 @@ def build_playlist_info(p, tracks, label, base, quality=None):
         "device_args": {"url": url, "title": label or "连续播放", "artist": "",
                         "lyric_url": "", "duration": int(round(total_s)) if total_s else 0},
         "device_tool": "self.music.play_url",
-        "spoken": "正在连续播放%s" % (label or "歌单"),
+        "spoken": "正在%s%s" % (action, label or "歌单"),
     }
 
 
@@ -1454,34 +1503,67 @@ def _tool_music_favorites(args, p, base, limit, quality):
     return "收藏 %d 首：\n%s" % (len(rows), fmt_tracks(rows, limit))
 
 
+_FAVORITE_PHRASES = ("收藏", "我的收藏", "收藏夹", "收藏列表", "收藏的歌单",
+                    "收藏歌曲", "我收藏的歌单", "收藏音乐")
+
+
+def _wants_favorites(text):
+    n = _norm_text(text)
+    if not n:
+        return False
+    if n in tuple(_norm_text(x) for x in _FAVORITE_PHRASES):
+        return True
+    return "收藏" in n and any(w in n for w in ("歌单", "列表", "歌曲", "音乐"))
+
+
+def _wants_shuffle(text):
+    n = _norm_text(text)
+    return any(w in n for w in ("随机", "随便", "随意", "shuffle", "random"))
+
+
 def _tool_music_play(args, p, base, limit, quality):
     guid = str(args.get("guid") or "").strip()
     playlist = str(args.get("playlist") or "").strip()
+    query_text = str(args.get("query") or "").strip()
     fav_raw = args.get("favorites")
-    favorites = str(fav_raw).strip().lower() in ("1", "true", "yes", "on") if fav_raw is not None else False
-    if playlist.strip().lower() in ("收藏", "我的收藏", "收藏夹", "收藏的歌单"):
+    favorites = _truthy(fav_raw)
+    shuffle = _truthy(args.get("shuffle")) or _truthy(args.get("random"))
+    if playlist and _wants_favorites(playlist):
+        shuffle = shuffle or _wants_shuffle(playlist)
         favorites, playlist = True, ""
+    if not guid and not playlist and query_text and _wants_favorites(query_text) and _wants_shuffle(query_text):
+        shuffle = True
+        favorites, query_text = True, ""
+    if _wants_shuffle(playlist) or _wants_shuffle(query_text):
+        shuffle = True
     if favorites or playlist:
         if favorites:
             rows, label = p.favorites(200), "收藏"
         else:
             pl = resolve_playlist(p, playlist)
             if not pl:
-                raise BadRequest("没有找到歌单「%s」" % playlist)
+                names = "、".join(str(x.get("name") or "") for x in (p.playlists() or [])[:8])
+                raise BadRequest("没有找到歌单「%s」%s" % (playlist, ("，现有：" + names) if names else ""))
             rows = p.playlist_tracks(pl["guid"], 500)
             label = "歌单「%s」" % pl["name"]
-        start = max(0, _to_int(args.get("index"), 1) - 1)
-        rows = rows[start:]
+        if shuffle:
+            rows = shuffle_tracks(rows)
+            start = 0
+            action = "随机播放"
+        else:
+            start = max(0, _to_int(args.get("index"), 1) - 1)
+            rows = rows[start:]
+            action = "连续播放"
         if not rows:
             raise BadRequest("列表里没有可播放的歌曲")
-        info = build_playlist_info(p, rows, label, base, quality)
+        info = build_playlist_info(p, rows, label, base, quality, action=action)
         total = len(rows)
-        return ("准备连续播放：%s，从第 %d 首开始，共 %d 首\n"
+        return ("准备%s：%s，%s，共 %d 首\n"
                 "直链（%d 分钟内有效）：%s\n"
                 "整条歌单预计 %d 秒\n"
                 "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
                 "artist 留空，lyric_url 留空，duration 填 %d。"
-                % (label, start + 1, total,
+                % (action, label, ("随机顺序" if shuffle else "从第 %d 首开始" % (start + 1)), total,
                    max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
                    int(info.get("duration") or 0), info["title"],
                    int(info.get("duration") or 0)))
@@ -1498,8 +1580,7 @@ def _tool_music_play(args, p, base, limit, quality):
                 track.update({k: v for k, v in found.items() if v})
         label, idx, total = "按 guid", 1, 1
     else:
-        rows, label = pick_tracks(p, str(args.get("query") or ""),
-                                  str(args.get("playlist") or ""), 20)
+        rows, label = pick_tracks(p, query_text, playlist, 20)
         idx = _to_int(args.get("index"), 1)
         if idx < 1 or idx > len(rows):
             raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))

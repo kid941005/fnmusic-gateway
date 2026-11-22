@@ -1575,13 +1575,55 @@ class TestOptim213(unittest.TestCase):
         with open(out, "rb") as fh:
             self.assertEqual(fh.read(3), b"ID3")
 
+    def test_resolve_playlist_picks_best_name_among_many(self):
+        class P:
+            def playlists(self):
+                return [{"guid": "p2", "name": "儿歌大全"},
+                        {"guid": "p1", "name": "儿歌"},
+                        {"guid": "p3", "name": "睡前"}]
+
+        self.assertEqual(app.resolve_playlist(P(), "播放儿歌歌单")["guid"], "p1")
+        self.assertEqual(app.resolve_playlist(P(), "儿歌大全")["guid"], "p2")
+        self.assertEqual(app.resolve_playlist(P(), "随便听听睡前")["guid"], "p3")
+
+    def test_music_play_favorites_shuffle_reorders_tracks(self):
+        from unittest import mock
+        with mock.patch.object(app.random, "shuffle", side_effect=lambda xs: xs.reverse()):
+            out = app.call_tool("music_play", {"favorites": True, "shuffle": True}, "http://h")
+        self.assertIn("随机播放", out)
+        self.assertIn("随机顺序", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        token = urllib.parse.urlparse(url).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        item = app.PLAYLISTS.get(token)
+        self.assertEqual([t["guid"] for t in item["tracks"]], ["mock-5", "mock-1"])
+
+    def test_music_play_natural_random_favorites_phrase(self):
+        from unittest import mock
+        with mock.patch.object(app.random, "shuffle", side_effect=lambda xs: xs.reverse()):
+            out = app.call_tool("music_play", {"playlist": "随机播放收藏的歌单"}, "http://h")
+        self.assertIn("随机播放", out)
+        self.assertIn("收藏", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        token = urllib.parse.urlparse(url).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        self.assertEqual(len(app.PLAYLISTS.get(token)["tracks"]), 2)
+
+    def test_music_play_playlist_shuffle_reorders_tracks(self):
+        from unittest import mock
+        with mock.patch.object(app.random, "shuffle", side_effect=lambda xs: xs.reverse()):
+            out = app.call_tool("music_play", {"playlist": "睡前", "shuffle": True}, "http://h")
+        self.assertIn("随机播放", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        token = urllib.parse.urlparse(url).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        self.assertEqual([t["guid"] for t in app.PLAYLISTS.get(token)["tracks"]],
+                         ["mock-6", "mock-5"])
+
 
 class TestRelease201(unittest.TestCase):
     """2.0.1：流式落盘、弱引用锁、单版本常量、搜索总上限/总超时。"""
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.1")
+        self.assertEqual(app.VERSION, "2.13.2")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

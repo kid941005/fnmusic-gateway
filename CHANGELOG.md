@@ -4,6 +4,10 @@
 
 ### 测试：补充 MCP chunked 请求体超限回归
 - 新增 `test_mcp_rejects_oversized_chunked_body`：临时调小 `MCP_BODY_CAP` 后发送超限 chunked 请求，断言返回 413 与 `payload too large`，防止 chunked 解析与错误映射退化。
+
+### 文档与部署
+- README 更新到 2.13.6，环境变量表补充 `GW_MCP_SEARCH_BUDGET`（默认 8）、`GW_FNOS_SEARCH_TIMEOUT`（默认 5）与桥接器 `GW_CONCURRENCY`（默认 4）。
+- `docker-compose.yml` 与部署包 compose 增加上述参数默认值、网关 healthcheck 和可选 `extra_hosts` 示例；部署包 README 补充可选调优说明。
 - 版本 2.13.5 → **2.13.6**；测试 **145 个用例**。
 
 ## 2.13.5 (2026-11-22)

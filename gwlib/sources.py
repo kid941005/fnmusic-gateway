@@ -313,6 +313,30 @@ class FallbackProvider:
     def artists(self, limit=20):
         return self._local().artists(limit)
 
+    def artist_items(self, limit=200):
+        fn = getattr(self._local(), "artist_items", None)
+        if callable(fn):
+            return fn(limit)
+        return [{"guid": str(x), "name": str(x)} for x in (self._local().artists(limit) or [])]
+
+    def album_items(self, limit=200):
+        fn = getattr(self._local(), "album_items", None)
+        if callable(fn):
+            return fn(limit)
+        return [{"guid": str(x), "name": str(x)} for x in (self._local().albums(limit) or [])]
+
+    def artist_tracks(self, guid, limit=500):
+        fn = getattr(self._local(), "artist_tracks", None)
+        if not callable(fn):
+            raise BadRequest("当前本地后端不支持按歌手播放")
+        return fn(guid, limit)
+
+    def album_tracks(self, guid, limit=500):
+        fn = getattr(self._local(), "album_tracks", None)
+        if not callable(fn):
+            raise BadRequest("当前本地后端不支持按专辑播放")
+        return fn(guid, limit)
+
     def favorites(self, limit=100):
         return self._local().favorites(limit)
 

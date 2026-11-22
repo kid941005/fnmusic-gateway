@@ -1586,6 +1586,25 @@ class TestOptim213(unittest.TestCase):
         self.assertEqual(app.resolve_playlist(P(), "儿歌大全")["guid"], "p2")
         self.assertEqual(app.resolve_playlist(P(), "随便听听睡前")["guid"], "p3")
 
+    def test_music_play_artist_returns_continuous_stream(self):
+        out = app.call_tool("music_play", {"artist": "周杰伦"}, "http://h")
+        self.assertIn("歌手「周杰伦」", out)
+        self.assertIn("共 2 首", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        token = urllib.parse.urlparse(url).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        self.assertEqual([t["guid"] for t in app.PLAYLISTS.get(token)["tracks"]],
+                         ["mock-1", "mock-2"])
+
+    def test_music_play_album_returns_continuous_stream(self):
+        out = app.call_tool("music_play", {"album": "叶惠美"}, "http://h")
+        self.assertIn("专辑「叶惠美」", out)
+        self.assertIn("共 1 首", out)
+
+    def test_music_play_query_artist_name_auto_plays_artist(self):
+        out = app.call_tool("music_play", {"query": "周杰伦"}, "http://h")
+        self.assertIn("歌手「周杰伦」", out)
+        self.assertIn("共 2 首", out)
+
     def test_music_play_favorites_shuffle_reorders_tracks(self):
         from unittest import mock
         with mock.patch.object(app.random, "shuffle", side_effect=lambda xs: xs.reverse()):
@@ -1623,7 +1642,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.2")
+        self.assertEqual(app.VERSION, "2.13.3")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

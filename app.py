@@ -454,6 +454,26 @@ def norm_playlist(p):
     }
 
 
+def norm_artist(p):
+    if not isinstance(p, dict):
+        return {"guid": str(p), "name": str(p), "count": 0}
+    return {
+        "guid": str(_first(p, "guid", "artistGuid", "artistGUID", "artistId", "id")),
+        "name": str(_first(p, "name", "title", "artistName")),
+        "count": _to_int(_first(p, "trackCount", "count", "songCount", default=0)),
+    }
+
+
+def norm_album(p):
+    if not isinstance(p, dict):
+        return {"guid": str(p), "name": str(p), "count": 0}
+    return {
+        "guid": str(_first(p, "guid", "albumGuid", "albumGUID", "albumId", "id")),
+        "name": str(_first(p, "name", "title", "albumName")),
+        "count": _to_int(_first(p, "trackCount", "count", "songCount", default=0)),
+    }
+
+
 def fmt_tracks(tracks, limit=10, show_guid=False):
     lines = []
     for i, t in enumerate(tracks[:limit], 1):
@@ -736,6 +756,31 @@ class MockProvider:
     def artists(self, limit=20):
         return ["周杰伦", "陈奕迅", "朴树", "Yiruma"][:limit]
 
+    def artist_items(self, limit=200):
+        return [
+            {"guid": "artist-1", "name": "周杰伦", "count": 2},
+            {"guid": "artist-2", "name": "陈奕迅", "count": 1},
+            {"guid": "artist-3", "name": "朴树", "count": 1},
+            {"guid": "artist-4", "name": "Yiruma", "count": 1},
+        ][:limit]
+
+    def album_items(self, limit=200):
+        return [
+            {"guid": "album-1", "name": "叶惠美", "count": 1},
+            {"guid": "album-2", "name": "十一月的萧邦", "count": 1},
+            {"guid": "album-3", "name": "猎户星座", "count": 1},
+        ][:limit]
+
+    def artist_tracks(self, guid, limit=500):
+        wanted = {"artist-1": "周杰伦", "artist-2": "陈奕迅",
+                  "artist-3": "朴树", "artist-4": "Yiruma"}.get(guid, "")
+        return [t for t in self.TRACKS if t.get("artist") == wanted][:limit]
+
+    def album_tracks(self, guid, limit=500):
+        wanted = {"album-1": "叶惠美", "album-2": "十一月的萧邦",
+                  "album-3": "猎户星座"}.get(guid, "")
+        return [t for t in self.TRACKS if t.get("album") == wanted][:limit]
+
     def favorites(self, limit=100):
         return [self.TRACKS[0], self.TRACKS[4]]
 
@@ -803,6 +848,26 @@ class FnProvider:
     def artists(self, limit=20):
         rows = _rows(self.client.artist_list(1, limit))
         return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
+
+    def artist_items(self, limit=200):
+        return [norm_artist(r) for r in _rows(self.client.artist_list(1, limit))[:limit]
+                if norm_artist(r).get("guid")]
+
+    def album_items(self, limit=200):
+        return [norm_album(r) for r in _rows(self.client.album_list(1, limit))[:limit]
+                if norm_album(r).get("guid")]
+
+    def artist_tracks(self, guid, limit=500):
+        rows = dedupe(norm_track(t) for t in _rows(self.client.artist_tracks(guid, 1, limit)))
+        for row in rows:
+            row["source"] = "local"
+        return rows[:limit]
+
+    def album_tracks(self, guid, limit=500):
+        rows = dedupe(norm_track(t) for t in _rows(self.client.album_tracks(guid, 1, limit)))
+        for row in rows:
+            row["source"] = "local"
+        return rows[:limit]
 
     def favorites(self, limit=100):
         rows = []
@@ -1149,23 +1214,44 @@ def playlist_match_score(query, name):
     return 0
 
 
-def resolve_playlist(p, name):
-    """在多歌单中选最匹配的一个，避免「儿歌」误中「儿歌大全」等。"""
+def _match_named(items, name):
     key = (name or "").strip()
     if not key:
         return None
     best, best_score = None, 0
-    for pl in p.playlists() or []:
-        score = playlist_match_score(key, pl.get("name") or "")
+    for item in items or []:
+        score = playlist_match_score(key, item.get("name") or "")
         if score > best_score or (
                 score == best_score and best is not None and
-                len(str(pl.get("name") or "")) < len(str(best.get("name") or ""))):
-            best, best_score = pl, score
-    if best_score >= 480:
-        if _norm_text(key) != _norm_text(best.get("name") or ""):
-            LOG.info("歌单匹配：%s -> %s（score=%d）", key, best.get("name"), best_score)
-        return best
-    return None
+                len(str(item.get("name") or "")) < len(str(best.get("name") or ""))):
+            best, best_score = item, score
+    return best if best_score >= 480 else None
+
+
+def resolve_playlist(p, name):
+    """在多歌单中选最匹配的一个，避免「儿歌」误中「儿歌大全」等。"""
+    best = _match_named(p.playlists() or [], name)
+    if best and _norm_text(name) != _norm_text(best.get("name") or ""):
+        LOG.info("歌单匹配：%s -> %s", name, best.get("name"))
+    return best
+
+
+def resolve_artist(p, name):
+    items = getattr(p, "artist_items", None)
+    if callable(items):
+        candidates = items()
+    else:
+        candidates = [{"guid": str(x), "name": str(x)} for x in (p.artists(200) or [])]
+    return _match_named(candidates, name)
+
+
+def resolve_album(p, name):
+    items = getattr(p, "album_items", None)
+    if callable(items):
+        candidates = items()
+    else:
+        candidates = [{"guid": str(x), "name": str(x)} for x in (p.albums(200) or [])]
+    return _match_named(candidates, name)
 
 
 def shuffle_tracks(tracks):
@@ -1525,6 +1611,8 @@ def _tool_music_play(args, p, base, limit, quality):
     guid = str(args.get("guid") or "").strip()
     playlist = str(args.get("playlist") or "").strip()
     query_text = str(args.get("query") or "").strip()
+    artist = str(args.get("artist") or "").strip()
+    album = str(args.get("album") or "").strip()
     fav_raw = args.get("favorites")
     favorites = _truthy(fav_raw)
     shuffle = _truthy(args.get("shuffle")) or _truthy(args.get("random"))
@@ -1536,8 +1624,27 @@ def _tool_music_play(args, p, base, limit, quality):
         favorites, query_text = True, ""
     if _wants_shuffle(playlist) or _wants_shuffle(query_text):
         shuffle = True
-    if favorites or playlist:
-        if favorites:
+    # 「播放周杰伦」这类精确歌手名，直接进入歌手整库播放；不精确时仍按搜歌处理。
+    if not guid and not playlist and not artist and not album and not favorites and query_text:
+        hit = resolve_artist(p, query_text)
+        if hit and _norm_text(hit.get("name") or "") == _norm_text(query_text):
+            artist = query_text
+    if favorites or playlist or artist or album:
+        if artist:
+            item = resolve_artist(p, artist)
+            if not item:
+                names = "、".join(str(x.get("name") or "") for x in (getattr(p, "artist_items", lambda: [])() or [])[:8])
+                raise BadRequest("没有找到歌手「%s」%s" % (artist, ("，现有：" + names) if names else ""))
+            rows = p.artist_tracks(item["guid"], 500)
+            label = "歌手「%s」" % item["name"]
+        elif album:
+            item = resolve_album(p, album)
+            if not item:
+                names = "、".join(str(x.get("name") or "") for x in (getattr(p, "album_items", lambda: [])() or [])[:8])
+                raise BadRequest("没有找到专辑「%s」%s" % (album, ("，现有：" + names) if names else ""))
+            rows = p.album_tracks(item["guid"], 500)
+            label = "专辑「%s」" % item["name"]
+        elif favorites:
             rows, label = p.favorites(200), "收藏"
         else:
             pl = resolve_playlist(p, playlist)

@@ -45,18 +45,21 @@ def build_tools():
             "description": ("拿一首歌的可播放直链，同时给出歌名、歌手、歌词直链、总时长（秒）和音质（设备屏显要用）。"
                             "优先传 music_search 返回的 guid（最稳，不会同名播错）；没有 guid 时 query/playlist 二选一，index 从 1 开始。"
                             "playlist 会连续播放整张歌单，favorites=true 会连续播放收藏列表（播完自动结束），不用逐首调用。"
-                            "要随机顺序再加 shuffle=true：随机播放收藏用 favorites=true&shuffle=true，随机播放某歌单用 playlist=歌单名&shuffle=true。"
-                            "歌单名支持模糊匹配：例如「播放儿歌歌单」可传 playlist=儿歌歌单，会匹配到「儿歌」。"
+                            "artist=歌手名 会连续播放飞牛音乐库里这个歌手的全部歌曲；album=专辑名 会连续播放整张专辑。"
+                            "要随机顺序再加 shuffle=true：随机播放收藏用 favorites=true&shuffle=true，随机播放某歌单用 playlist=歌单名&shuffle=true，随机播放某歌手用 artist=歌手名&shuffle=true。"
+                            "歌单/歌手/专辑名支持模糊匹配：例如「播放儿歌歌单」可传 playlist=儿歌歌单，会匹配到「儿歌」。"
                             "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url/duration 五个参数都填上。"),
             "inputSchema": {"type": "object", "properties": {
                 "guid": {"type": "string", "description": "music_search 返回的曲目 guid，优先使用"},
                 "query": {"type": "string"},
                 "playlist": {"type": "string", "description": "歌单名；会连续播放整张歌单"},
+                "artist": {"type": "string", "description": "歌手名；会连续播放飞牛音乐库里该歌手的全部歌曲"},
+                "album": {"type": "string", "description": "专辑名；会连续播放整张专辑"},
                 "favorites": {"type": "boolean", "description": "true=连续播放收藏列表"},
-                "shuffle": {"type": "boolean", "description": "true=随机顺序播放（配合 playlist 或 favorites）"},
+                "shuffle": {"type": "boolean", "description": "true=随机顺序播放（配合 playlist/artist/album/favorites）"},
                 "index": {"type": "integer", "description": "从列表第几首开始，默认 1"},
                 "quality": QUALITY_PROP},
-                "anyOf": [{"required": ["guid"]}, {"required": ["query"]}, {"required": ["playlist"]}, {"required": ["favorites"]}]},
+                "anyOf": [{"required": ["guid"]}, {"required": ["query"]}, {"required": ["playlist"]}, {"required": ["artist"]}, {"required": ["album"]}, {"required": ["favorites"]}]},
         },
         {
             "name": "music_favorite",

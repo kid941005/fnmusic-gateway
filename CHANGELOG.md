@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 2.13.6 (2026-11-22)
+
+### 测试：补充 MCP chunked 请求体超限回归
+- 新增 `test_mcp_rejects_oversized_chunked_body`：临时调小 `MCP_BODY_CAP` 后发送超限 chunked 请求，断言返回 413 与 `payload too large`，防止 chunked 解析与错误映射退化。
+- 版本 2.13.5 → **2.13.6**；测试 **145 个用例**。
+
 ## 2.13.5 (2026-11-22)
 
 ### 修复与稳定性：播放链路评审问题落地

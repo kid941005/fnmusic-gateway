@@ -353,6 +353,34 @@ class TestHttp(Base):
         self.assertIn(b" 200 ", head.split(b"\r\n")[0])
         self.assertIn(b"fnmusic-gateway", body)
 
+    def test_mcp_rejects_oversized_chunked_body(self):
+        old_cap = app.MCP_BODY_CAP
+        app.MCP_BODY_CAP = 64
+        try:
+            payload = (b'{"jsonrpc":"2.0","id":1,"method":"initialize",'
+                       b'"params":{"pad":"' + b"x" * 200 + b'"}}')
+            self.assertGreater(len(payload), app.MCP_BODY_CAP)
+            chunk = ("%x\r\n" % len(payload)).encode() + payload + b"\r\n0\r\n\r\n"
+            s = socket.create_connection(("127.0.0.1", self.port), 10)
+            data = b""
+            try:
+                s.sendall(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                          b"Content-Type: application/json\r\n"
+                          b"Accept: application/json, text/event-stream\r\n"
+                          b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + chunk)
+                while True:
+                    part = s.recv(65536)
+                    if not part:
+                        break
+                    data += part
+            finally:
+                s.close()
+        finally:
+            app.MCP_BODY_CAP = old_cap
+        head, _, body = data.partition(b"\r\n\r\n")
+        self.assertIn(b" 413 ", head.split(b"\r\n")[0])
+        self.assertIn(b"payload too large", body)
+
     def test_unknown_route(self):
         r, _ = self.req("GET", "/playlists", raw=True)
         self.assertEqual(r.status, 404)
@@ -1824,7 +1852,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.5")
+        self.assertEqual(app.VERSION, "2.13.6")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

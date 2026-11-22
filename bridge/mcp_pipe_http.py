@@ -34,8 +34,24 @@ import urllib.request
 
 ENDPOINT = (os.environ.get("MCP_ENDPOINT") or "").strip()
 GW_MCP_URL = (os.environ.get("GW_MCP_URL") or "http://127.0.0.1:8766/mcp").strip()
-GW_TIMEOUT = float(os.environ.get("GW_TIMEOUT") or "120")
-GW_CONCURRENCY = max(1, int(os.environ.get("GW_CONCURRENCY") or "4"))
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+GW_TIMEOUT = max(1.0, _env_float("GW_TIMEOUT", 120))
+GW_CONCURRENCY = max(1, _env_int("GW_CONCURRENCY", 4))
 GW_ADMIN_TOKEN = (os.environ.get("GW_ADMIN_TOKEN") or "").strip()
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 600.0

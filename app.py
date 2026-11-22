@@ -364,19 +364,29 @@ def _load_secret():
 SECRET = _load_secret()
 
 
-def sign(guid, exp):
+def _sign_raw(guid, exp):
     msg = ("%s|%d" % (guid, exp)).encode("utf-8")
     return hmac.new(SECRET, msg, hashlib.sha256).hexdigest()[:40]
 
 
-def verify(guid, exp, sig):
+def sign(guid, exp, quality=None):
+    """签名绑定 guid/过期时间/音质，避免改 URL 的 q 参数越权取高音质。"""
+    q = normalize_quality(quality or QUALITY_DEFAULT)
+    msg = ("%s|%d|%s" % (guid, exp, q)).encode("utf-8")
+    return hmac.new(SECRET, msg, hashlib.sha256).hexdigest()[:40]
+
+
+def verify(guid, exp, sig, quality=None):
     try:
         exp = int(exp)
     except Exception:
         return False
     if exp < int(time.time()):
         return False
-    return hmac.compare_digest(sign(guid, exp), str(sig or ""))
+    given = str(sig or "")
+    # 兼容旧版本已发出的、只签 guid+exp 的 URL（URL_TTL 内平滑升级）。
+    return (hmac.compare_digest(sign(guid, exp, quality), given) or
+            hmac.compare_digest(_sign_raw(guid, exp), given))
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -656,7 +666,7 @@ def fast_search_tracks(p, query, limit=10, budget=None):
     q = (query or "").strip()
     if not q:
         return [], ""
-    fixed, _changed = apply_aliases(q)
+    fixed, changed = apply_aliases(q)
     deadline = time.monotonic() + max(1.0, float(budget or MCP_SEARCH_BUDGET))
     raw = []
     stream = getattr(p, "search_stream", None)
@@ -675,6 +685,12 @@ def fast_search_tracks(p, query, limit=10, budget=None):
             raw.extend(p.search(fixed, max(limit * 3, 20)))
     except Exception as e:
         LOG.warning("fast search %r failed: %s", fixed, e)
+    # 别名生效但结果太少时，用原词补一次，避免别名表写错导致搜不到。
+    if changed and len(raw) < limit and time.monotonic() < deadline:
+        try:
+            raw.extend(p.search(q, max(limit, 10)))
+        except Exception as e:
+            LOG.warning("fast search fallback %r failed: %s", q, e)
     return rank_tracks(fixed, dedupe(raw), limit), fixed
 
 
@@ -849,12 +865,20 @@ class FnProvider:
         rows = _rows(self.client.artist_list(1, limit))
         return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
 
-    def artist_items(self, limit=200):
-        return [norm_artist(r) for r in _rows(self.client.artist_list(1, limit))[:limit]
+    def artist_items(self, limit=200, query=""):
+        if query:
+            data = self.client.search_artist(query, 1, max(1, int(limit or 20)))
+        else:
+            data = self.client.artist_list(1, limit)
+        return [norm_artist(r) for r in _rows(data)[:limit]
                 if norm_artist(r).get("guid")]
 
-    def album_items(self, limit=200):
-        return [norm_album(r) for r in _rows(self.client.album_list(1, limit))[:limit]
+    def album_items(self, limit=200, query=""):
+        if query:
+            data = self.client.search_album(query, 1, max(1, int(limit or 20)))
+        else:
+            data = self.client.album_list(1, limit)
+        return [norm_album(r) for r in _rows(data)[:limit]
                 if norm_album(r).get("guid")]
 
     def artist_tracks(self, guid, limit=500):
@@ -1063,7 +1087,17 @@ def online_status():
     settings = online_settings()
     if not online_active(settings):
         return []
-    return new_native_provider(settings).status()
+    prov = new_native_provider(settings)
+    try:
+        return prov.status()
+    finally:
+        # 这个临时 provider 只用于查状态，必须释放它的线程池/worker 子进程。
+        close_fn = getattr(prov, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                LOG.debug("关闭状态查询 provider 失败", exc_info=True)
 
 
 def online_services():
@@ -1088,25 +1122,44 @@ def gateway_mode():
     return "online" if online else "none"
 
 
+def _close_provider_quietly(prov):
+    close_fn = getattr(prov, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            LOG.debug("关闭 provider 失败", exc_info=True)
+
+
 def reset_provider():
-    """配置变更后丢弃 provider 单例，下一次请求按新配置重建。"""
+    """配置变更后丢弃 provider 单例，下一次请求按新配置重建。
+
+    旧实例可能仍被正在播放/流式的请求持有，不能立刻 close（会中断音频）；
+    先放入退休队列，等新实例稳定或队列过长时再关闭。
+    """
     global _PROVIDER, _PROVIDER_ERR
     old = None
     with _PROVIDER_LOCK:
         old = _PROVIDER
         _PROVIDER = None
         _PROVIDER_ERR = None
-    close_fn = getattr(old, "close", None)
-    if callable(close_fn):
-        try:
-            close_fn()
-        except Exception:
-            LOG.debug("关闭旧 provider 失败", exc_info=True)
+    if old is None:
+        return
+    stale = []
+    with _RETIRED_LOCK:
+        _RETIRED_PROVIDERS.append(old)
+        while len(_RETIRED_PROVIDERS) > _RETIRED_MAX:
+            stale.append(_RETIRED_PROVIDERS.pop(0))
+    for prov in stale:
+        _close_provider_quietly(prov)
 
 
 _PROVIDER = None
 _PROVIDER_ERR = None
 _PROVIDER_LOCK = threading.Lock()
+_RETIRED_PROVIDERS = []
+_RETIRED_LOCK = threading.Lock()
+_RETIRED_MAX = 8
 
 
 def provider():
@@ -1240,26 +1293,47 @@ def resolve_artist(p, name):
     try:
         items = getattr(p, "artist_items", None)
         if callable(items):
-            candidates = items()
+            # 先用搜索接口精确定位，避免每个查询都拉 200 个歌手全表。
+            try:
+                candidates = items(query=name)
+            except TypeError:
+                candidates = items()
         else:
             candidates = [{"guid": str(x), "name": str(x)} for x in (p.artists(200) or [])]
     except Exception as exc:
         LOG.debug("artist list unavailable: %s", exc)
         return None
-    return _match_named(candidates, name)
+    hit = _match_named(candidates, name)
+    if hit or not callable(items):
+        return hit
+    try:
+        return _match_named(items(), name)
+    except Exception as exc:
+        LOG.debug("artist list fallback unavailable: %s", exc)
+        return None
 
 
 def resolve_album(p, name):
     try:
         items = getattr(p, "album_items", None)
         if callable(items):
-            candidates = items()
+            try:
+                candidates = items(query=name)
+            except TypeError:
+                candidates = items()
         else:
             candidates = [{"guid": str(x), "name": str(x)} for x in (p.albums(200) or [])]
     except Exception as exc:
         LOG.debug("album list unavailable: %s", exc)
         return None
-    return _match_named(candidates, name)
+    hit = _match_named(candidates, name)
+    if hit or not callable(items):
+        return hit
+    try:
+        return _match_named(items(), name)
+    except Exception as exc:
+        LOG.debug("album list fallback unavailable: %s", exc)
+        return None
 
 
 def shuffle_tracks(tracks):
@@ -1293,7 +1367,7 @@ def make_url(base, guid, ttl=None, quality=None):
     g = urllib.parse.quote(guid, safe="")
     q = normalize_quality(quality or QUALITY_DEFAULT)
     return "%s/play/%s.mp3?exp=%d&sig=%s&q=%s" % (
-        base, g, exp, sign(guid, exp), urllib.parse.quote(q, safe=""))
+        base, g, exp, sign(guid, exp, q), urllib.parse.quote(q, safe=""))
 
 
 def make_playlist_url(base, token, ttl=None, quality=None):
@@ -1301,7 +1375,7 @@ def make_playlist_url(base, token, ttl=None, quality=None):
     guid = "pl:" + str(token)
     q = normalize_quality(quality or QUALITY_DEFAULT)
     return "%s/playlist/%s.mp3?exp=%d&sig=%s&q=%s" % (
-        base, urllib.parse.quote(str(token), safe=""), exp, sign(guid, exp),
+        base, urllib.parse.quote(str(token), safe=""), exp, sign(guid, exp, q),
         urllib.parse.quote(q, safe=""))
 
 
@@ -1346,8 +1420,15 @@ def with_web_url(info):
     """给 WebUI 的同源播放地址，避免 PUBLIC_BASE 与当前访问主机不一致导致播放失败。"""
     out = dict(info)
     try:
-        out["web_url"] = make_url("", out.get("guid") or "",
-                                  ttl=out.get("expires_in"), quality=out.get("quality"))
+        guid = str(out.get("guid") or "")
+        if guid.startswith("pl:"):
+            # 连续播放列表要用 /playlist 流，不能当成普通单曲 /play。
+            out["web_url"] = make_playlist_url("", guid[3:],
+                                               ttl=out.get("expires_in"),
+                                               quality=out.get("quality"))
+        else:
+            out["web_url"] = make_url("", guid, ttl=out.get("expires_in"),
+                                      quality=out.get("quality"))
     except Exception:
         out["web_url"] = out.get("url") or ""
     return out
@@ -1615,6 +1696,52 @@ def _wants_shuffle(text):
     return any(w in n for w in ("随机", "随便", "随意", "shuffle", "random"))
 
 
+def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
+                       favorites=False, shuffle=False, index=1):
+    """把歌单/收藏/歌手/专辑解析成连续播放流，MCP 与 REST 共用。"""
+    if artist:
+        item = resolve_artist(p, artist)
+        if not item:
+            names = "、".join(str(x.get("name") or "") for x in (getattr(p, "artist_items", lambda: [])() or [])[:8])
+            raise BadRequest("没有找到歌手「%s」%s" % (artist, ("，现有：" + names) if names else ""))
+        rows = p.artist_tracks(item["guid"], 500)
+        label = "歌手「%s」" % item["name"]
+    elif album:
+        item = resolve_album(p, album)
+        if not item:
+            names = "、".join(str(x.get("name") or "") for x in (getattr(p, "album_items", lambda: [])() or [])[:8])
+            raise BadRequest("没有找到专辑「%s」%s" % (album, ("，现有：" + names) if names else ""))
+        rows = p.album_tracks(item["guid"], 500)
+        label = "专辑「%s」" % item["name"]
+    elif favorites:
+        rows, label = p.favorites(200), "收藏"
+    elif playlist:
+        # 先找真实歌单；只有确实没有同名歌单时，才把「收藏」类短语当收藏。
+        pl = resolve_playlist(p, playlist)
+        if pl:
+            rows = p.playlist_tracks(pl["guid"], 500)
+            label = "歌单「%s」" % pl["name"]
+        elif _wants_favorites(playlist):
+            rows, label = p.favorites(200), "收藏"
+        else:
+            names = "、".join(str(x.get("name") or "") for x in (p.playlists() or [])[:8])
+            raise BadRequest("没有找到歌单「%s」%s" % (playlist, ("，现有：" + names) if names else ""))
+    else:
+        raise BadRequest("需要歌单、收藏、歌手或专辑之一")
+    if shuffle:
+        rows = shuffle_tracks(rows)
+        start = 0
+        action = "随机播放"
+    else:
+        start = max(0, _to_int(index, 1) - 1)
+        rows = rows[start:]
+        action = "连续播放"
+    if not rows:
+        raise BadRequest("列表里没有可播放的歌曲")
+    info = build_playlist_info(p, rows, label, base, quality, action=action)
+    return info, label, start, bool(shuffle), action, rows
+
+
 def _tool_music_play(args, p, base, limit, quality):
     guid = str(args.get("guid") or "").strip()
     playlist = str(args.get("playlist") or "").strip()
@@ -1624,54 +1751,24 @@ def _tool_music_play(args, p, base, limit, quality):
     fav_raw = args.get("favorites")
     favorites = _truthy(fav_raw)
     shuffle = _truthy(args.get("shuffle")) or _truthy(args.get("random"))
-    if playlist and _wants_favorites(playlist):
-        shuffle = shuffle or _wants_shuffle(playlist)
-        favorites, playlist = True, ""
     if not guid and not playlist and query_text and _wants_favorites(query_text) and _wants_shuffle(query_text):
         shuffle = True
         favorites, query_text = True, ""
     if _wants_shuffle(playlist) or _wants_shuffle(query_text):
         shuffle = True
-    # 「播放周杰伦」这类精确歌手名，直接进入歌手整库播放；不精确时仍按搜歌处理。
+    # 普通 query 只搜一次：搜索结果全部来自同一歌手时才升级为「播放歌手」，
+    # 避免每个查询都去拉一遍歌手全表。
+    pre_rows = None
+    pre_label = ""
     if not guid and not playlist and not artist and not album and not favorites and query_text:
-        hit = resolve_artist(p, query_text)
-        if hit and _norm_text(hit.get("name") or "") == _norm_text(query_text):
+        pre_rows, pre_label = pick_tracks(p, query_text, "", 20)
+        names = {_norm_text(t.get("artist")) for t in pre_rows if t.get("artist")}
+        if len(pre_rows) >= 2 and len(names) == 1 and _norm_text(query_text) in names:
             artist = query_text
     if favorites or playlist or artist or album:
-        if artist:
-            item = resolve_artist(p, artist)
-            if not item:
-                names = "、".join(str(x.get("name") or "") for x in (getattr(p, "artist_items", lambda: [])() or [])[:8])
-                raise BadRequest("没有找到歌手「%s」%s" % (artist, ("，现有：" + names) if names else ""))
-            rows = p.artist_tracks(item["guid"], 500)
-            label = "歌手「%s」" % item["name"]
-        elif album:
-            item = resolve_album(p, album)
-            if not item:
-                names = "、".join(str(x.get("name") or "") for x in (getattr(p, "album_items", lambda: [])() or [])[:8])
-                raise BadRequest("没有找到专辑「%s」%s" % (album, ("，现有：" + names) if names else ""))
-            rows = p.album_tracks(item["guid"], 500)
-            label = "专辑「%s」" % item["name"]
-        elif favorites:
-            rows, label = p.favorites(200), "收藏"
-        else:
-            pl = resolve_playlist(p, playlist)
-            if not pl:
-                names = "、".join(str(x.get("name") or "") for x in (p.playlists() or [])[:8])
-                raise BadRequest("没有找到歌单「%s」%s" % (playlist, ("，现有：" + names) if names else ""))
-            rows = p.playlist_tracks(pl["guid"], 500)
-            label = "歌单「%s」" % pl["name"]
-        if shuffle:
-            rows = shuffle_tracks(rows)
-            start = 0
-            action = "随机播放"
-        else:
-            start = max(0, _to_int(args.get("index"), 1) - 1)
-            rows = rows[start:]
-            action = "连续播放"
-        if not rows:
-            raise BadRequest("列表里没有可播放的歌曲")
-        info = build_playlist_info(p, rows, label, base, quality, action=action)
+        info, label, start, shuffle, action, rows = build_list_playback(
+            p, base, quality, playlist=playlist, artist=artist, album=album,
+            favorites=favorites, shuffle=shuffle, index=args.get("index"))
         total = len(rows)
         return ("准备%s：%s，%s，共 %d 首\n"
                 "直链（%d 分钟内有效）：%s\n"
@@ -1695,7 +1792,10 @@ def _tool_music_play(args, p, base, limit, quality):
                 track.update({k: v for k, v in found.items() if v})
         label, idx, total = "按 guid", 1, 1
     else:
-        rows, label = pick_tracks(p, query_text, playlist, 20)
+        if pre_rows is not None:
+            rows, label = pre_rows, pre_label
+        else:
+            rows, label = pick_tracks(p, query_text, playlist, 20)
         idx = _to_int(args.get("index"), 1)
         if idx < 1 or idx > len(rows):
             raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
@@ -1895,42 +1995,67 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest("参数 q 不能为空")
         limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
         p = provider()
+        fixed, changed = apply_aliases(q)
         self._sse_start()
-        self._sse_send({"type": "start", "query": q})
+        self._sse_send({"type": "start", "query": q, "corrected": fixed if changed else ""})
         count = 0
-        try:
-            stream = getattr(p, "search_stream", None)
-            if callable(stream):
-                for track in stream(q, limit):
-                    if not self._sse_send({"type": "track", "track": track}):
-                        break
-                    count += 1
-            else:
-                rows, _fixed = p.search(q, limit), ""
-                for track in rows:
-                    if not self._sse_send({"type": "track", "track": track}):
-                        break
-                    count += 1
-            meta = {}
+        seen = set()
+        metas = []
+
+        def _meta():
             meta_fn = getattr(p, "last_search_meta", None)
             if callable(meta_fn):
                 try:
-                    meta = meta_fn() or {}
+                    got = meta_fn() or {}
                 except Exception:
-                    meta = {}
-            if not isinstance(meta, dict):
-                meta = {}
-            local_count = meta.get("local_count")
-            if not isinstance(local_count, int):
-                local_count = 0
-            online_count = meta.get("online_count")
-            if not isinstance(online_count, int):
+                    got = {}
+                if isinstance(got, dict):
+                    metas.append(got)
+
+        def _emit(track):
+            key = (_norm_text(track.get("title")), _norm_text(track.get("artist")))
+            if key in seen:
+                return None  # 重复结果，不发送也不计数
+            seen.add(key)
+            return self._sse_send({"type": "track", "track": track})
+
+        def _iter(term, want):
+            stream = getattr(p, "search_stream", None)
+            if callable(stream):
+                return stream(term, want)
+            return p.search(term, want)
+
+        try:
+            broken = False
+            for track in _iter(fixed, limit):
+                sent = _emit(track)
+                if sent is False:
+                    broken = True
+                    break
+                if sent:
+                    count += 1
+            _meta()
+            if changed and not broken and count < limit:
+                for track in _iter(q, limit - count):
+                    sent = _emit(track)
+                    if sent is False:
+                        broken = True
+                        break
+                    if sent:
+                        count += 1
+                _meta()
+            local_count = sum(int(m.get("local_count") or 0) for m in metas)
+            online_count = sum(int(m.get("online_count") or 0) for m in metas)
+            if not metas:
                 online_count = max(0, count - local_count)
+            local_error = "；".join(str(m.get("local_error")) for m in metas if m.get("local_error"))
+            online_error = "；".join(str(m.get("online_error")) for m in metas if m.get("online_error"))
             self._sse_send({"type": "done", "query": q, "count": count,
+                            "corrected": fixed if changed else "",
                             "local_count": local_count,
                             "online_count": online_count,
-                            "local_error": meta.get("local_error") or "",
-                            "online_error": meta.get("online_error") or ""})
+                            "local_error": local_error,
+                            "online_error": online_error})
         except Exception as exc:
             LOG.exception("GET /api/search/stream failed")
             self._sse_send({"type": "error", "error": str(exc)})
@@ -2233,6 +2358,31 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest("参数 %s 必须是整数" % key)
 
     def _raw_body(self, cap=HTTP_BODY_CAP):
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            chunks, total = [], 0
+            while True:
+                line = self.rfile.readline(1024)
+                if not line:
+                    break
+                try:
+                    size = int((line.split(b";", 1)[0] or b"0").strip() or b"0", 16)
+                except ValueError:
+                    raise BadRequest("chunked 长度非法")
+                if size < 0:
+                    raise BadRequest("chunked 长度非法")
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline(1024)
+                        if not trailer or trailer in (b"\r\n", b"\n"):
+                            break
+                    break
+                total += size
+                if total > cap:
+                    raise BadRequest("请求体过大（上限 %d 字节）" % cap)
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(chunks)
         n = _to_int(self.headers.get("Content-Length"), 0)
         if n < 0:
             raise BadRequest("Content-Length 非法")
@@ -2561,6 +2711,17 @@ class Handler(BaseHTTPRequestHandler):
             info = PLAYBACK.prepare(track, p, self._base(), quality=quality, wait=False)
             info.update({"label": "直链", "index": 1, "count": 1})
             return self._json(with_web_url(info))
+        favorites = _truthy((qs.get("favorites") or [""])[0])
+        artist = (qs.get("artist") or [""])[0].strip()
+        album = (qs.get("album") or [""])[0].strip()
+        shuffle = _truthy((qs.get("shuffle") or [""])[0])
+        if favorites or artist or album or shuffle:
+            # 收藏/歌手/专辑/随机播放走整列表连续流；纯 playlist 保持旧的单曲行为。
+            info, label, start, shuffled, _action, rows = build_list_playback(
+                p, self._base(), quality, playlist=playlist, artist=artist, album=album,
+                favorites=favorites, shuffle=shuffle, index=index)
+            info.update({"label": label, "index": start + 1, "count": len(rows), "shuffle": shuffled})
+            return self._json(with_web_url(info))
         rows, label = pick_tracks(p, query, playlist, 20)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)
@@ -2621,12 +2782,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "missing playlist token"}, 400)
         exp = (qs.get("exp") or [""])[0]
         sig = (qs.get("sig") or [""])[0]
-        if not verify("pl:" + token, exp, sig):
+        quality = (qs.get("q") or [""])[0] or "standard"
+        if not verify("pl:" + token, exp, sig, quality):
             return self._json({"error": "invalid or expired signature"}, 403)
         item = PLAYLISTS.get(token)
         if not item or not item.get("tracks"):
             return self._json({"error": "playlist expired"}, 404)
-        quality = (qs.get("q") or [""])[0] or item.get("quality") or "standard"
+        quality = quality or item.get("quality") or "standard"
         p = provider()
         tracks = item["tracks"]
         first_path = None
@@ -2677,10 +2839,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "missing guid"}, 400)
         exp = (qs.get("exp") or [""])[0]
         sig = (qs.get("sig") or [""])[0]
-        if not verify(guid, exp, sig):
+        quality = (qs.get("q") or [""])[0] or None
+        if not verify(guid, exp, sig, quality):
             LOG.warning("bad signature for %s", guid)
             return self._json({"error": "invalid or expired signature"}, 403)
-        quality = (qs.get("q") or [""])[0] or None
         try:
             path = CACHE.ensure(guid, provider(), quality=quality)
         except Exception as e:
@@ -2759,11 +2921,11 @@ class Handler(BaseHTTPRequestHandler):
             LOG.info("client aborted while streaming %s", path)
 
     def _handle_mcp(self):
-        n = _to_int(self.headers.get("Content-Length"), 0)
-        if n < 0 or n > MCP_BODY_CAP:
+        try:
+            raw = self._raw_body(MCP_BODY_CAP)
+        except BadRequest:
             return self._json({"jsonrpc": "2.0", "id": None,
                                "error": {"code": -32600, "message": "payload too large"}}, 413)
-        raw = self.rfile.read(n) if n else b""
         # 优先走官方 MCPServer 2.3 的 streamable-http；它只监听 127.0.0.1 随机端口。
         headers = {
             "Content-Type": self.headers.get("Content-Type") or "application/json",

@@ -53,7 +53,7 @@ DEFAULT_INSTRUCTIONS = (
 
 
 class McpService:
-    """把网关的 12 个工具注册进官方 MCPServer 2.3。"""
+    """把网关的 11 个工具注册进官方 MCPServer 2.3。"""
 
     def __init__(self, call_tool: Callable[[str, dict, str], str], version: str,
                  default_base: str | Callable[[], str],

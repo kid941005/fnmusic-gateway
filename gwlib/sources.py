@@ -313,16 +313,22 @@ class FallbackProvider:
     def artists(self, limit=20):
         return self._local().artists(limit)
 
-    def artist_items(self, limit=200):
+    def artist_items(self, limit=200, query=""):
         fn = getattr(self._local(), "artist_items", None)
         if callable(fn):
-            return fn(limit)
+            try:
+                return fn(limit, query=query)
+            except TypeError:
+                return fn(limit)
         return [{"guid": str(x), "name": str(x)} for x in (self._local().artists(limit) or [])]
 
-    def album_items(self, limit=200):
+    def album_items(self, limit=200, query=""):
         fn = getattr(self._local(), "album_items", None)
         if callable(fn):
-            return fn(limit)
+            try:
+                return fn(limit, query=query)
+            except TypeError:
+                return fn(limit)
         return [{"guid": str(x), "name": str(x)} for x in (self._local().albums(limit) or [])]
 
     def artist_tracks(self, guid, limit=500):

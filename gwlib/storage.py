@@ -195,7 +195,8 @@ class MediaCache:
                 # 标准音质且源本身是 MP3：直接改名复用，跳过 ffmpeg。
                 if profile["name"] == "standard" and _looks_like_mp3(src, ctype):
                     os.replace(src, dst)
-                    self.evict()
+                    self._check_single_file(dst)
+                    self.evict(protect=dst)
                     return dst
                 bitrate = profile["bitrate"] or self._legacy_bitrate or "128k"
                 sample_rate = profile["sample_rate"] or self._legacy_sample_rate or 44100
@@ -223,11 +224,29 @@ class MediaCache:
                         os.remove(leftover)
                     except Exception:
                         pass
-            self.evict()
+            self._check_single_file(dst)
+            self.evict(protect=dst)
             return dst
 
-    def evict(self):
+    def _check_single_file(self, path):
+        """单曲超过缓存上限时明确报错，避免刚写入就被 evict 掉。"""
+        if not self.max:
+            return
         try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size > self.max:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise StorageError("缓存上限 %.1f MiB 小于单曲大小 %.1f MiB" % (
+                self.max / 1048576.0, size / 1048576.0))
+
+    def evict(self, protect=None):
+        try:
+            protected = os.path.abspath(protect) if protect else None
             items = []
             for name in os.listdir(self.dir):
                 if not name.endswith(".mp3"):
@@ -247,6 +266,8 @@ class MediaCache:
             for _, size, fp in items:
                 if total <= self.max * 0.9:
                     break
+                if protected and os.path.abspath(fp) == protected:
+                    continue
                 try:
                     os.remove(fp)
                     total -= size
@@ -339,6 +360,8 @@ class LibraryStore:
         if not directory:
             raise BadRequest("保存到本地曲库需要先配置 GW_DOWNLOAD_DIR")
         os.makedirs(directory, exist_ok=True)
+        # 下载前先确认还有空间，避免边下边写把磁盘写满后才报错。
+        self._check_capacity(1)
         fd, tmp = tempfile.mkstemp(prefix=".fnmusic-", suffix=".part", dir=directory)
         os.close(fd)
         try:

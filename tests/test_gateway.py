@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -129,6 +130,15 @@ class TestPure(unittest.TestCase):
     def test_expired(self):
         exp = int(app.time.time()) - 5
         self.assertFalse(app.verify("g1", str(exp), app.sign("g1", exp)))
+
+    def test_signature_binds_quality(self):
+        exp = int(app.time.time()) + 60
+        url = app.make_url("http://h:1", "g1", 60, quality="high")
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        self.assertEqual(qs["q"][0], "high")
+        self.assertTrue(app.verify("g1", qs["exp"][0], qs["sig"][0], "high"))
+        self.assertFalse(app.verify("g1", qs["exp"][0], qs["sig"][0]))
+        self.assertFalse(app.verify("g1", qs["exp"][0], qs["sig"][0], "standard"))
 
     def test_make_url(self):
         url = app.make_url("http://h:1", "a/b c", 60)
@@ -312,6 +322,36 @@ class TestHttp(Base):
         self.assertIn("lyric_url", d)
         self.assertEqual(d["device_args"]["title"], d["title"])
         self.assertEqual(d["device_args"]["url"], d["url"])
+
+    def test_api_play_favorites_continuous(self):
+        r, d = self.req("GET", "/api/play?favorites=1")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(d["count"], 2)
+        self.assertTrue(d["web_url"].startswith("/playlist/"), d["web_url"])
+
+    def test_mcp_accepts_chunked_body(self):
+        init = {"jsonrpc": "2.0", "id": 9, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "0"}}}
+        payload = json.dumps(init).encode()
+        chunk = ("%x\r\n" % len(payload)).encode() + payload + b"\r\n0\r\n\r\n"
+        s = socket.create_connection(("127.0.0.1", self.port), 10)
+        try:
+            s.sendall(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      b"Content-Type: application/json\r\n"
+                      b"Accept: application/json, text/event-stream\r\n"
+                      b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + chunk)
+            data = b""
+            while True:
+                part = s.recv(65536)
+                if not part:
+                    break
+                data += part
+        finally:
+            s.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+        self.assertIn(b"fnmusic-gateway", body)
 
     def test_unknown_route(self):
         r, _ = self.req("GET", "/playlists", raw=True)
@@ -1637,12 +1677,154 @@ class TestOptim213(unittest.TestCase):
                          ["mock-6", "mock-5"])
 
 
+class TestOptim2135(unittest.TestCase):
+    """2.13.5：provider 生命周期、缓存保护、搜索兜底、列表优先级。"""
+
+    def test_online_status_closes_temporary_provider(self):
+        from unittest import mock
+
+        class P:
+            def __init__(self):
+                self.closed = False
+
+            def status(self):
+                return [{"name": "x", "ok": True}]
+
+            def close(self):
+                self.closed = True
+
+        p = P()
+        with mock.patch.object(app, "online_active", return_value=True), \
+                mock.patch.object(app, "new_native_provider", return_value=p):
+            self.assertEqual(app.online_status(), [{"name": "x", "ok": True}])
+        self.assertTrue(p.closed)
+
+    def test_reset_provider_retires_old_instance(self):
+        class P:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        old = P()
+        saved_list, saved_prov = app._RETIRED_PROVIDERS[:], app._PROVIDER
+        try:
+            app._RETIRED_PROVIDERS[:] = []
+            app._PROVIDER = old
+            app.reset_provider()
+            self.assertFalse(old.closed, "活跃播放可能仍持有旧 provider，不能立刻关闭")
+            self.assertIn(old, app._RETIRED_PROVIDERS)
+        finally:
+            app._RETIRED_PROVIDERS[:] = saved_list
+            app._PROVIDER = saved_prov
+
+    def test_retired_queue_closes_only_overflow(self):
+        class P:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        olds = [P() for _ in range(app._RETIRED_MAX)]
+        new = P()
+        saved_list, saved_prov = app._RETIRED_PROVIDERS[:], app._PROVIDER
+        try:
+            app._RETIRED_PROVIDERS[:] = olds
+            app._PROVIDER = new
+            app.reset_provider()
+            self.assertTrue(olds[0].closed)
+            self.assertFalse(olds[1].closed)
+            self.assertFalse(new.closed)
+            self.assertEqual(len(app._RETIRED_PROVIDERS), app._RETIRED_MAX)
+        finally:
+            app._RETIRED_PROVIDERS[:] = saved_list
+            app._PROVIDER = saved_prov
+
+    def test_cache_rejects_single_file_larger_than_limit(self):
+        class P:
+            def stream_to_path(self, guid, path, quality=None):
+                with open(path, "wb") as fh:
+                    fh.write(b"ID3" + b"\x00" * 4096)
+                return "audio/mpeg", 4099
+
+        d = tempfile.mkdtemp(prefix="gw-small-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 10)
+        with self.assertRaises(gw_storage.StorageError):
+            cache.ensure("ext:musicdl:big", P(), quality="standard")
+        self.assertEqual([x for x in os.listdir(d) if x.endswith(".mp3")], [])
+
+    def test_evict_never_removes_protected_file(self):
+        d = tempfile.mkdtemp(prefix="gw-protect-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 120)
+        keep = os.path.join(d, "keep.mp3")
+        drop = os.path.join(d, "drop.mp3")
+        for fp in (keep, drop):
+            with open(fp, "wb") as fh:
+                fh.write(b"x" * 100)
+        cache.evict(protect=keep)
+        self.assertTrue(os.path.exists(keep))
+        self.assertFalse(os.path.exists(drop))
+
+    def test_library_checks_capacity_before_download(self):
+        class P:
+            def stream_to_path(self, guid, path, quality=None):
+                raise AssertionError("容量不足时不应开始下载")
+
+        d = tempfile.mkdtemp(prefix="gw-libcap-", dir=DATA)
+        with open(os.path.join(d, "old.mp3"), "wb") as fh:
+            fh.write(b"x" * 20)
+        lib = gw_storage.LibraryStore(lambda: d, max_bytes=10)
+        with self.assertRaises(gw_storage.StorageError):
+            lib.save_from_provider(P(), {"guid": "ext:x:1", "title": "t", "artist": "a"})
+        self.assertEqual([x for x in os.listdir(d) if x.endswith(".part")], [])
+
+    def test_fast_search_falls_back_to_original_query(self):
+        from unittest import mock
+
+        class P:
+            def search_stream(self, q, limit=10, deadline_s=None):
+                return iter(())
+
+            def search(self, q, limit=10):
+                if q == "原词":
+                    return [{"guid": "orig-1", "title": "晴天", "artist": "周杰伦"}]
+                return []
+
+        with mock.patch.object(app, "apply_aliases", return_value=("晴天", "原词")):
+            rows, fixed = app.fast_search_tracks(P(), "原词", limit=5, budget=2)
+        self.assertEqual(fixed, "晴天")
+        self.assertEqual([r["guid"] for r in rows], ["orig-1"])
+
+    def test_playlist_name_wins_over_favorites_phrase(self):
+        class P(app.MockProvider):
+            def playlists(self):
+                return [{"guid": "pl-fav", "name": "收藏", "count": 1}]
+
+            def playlist_tracks(self, guid, limit=200):
+                return [self.TRACKS[2]] if guid == "pl-fav" else []
+
+        info, label, _start, _shuffle, _action, rows = app.build_list_playback(
+            P(), "http://h", playlist="收藏")
+        self.assertEqual(label, "歌单「收藏」")
+        self.assertEqual([r["guid"] for r in rows], ["mock-3"])
+
+    def test_normal_query_does_not_list_artists(self):
+        class P(app.MockProvider):
+            def artist_items(self, *a, **k):
+                raise AssertionError("普通搜歌不应拉歌手全表")
+
+        out = app._tool_music_play({"query": "晴天"}, P(), "http://h", 10, "standard")
+        self.assertIn("准备播放", out)
+
+
 class TestRelease201(unittest.TestCase):
     """2.0.1：流式落盘、弱引用锁、单版本常量、搜索总上限/总超时。"""
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.4")
+        self.assertEqual(app.VERSION, "2.13.5")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

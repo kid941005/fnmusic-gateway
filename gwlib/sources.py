@@ -23,6 +23,19 @@ from .storage import LibraryStore, _call_stream, _call_stream_to_path
 
 LOG = logging.getLogger("fnmusic-gw.sources")
 EXT_PREFIX = "ext:"
+
+
+def _stream_ext(ext, q, per, deadline_s=None):
+    """兼容老外部音源 search_stream(q, limit) 与新签名 deadline_s。"""
+    fn = getattr(ext, "search_stream", None)
+    if not callable(fn):
+        return [ext.search(q, per)]
+    if deadline_s is None:
+        return fn(q, per)
+    try:
+        return fn(q, per, deadline_s=deadline_s)
+    except TypeError:
+        return fn(q, per)
 SERVICE_PORTS = {"8768": "musicdl", "8770": "musicbox", "8772": "lxmusic", "8776": "neteasefree"}
 SERVICE_ALIASES = {"musicdl": "musicdl", "lx": "lxmusic", "lxmusic": "lxmusic",
                    "musicbox": "musicbox", "netease": "musicbox", "neteasefree": "neteasefree"}
@@ -375,7 +388,7 @@ class FallbackProvider:
         meta["online_count"] = max(0, len(rows) - meta["local_count"])
         return rows[:cap]
 
-    def search_stream(self, q, limit=10):
+    def search_stream(self, q, limit=10, deadline_s=None):
         """本地优先，在线音源边搜边出；每拿到一首就 yield，不等全部完成。"""
         cap = min(max(1, int(limit or 1)), self.total_limit)
         meta = {"local_count": 0, "online_count": 0,
@@ -407,14 +420,14 @@ class FallbackProvider:
         if len(rows) >= cap or not self.exts:
             meta["online_count"] = 0
             return
-        deadline = time.monotonic() + self.total_timeout
+        budget = min(self.total_timeout, float(deadline_s)) if deadline_s else self.total_timeout
+        deadline = time.monotonic() + max(0.1, budget)
         per_source = max(1, max(cap - len(rows), self.search_limit))
         for ext in self.exts:
             if time.monotonic() >= deadline:
                 break
             try:
-                stream = getattr(ext, "search_stream", None)
-                batch = stream(q, per_source) if callable(stream) else [ext.search(q, per_source)]
+                batch = _stream_ext(ext, q, per_source, deadline_s)
                 for track in batch:
                     if add(track):
                         yield track

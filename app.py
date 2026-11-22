@@ -174,6 +174,8 @@ LIBRARY_MAX_BYTES = _env_int("GW_LIBRARY_MAX_BYTES", 0)
 
 # 搜索：别名纠错 + 相关度打分（中文 ASR 常把歌名/歌手听成同音字）
 SMART_SEARCH = _env_bool("GW_SMART_SEARCH", True)
+MCP_SEARCH_BUDGET = max(1.0, float(_env("GW_MCP_SEARCH_BUDGET", "8")))
+FNOS_SEARCH_TIMEOUT = max(1, _env_int("GW_FNOS_SEARCH_TIMEOUT", 5))
 ALIASES_FILE = _env("GW_ALIASES_FILE", os.path.join(DATA_DIR, "music_aliases.json"))
 
 # ---------------------------------------------------------------- 高级设置
@@ -429,7 +431,15 @@ def norm_track(t):
     album = _first(t, "album", "albumName", "albumTitle")
     if isinstance(album, dict):
         album = album.get("name", "")
-    return {"guid": guid, "title": title, "artist": str(artist or ""), "album": str(album or "")}
+    out = {"guid": guid, "title": title, "artist": str(artist or ""), "album": str(album or "")}
+    raw_duration = _first(t, "duration_s", "duration_seconds", "duration", "durationMs", "duration_ms")
+    try:
+        seconds = float(raw_duration)
+        if seconds > 0:
+            out["duration_s"] = seconds / 1000.0 if seconds > 10000 else seconds
+    except (TypeError, ValueError):
+        pass
+    return out
 
 
 def norm_playlist(p):
@@ -442,11 +452,14 @@ def norm_playlist(p):
     }
 
 
-def fmt_tracks(tracks, limit=10):
+def fmt_tracks(tracks, limit=10, show_guid=False):
     lines = []
     for i, t in enumerate(tracks[:limit], 1):
         a = (" - " + t["artist"]) if t.get("artist") else ""
-        lines.append("%d. %s%s" % (i, t.get("title") or t.get("guid"), a))
+        line = "%d. %s%s" % (i, t.get("title") or t.get("guid"), a)
+        if show_guid and t.get("guid"):
+            line += "（guid=%s）" % t["guid"]
+        lines.append(line)
     return "\n".join(lines) if lines else "（没有结果）"
 
 
@@ -616,6 +629,33 @@ def search_tracks(p, query, limit=10):
     return rank_tracks(fixed, dedupe(raw), limit), fixed
 
 
+def fast_search_tracks(p, query, limit=10, budget=None):
+    """MCP 快速搜索：本地/在线边搜边返回，最多等 budget 秒，先到先播。"""
+    q = (query or "").strip()
+    if not q:
+        return [], ""
+    fixed, _changed = apply_aliases(q)
+    deadline = time.monotonic() + max(1.0, float(budget or MCP_SEARCH_BUDGET))
+    raw = []
+    stream = getattr(p, "search_stream", None)
+    try:
+        if callable(stream):
+            try:
+                iterator = stream(fixed, max(1, limit),
+                                  deadline_s=max(0.2, deadline - time.monotonic()))
+            except TypeError:
+                iterator = stream(fixed, max(1, limit))
+            for track in iterator:
+                raw.append(track)
+                if len(raw) >= limit or time.monotonic() >= deadline:
+                    break
+        else:
+            raw.extend(p.search(fixed, max(limit * 3, 20)))
+    except Exception as e:
+        LOG.warning("fast search %r failed: %s", fixed, e)
+    return rank_tracks(fixed, dedupe(raw), limit), fixed
+
+
 # ---------------------------------------------------------------- 状态
 _state_lock = threading.Lock()
 
@@ -728,7 +768,8 @@ class FnProvider:
         self.client.ensure_token()
 
     def search(self, q, limit=10):
-        rows = dedupe(norm_track(t) for t in _rows(self.client.search_track(q, 1, limit)))
+        rows = dedupe(norm_track(t) for t in _rows(self.client.search_track(
+            q, 1, limit, timeout=min(FNOS_SEARCH_TIMEOUT, FNOS_TIMEOUT))))
         for row in rows:
             row["source"] = "local"
         return rows
@@ -1011,6 +1052,13 @@ def provider():
                     if online_active(settings):
                         exts = [new_native_provider(settings)]
                         LOG.info("内置在线音源：%s", ", ".join(online_platforms(settings)))
+                        for ext in exts:
+                            warm = getattr(ext, "prewarm", None)
+                            if callable(warm):
+                                try:
+                                    warm()
+                                except Exception:
+                                    LOG.debug("在线音源预热失败", exc_info=True)
                     if exts:
                         _PROVIDER = FallbackProvider(
                             base, exts=exts, timeout=settings["timeout"],
@@ -1291,11 +1339,25 @@ def _tool_music_search(args, p, base, limit, quality):
     if not q:
         raise BadRequest("query 不能为空")
     if SMART_SEARCH:
-        rows, fixed = search_tracks(p, q, limit)
+        rows, fixed = fast_search_tracks(p, q, limit)
     else:
         rows, fixed = p.search(q, limit), ""
     tail = ("（已按别名纠正为「%s」）" % fixed) if fixed and fixed != _norm_text(q) else ""
-    return "搜索「%s」%s找到 %d 首：\n%s" % (q, tail, len(rows), fmt_tracks(rows, limit))
+    local_count = sum(1 for t in rows if (t.get("source") or "") == "local")
+    online_count = max(0, len(rows) - local_count)
+    meta_fn = getattr(p, "last_search_meta", None)
+    meta = meta_fn() if callable(meta_fn) else {}
+    errs = []
+    if isinstance(meta, dict):
+        if meta.get("local_error"):
+            errs.append("本地搜索失败：" + str(meta["local_error"]))
+        if meta.get("online_error"):
+            errs.append("在线搜索失败：" + str(meta["online_error"]))
+    extra = ("（本地 %d · 在线 %d）" % (local_count, online_count))
+    if errs:
+        extra += "；" + "；".join(errs)
+    return "搜索「%s」%s找到 %d 首%s：\n%s" % (
+        q, tail, len(rows), extra, fmt_tracks(rows, limit, show_guid=True))
 
 
 def _tool_music_browse(args, p, base, limit, quality):
@@ -1335,25 +1397,42 @@ def _tool_music_favorites(args, p, base, limit, quality):
 
 
 def _tool_music_play(args, p, base, limit, quality):
-    rows, label = pick_tracks(p, str(args.get("query") or ""),
-                              str(args.get("playlist") or ""), 20)
-    idx = _to_int(args.get("index"), 1)
-    if idx < 1 or idx > len(rows):
-        raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
-    info = PLAYBACK.prepare(rows[idx - 1], p, base, quality=quality)
+    guid = str(args.get("guid") or "").strip()
+    if guid:
+        track = {"guid": guid, "title": str(args.get("title") or "").strip() or guid,
+                 "artist": str(args.get("artist") or "").strip()}
+        info_fn = getattr(p, "track_info", None)
+        if callable(info_fn):
+            try:
+                found = info_fn(guid)
+            except Exception:
+                found = None
+            if isinstance(found, dict):
+                track.update({k: v for k, v in found.items() if v})
+        label, idx, total = "按 guid", 1, 1
+    else:
+        rows, label = pick_tracks(p, str(args.get("query") or ""),
+                                  str(args.get("playlist") or ""), 20)
+        idx = _to_int(args.get("index"), 1)
+        if idx < 1 or idx > len(rows):
+            raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
+        track = rows[idx - 1]
+        total = len(rows)
+    info = PLAYBACK.prepare(track, p, base, quality=quality, wait=False)
     src_line = ("\n来源：在线音源 %s" % info["source"]) if info["source"] != "local" else ""
     prev_line = ""
     if info["preview"]:
         prev_line = ("\n注意：在线音源只给到试听片段（约 %d 秒）；说「下载」可保存完整版到本地曲库。" % int(info["duration"] or 0))
     save_line = "，正在后台保存到本地曲库" if info["saving"] else ""
-    return ("准备播放：%s%s\n%s 第 %d 首，音质 %s（%s kbps）%s%s\n直链（%d 分钟内有效）：%s\n"
+    prep_line = "\n音频正在后台准备，设备可直接用直链播放。" if info.get("preparing") else ""
+    return ("准备播放：%s%s\n%s 第 %d/%d 首，音质 %s（%s kbps）%s%s%s\n直链（%d 分钟内有效）：%s\n"
             "歌词直链：%s\n"
             "总时长：%d 秒\n"
             "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
             "artist 填「%s」，lyric_url 填上面的歌词直链（没有歌词就留空），"
             "duration 填 %d（总秒数，整数）。" % (
-                info["title"], (" - " + info["artist"]) if info["artist"] else "", label, idx,
-                info["quality_label"], info["bitrate"], src_line, prev_line + save_line,
+                info["title"], (" - " + info["artist"]) if info["artist"] else "", label, idx, total,
+                info["quality_label"], info["bitrate"], src_line, prev_line + save_line, prep_line,
                 max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
                 info["lyric_url"] or "（这首歌查不到歌词，留空即可）",
                 int(info.get("duration") or 0),
@@ -2193,13 +2272,13 @@ class Handler(BaseHTTPRequestHandler):
             track = {"guid": guid,
                      "title": (qs.get("title") or [guid])[0],
                      "artist": (qs.get("artist") or [""])[0]}
-            info = PLAYBACK.prepare(track, p, self._base(), quality=quality)
+            info = PLAYBACK.prepare(track, p, self._base(), quality=quality, wait=False)
             info.update({"label": "直链", "index": 1, "count": 1})
             return self._json(with_web_url(info))
         rows, label = pick_tracks(p, query, playlist, 20)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)
-        info = PLAYBACK.prepare(rows[index - 1], p, self._base(), quality=quality)
+        info = PLAYBACK.prepare(rows[index - 1], p, self._base(), quality=quality, wait=False)
         info.update({"label": label, "index": index, "count": len(rows)})
         return self._json(with_web_url(info))
 

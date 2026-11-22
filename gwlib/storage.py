@@ -42,6 +42,19 @@ def _call_stream_to_path(provider, guid, path, quality=None):
     return fn(guid, path, quality=quality) if _accepts_quality(fn) else fn(guid, path)
 
 
+def _looks_like_mp3(path, content_type=""):
+    """标准音质下，源本身就是 MP3 时直接复用，省掉一次 ffmpeg 转码。"""
+    ctype = (content_type or "").lower()
+    if "audio/mpeg" in ctype or "audio/mp3" in ctype or "mpeg" in ctype:
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return False
+    return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] in (0xFB, 0xF3, 0xF2))
+
+
 def audio_seconds(path):
     """ffprobe 读时长（秒，float）；失败返回 None。"""
     try:
@@ -102,6 +115,8 @@ class MediaCache:
         self._locks = weakref.WeakValueDictionary()
         self._guard = threading.Lock()
         self._slots = transcode_slots or TranscodeSlots(2)
+        self._prefetching = set()
+        self._prefetch_guard = threading.Lock()
         self._cleanup_stale()
 
     def reconfigure(self, max_bytes=None, transcode_slots=None):
@@ -130,6 +145,30 @@ class MediaCache:
     def path(self, guid, quality=None):
         return os.path.join(self.dir, self.key(guid, quality) + ".mp3")
 
+    def prefetch(self, guid, provider, quality=None):
+        """后台准备缓存，不阻塞 MCP/WebUI 的播放请求。"""
+        profile = get_profile(quality)
+        dst = self.path(guid, profile["name"])
+        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            return dst
+        key = os.path.basename(dst)
+        with self._prefetch_guard:
+            if key in self._prefetching:
+                return dst
+            self._prefetching.add(key)
+
+        def run():
+            try:
+                self.ensure(guid, provider, quality=profile["name"])
+            except Exception as exc:
+                self.log.info("cache prefetch failed for %s: %s", guid, exc)
+            finally:
+                with self._prefetch_guard:
+                    self._prefetching.discard(key)
+
+        threading.Thread(target=run, daemon=True, name="cache-prefetch").start()
+        return dst
+
     def _lock(self, key):
         with self._guard:
             lock = self._locks.get(key)
@@ -150,9 +189,14 @@ class MediaCache:
             tmp = dst + ".part"
             try:
                 # 直接流式落盘到临时源文件，避免整首 FLAC/MP3 读进内存
-                _call_stream_to_path(provider, guid, src, profile["name"])
+                ctype, _ = _call_stream_to_path(provider, guid, src, profile["name"])
                 if not os.path.exists(src) or os.path.getsize(src) < 1:
                     raise StorageError("empty audio for %s" % guid)
+                # 标准音质且源本身是 MP3：直接改名复用，跳过 ffmpeg。
+                if profile["name"] == "standard" and _looks_like_mp3(src, ctype):
+                    os.replace(src, dst)
+                    self.evict()
+                    return dst
                 bitrate = profile["bitrate"] or self._legacy_bitrate or "128k"
                 sample_rate = profile["sample_rate"] or self._legacy_sample_rate or 44100
                 channels = profile["channels"] or self._legacy_channels or 2

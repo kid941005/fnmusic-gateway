@@ -215,6 +215,8 @@ class NativeMusicDLProvider:
         self._cache = {}
         self._cache_order = []
         self._lock = threading.Lock()
+        self._pool = ThreadPoolExecutor(max_workers=min(4, len(self.platforms)) or 1,
+                                        thread_name_prefix="musicdl-search")
 
     # ---- worker / cache ----
     def _worker(self, platform):
@@ -233,6 +235,20 @@ class NativeMusicDLProvider:
             with self._lock:
                 self._workers[platform] = worker
             return worker
+
+    def prewarm(self):
+        """后台预热各平台 worker，缩短首次搜索等待。"""
+        if not deps_available():
+            return
+        for platform in self.platforms:
+            threading.Thread(target=self._warm_one, args=(platform,),
+                             daemon=True, name="musicdl-warm-" + str(platform)).start()
+
+    def _warm_one(self, platform):
+        try:
+            self._worker(platform)
+        except Exception as exc:
+            LOG.info("musicdl prewarm %s failed: %s", platform, exc)
 
     def _remember(self, item, headers, lyric):
         eid = str(item.get("id") or "")
@@ -319,7 +335,7 @@ class NativeMusicDLProvider:
         per = max(1, min(10, int(limit or 10)))
         cap = min(max(1, int(limit or 1)), self.total_limit)
         deadline = time.monotonic() + self.total_timeout
-        pool = ThreadPoolExecutor(max_workers=min(4, len(self.platforms)))
+        pool = self._pool
         futures = [pool.submit(self._search_platform, p, q, per) for p in self.platforms]
         batches = []
         try:
@@ -334,7 +350,6 @@ class NativeMusicDLProvider:
         finally:
             for future in futures:
                 future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
         rows = []
         seen = set()
         for batch in batches:
@@ -347,14 +362,15 @@ class NativeMusicDLProvider:
                     return rows[:cap]
         return rows[:cap]
 
-    def search_stream(self, q, limit=10):
+    def search_stream(self, q, limit=10, deadline_s=None):
         """多平台并行搜索，哪个平台先探活成功就先产出哪首，不等全部完成。"""
         q = str(q or "").strip()
         if not q or not self.platforms:
             return
         per = max(1, min(10, int(limit or 10)))
         cap = min(max(1, int(limit or 1)), self.total_limit)
-        deadline = time.monotonic() + self.total_timeout
+        budget = min(self.total_timeout, float(deadline_s)) if deadline_s else self.total_timeout
+        deadline = time.monotonic() + max(0.1, budget)
         out = queue.Queue()
         stop = threading.Event()
 
@@ -362,8 +378,9 @@ class NativeMusicDLProvider:
             try:
                 worker = self._worker(platform)
                 seen = set()
+                remain = max(1.0, deadline - time.monotonic())
                 for entry in worker.iter_search(
-                        q, per, self.timeout, stop_event=stop):
+                        q, per, min(self.timeout, remain), stop_event=stop):
                     if stop.is_set():
                         break
                     track = self._entry_track(entry)
@@ -492,6 +509,13 @@ class NativeMusicDLProvider:
                     "ms": int((time.monotonic() - started) * 1000), "error": str(exc)}
 
     def close(self):
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         with self._lock:
             workers = list(self._workers.values())
             self._workers.clear()

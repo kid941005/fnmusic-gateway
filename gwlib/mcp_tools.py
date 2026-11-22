@@ -11,7 +11,7 @@ def build_tools():
     return [
         {
             "name": "music_search",
-            "description": "搜歌：飞牛音乐优先，本地不足再并行问在线音源（自动纠正同音字/错字，按相关度排序）。返回带序号的曲目列表。",
+            "description": "搜歌：飞牛音乐优先，本地不足再并行问在线音源（自动纠正同音字/错字，按相关度排序）。返回带序号和 guid 的曲目列表；播放时优先把 guid 原样传给 music_play。",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "歌名或歌手"},
                 "limit": {"type": "integer", "description": "最多返回几首，默认 10"}},
@@ -43,13 +43,14 @@ def build_tools():
         {
             "name": "music_play",
             "description": ("拿一首歌的可播放直链，同时给出歌名、歌手、歌词直链、总时长（秒）和音质（设备屏显要用）。"
-                            "query/playlist 二选一，index 从 1 开始。"
+                            "优先传 music_search 返回的 guid（最稳，不会同名播错）；没有 guid 时 query/playlist 二选一，index 从 1 开始。"
                             "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url/duration 五个参数都填上。"),
             "inputSchema": {"type": "object", "properties": {
+                "guid": {"type": "string", "description": "music_search 返回的曲目 guid，优先使用"},
                 "query": {"type": "string"},
                 "playlist": {"type": "string"}, "index": {"type": "integer"},
                 "quality": QUALITY_PROP},
-                "anyOf": [{"required": ["query"]}, {"required": ["playlist"]}]},
+                "anyOf": [{"required": ["guid"]}, {"required": ["query"]}, {"required": ["playlist"]}]},
         },
         {
             "name": "music_favorite",

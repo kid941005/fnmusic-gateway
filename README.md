@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.12.1**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.0**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -22,6 +22,8 @@
 - **设备可播**：音源里的 FLAC/无损自动转 MP3，签发短时直链，支持 Range、HEAD 和预转码。
 - **屏显信息**：播放时把歌名、歌手、歌词（LRC）一起交给设备，不再显示 `unknown`。
 - **听得更准**：中文同音字/错字纠正 + 相关度排序（青花磁 → 青花瓷）。
+- **点歌更快**：MCP 搜索结果带 `guid`，播放优先按 `guid` 直取，避免同名/重搜播错；边搜边返回，最多等约 8 秒先播已出现的结果。
+- **首播不等转码**：播放接口立即返回签名直链，音频在后台准备；标准音质且源本身是 MP3 时直接复用，跳过 ffmpeg。
 - **内置在线音源**：musicdl 直接内置在网关镜像里，按平台并行搜索、解析直链、播放与下载，不再依赖独立音源容器。
 - **安全外网**：只发布一个 8766；公网反代只转发 `/play/` 与 `/lyrics/`，管理面与 WebUI 不暴露。
 - **多种接入**：11 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
@@ -485,7 +487,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 117 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘，全离线（mock）
+python tests/test_gateway.py -v   # 122 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放与快速搜索，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 

@@ -166,9 +166,9 @@ class FnMusicClient:
             return None
         return env if isinstance(env, dict) else None
 
-    def _http(self, url, method, headers, payload=None):
+    def _http(self, url, method, headers, payload=None, timeout=None):
         req = urllib.request.Request(url, data=payload, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout, context=self._ssl) as resp:
             return resp.status, resp.read(), dict(resp.headers)
 
     def _build(self, path, params, body):
@@ -187,10 +187,10 @@ class FnMusicClient:
         headers["authx"] = build_authx(pathname, "GET" if body is None else "POST", params, body)
         return url, headers, payload
 
-    def request(self, method, path, params=None, body=None, retry=True):
+    def request(self, method, path, params=None, body=None, retry=True, timeout=None):
         url, headers, payload = self._build(path, params, body)
         try:
-            status, raw, _ = self._http(url, method, headers, payload)
+            status, raw, _ = self._http(url, method, headers, payload, timeout=timeout)
         except urllib.error.HTTPError as e:
             status, raw = e.code, e.read()
         except Exception as e:
@@ -201,7 +201,7 @@ class FnMusicClient:
         if retry and self.username and self.password and self._invalid_token(status, env):
             self.token = None
             self.login()
-            return self.request(method, path, params, body, retry=False)
+            return self.request(method, path, params, body, retry=False, timeout=timeout)
         if not isinstance(env, dict):
             raise FnMusicError("bad response status=%s head=%r" % (status, raw[:120]), status)
         if env.get("code") not in SUCCESS_CODES:
@@ -281,8 +281,9 @@ class FnMusicClient:
         return self.get("/track/playlist-detail/list",
                         {"playlistGUID": playlist_guid, "page": page, "size": size})
 
-    def search_track(self, keyword, page=1, page_size=20):
-        return self.get("/search/track", {"q": keyword, "page": page, "pageSize": page_size})
+    def search_track(self, keyword, page=1, page_size=20, timeout=None):
+        return self.get("/search/track", {"q": keyword, "page": page, "pageSize": page_size},
+                        timeout=timeout)
 
     def search_album(self, keyword, page=1, page_size=20):
         return self.get("/search/album", {"q": keyword, "page": page, "pageSize": page_size})

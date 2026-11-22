@@ -20,6 +20,7 @@ fnmusic-gateway，不需要再拉起一个 stdio MCP 进程。
     GW_MCP_URL     fnmusic-gateway 的 MCP 端点，默认 http://127.0.0.1:8766/mcp
     GW_ADMIN_TOKEN 网关管理令牌（设置 GW_ADMIN_TOKEN 时必填）
     GW_TIMEOUT     单次工具调用超时秒数，默认 120（搜索+预热转码可能较慢）
+    GW_CONCURRENCY 并发转发的工具调用上限，默认 4（避免单个慢工具卡住后续请求）
     LOG_LEVEL      DEBUG/INFO/WARNING，默认 INFO
 """
 
@@ -34,6 +35,7 @@ import urllib.request
 ENDPOINT = (os.environ.get("MCP_ENDPOINT") or "").strip()
 GW_MCP_URL = (os.environ.get("GW_MCP_URL") or "http://127.0.0.1:8766/mcp").strip()
 GW_TIMEOUT = float(os.environ.get("GW_TIMEOUT") or "120")
+GW_CONCURRENCY = max(1, int(os.environ.get("GW_CONCURRENCY") or "4"))
 GW_ADMIN_TOKEN = (os.environ.get("GW_ADMIN_TOKEN") or "").strip()
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 600.0
@@ -154,14 +156,36 @@ async def serve():
             async with websockets.connect(
                 ENDPOINT, ping_interval=20, ping_timeout=20, max_size=None
             ) as ws:
-                LOG.info("接入点已连接")
+                LOG.info("接入点已连接（并发上限 %d）", GW_CONCURRENCY)
                 backoff = INITIAL_BACKOFF
-                async for raw in ws:
-                    if isinstance(raw, (bytes, bytearray)):
-                        raw = raw.decode("utf-8", "replace")
-                    reply = await forward(raw)
+                slots = asyncio.Semaphore(GW_CONCURRENCY)
+                send_lock = asyncio.Lock()
+                pending = set()
+
+                async def handle(raw_text):
+                    async with slots:
+                        reply = await forward(raw_text)
                     if reply:
-                        await ws.send(reply)
+                        async with send_lock:
+                            await ws.send(reply)
+
+                def _done(task):
+                    pending.discard(task)
+                    if not task.cancelled() and task.exception() is not None:
+                        LOG.warning("转发任务失败: %s", task.exception())
+
+                try:
+                    async for raw in ws:
+                        if isinstance(raw, (bytes, bytearray)):
+                            raw = raw.decode("utf-8", "replace")
+                        task = asyncio.create_task(handle(raw))
+                        pending.add(task)
+                        task.add_done_callback(_done)
+                finally:
+                    for task in list(pending):
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
         except asyncio.CancelledError:
             raise
         except Exception as e:

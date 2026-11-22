@@ -1362,6 +1362,13 @@ class TestV2Playback(unittest.TestCase):
             {"guid": "mock-1", "title": "晴天", "artist": "周杰伦"}, self._Provider(), "http://h")
         self.assertFalse(info2["saving"])
 
+    def test_prepare_fast_returns_before_cache_is_ready(self):
+        info = self._svc().prepare(
+            {"guid": "ext:musicdl:e2", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
+            self._Provider(), "http://h", wait=False)
+        self.assertTrue(info["preparing"])
+        self.assertTrue(info["url"].startswith("http://x/play/"))
+
     def test_failover_reselects_source(self):
         cache = self._Cache(fail_first=True)
         info = self._svc(cache=cache).prepare(
@@ -1496,12 +1503,61 @@ class TestAuditFixes(unittest.TestCase):
         fp = app.FallbackProvider(_FakeLocal(), ["musicdl@http://x:1"], max_bytes=123)
         self.assertEqual(fp.library.max_bytes, 123)
 
+class TestOptim213(unittest.TestCase):
+    """2.13.0：guid 直取播放、MCP 快速流式搜索、标准音质 MP3 直出。"""
+
+    def test_search_outputs_guid(self):
+        out = app.call_tool("music_search", {"query": "晴天"}, "http://h")
+        self.assertIn("guid=mock-1", out)
+        self.assertIn("本地", out)
+
+    def test_play_by_guid(self):
+        out = app.call_tool("music_play", {"guid": "mock-1"}, "http://h")
+        self.assertIn("按 guid", out)
+        self.assertIn("self.music.play_url", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        guid = urllib.parse.unquote(url.split("/play/")[1].split(".mp3")[0])
+        self.assertEqual(guid, "mock-1")
+        self.assertTrue(app.verify(guid, qs["exp"][0], qs["sig"][0]))
+
+    def test_fast_search_prefers_stream_and_does_not_call_search(self):
+        class StreamOnly:
+            def search(self, *a, **k):
+                raise AssertionError("不应退回整段 search")
+
+            def search_stream(self, q, limit=10, deadline_s=None):
+                yield {"guid": "s-1", "title": "晴天", "artist": "周杰伦"}
+                yield {"guid": "s-2", "title": "晴天（钢琴版）", "artist": "纯音乐"}
+
+        rows, _ = app.fast_search_tracks(StreamOnly(), "晴天", limit=5, budget=1)
+        self.assertEqual([r["guid"] for r in rows], ["s-1", "s-2"])
+
+    def test_standard_mp3_source_skips_ffmpeg(self):
+        from unittest import mock
+
+        class Mp3Prov:
+            def stream_to_path(self, guid, path, quality=None):
+                with open(path, "wb") as fh:
+                    fh.write(b"ID3" + b"\x00" * 4096)
+                return "audio/mpeg", 4099
+
+        d = tempfile.mkdtemp(prefix="gw-mp3-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 0)
+        with mock.patch.object(gw_storage.subprocess, "run",
+                               side_effect=AssertionError("不应调用 ffmpeg")):
+            out = cache.ensure("ext:musicdl:mp3", Mp3Prov(), quality="standard")
+        self.assertTrue(os.path.exists(out))
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(3), b"ID3")
+
+
 class TestRelease201(unittest.TestCase):
     """2.0.1：流式落盘、弱引用锁、单版本常量、搜索总上限/总超时。"""
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.12.1")
+        self.assertEqual(app.VERSION, "2.13.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

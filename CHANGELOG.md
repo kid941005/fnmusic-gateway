@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2.13.0 (2026-11-22)
+
+### 优化：小智点歌全链路提速
+- **按 guid 播放**：`music_search` 结果每行带 `guid`，`music_play` 新增 `guid` 参数并优先直取，避免按关键词二次搜索和同名歌曲播错；查询路径仍保留。
+- **播放异步化**：`PlaybackService.prepare(wait=False)` 立即返回签名直链，音频在后台 `MediaCache.prefetch` 准备，不再阻塞 MCP/WebUI；旧同步模式保留给内部与既有测试。
+- **MP3 直出**：标准音质且上游流本身就是 MP3（Content-Type 或文件头判断）时直接改名入缓存，跳过 ffmpeg 转码。
+- **MCP 快速搜索**：`fast_search_tracks` 优先走 `search_stream`，边搜边返回，最多等 `GW_MCP_SEARCH_BUDGET`（默认 8 秒）或凑够条数；返回本地/在线计数与失败原因。
+- **常驻搜索池与预热**：`NativeMusicDLProvider` 使用常驻线程池，启动后后台预热各平台 worker，避免每次搜索新建线程/子进程。
+- **本地搜索短超时**：`FnProvider.search` 使用 `GW_FNOS_SEARCH_TIMEOUT`（默认 5 秒），飞牛不可达时更快回退在线源。
+- **桥接并发**：`bridge/mcp_pipe_http.py` 每帧独立任务，`GW_CONCURRENCY`（默认 4）限制并发，单个慢工具不再阻塞后续请求。
+- **部署**：网关 compose 增加 `extra_hosts: fn.hqgg.top:192.168.50.100`，绕过 Docker NAT 回环导致的本地库不可达。
+- 版本 2.12.1 → **2.13.0**；测试 **122 个用例**（新增 guid 搜索/播放、快速流式搜索、MP3 直出、异步 prepare）。
+
 ## 2.12.1 (2026-11-22)
 
 ### 修复：扫码前预热网易云会话

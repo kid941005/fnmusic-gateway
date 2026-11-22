@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 2.11.0 (2026-11-22)
+
+### 新增：网易云 MUSIC_U Cookie 配置
+- WebUI「设置 → 在线音源」新增网易云 Cookie 输入框与「清除已保存的网易云 Cookie」选项；Cookie 只写 `/data/config.json`（0600），接口只返回 `netease_cookie_set`，不回明文，日志不打印。
+- Cookie 支持整段 `MUSIC_U=...; __csrf=...` 或纯 `MUSIC_U` 值；仅对 `NeteaseMusicClient` 注入到 musicdl 的 `default_search_cookies`/`default_parse_cookies`/`default_download_cookies`，worker 子进程按任务传递。
+- 版本 2.10.2 → **2.11.0**；测试 **115 个用例**（新增 Cookie 解析/仅网易云注入、设置接口脱敏与清除）。
+
 ## 2.10.2 (2026-11-21)
 
 ### 修复：飞牛 token 失效后本地搜索一直为空

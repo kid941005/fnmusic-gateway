@@ -33,6 +33,10 @@ import fnmusic_client  # noqa: E402
 import gwlib.sources as gw_sources  # noqa: E402
 import gwlib.storage as gw_storage  # noqa: E402
 import gwlib.config as gw_config  # noqa: E402
+try:
+    import gwlib.musicdl_core as gw_musicdl_core  # noqa: E402
+except Exception:  # 测试环境可能没有 httpx/musicdl 依赖
+    gw_musicdl_core = None
 
 
 class Base(unittest.TestCase):
@@ -596,6 +600,25 @@ class TestFnSettings(Base):
         self.assertEqual(got["total_timeout"], 30)
         self.assertIn("deps_available", got)
 
+    def test_settings_online_cookie_masked_and_clear(self):
+        r, body = self.req("PUT", "/api/settings/online",
+                           body={"enabled": True, "platforms": ["NeteaseMusicClient"],
+                                 "netease_cookie": "MUSIC_U=secret-cookie"},
+                           headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertTrue(body["netease_cookie_set"])
+        self.assertNotIn("netease_cookie", body)
+        self.assertNotIn("secret-cookie", json.dumps(body, ensure_ascii=False))
+        r, got = self.req("GET", "/api/settings/online", headers=self._h())
+        self.assertTrue(got["netease_cookie_set"])
+        self.assertNotIn("netease_cookie", got)
+        self.assertNotIn("secret-cookie", json.dumps(got, ensure_ascii=False))
+        r, got = self.req("PUT", "/api/settings/online",
+                          body={"clear_netease_cookie": True}, headers=self._h())
+        self.assertEqual(r.status, 200)
+        self.assertFalse(got["netease_cookie_set"])
+        self.assertNotIn("netease_cookie", app.FNOS_CONFIG.section("online"))
+
     def test_settings_online_rejects_bad_platform(self):
         r, _ = self.req("PUT", "/api/settings/online",
                         body={"platforms": ["../evil"]}, headers=self._h())
@@ -632,6 +655,49 @@ class TestFnSettings(Base):
         self.assertTrue(body["ok"])
         self.assertEqual(body["results"][0]["count"], 3)
         self.assertTrue(made and made[0].closed)
+
+
+class TestNeteaseCookie(unittest.TestCase):
+    """网易云 MUSIC_U Cookie：解析与传入 musicdl 客户端配置。"""
+
+    def setUp(self):
+        if gw_musicdl_core is None:
+            self.skipTest("musicdl_core 依赖不可用")
+
+    def test_parse_cookie_value_and_header(self):
+        self.assertEqual(gw_musicdl_core.parse_netease_cookie(""), {})
+        self.assertEqual(gw_musicdl_core.parse_netease_cookie("abc"),
+                         {"MUSIC_U": "abc"})
+        self.assertEqual(gw_musicdl_core.parse_netease_cookie("MUSIC_U=abc; __csrf=xyz"),
+                         {"MUSIC_U": "abc", "__csrf": "xyz"})
+        self.assertEqual(gw_musicdl_core.parse_netease_cookie("plain-token"),
+                         {"MUSIC_U": "plain-token"})
+
+    def test_search_one_source_injects_cookie_only_for_netease(self):
+        seen = {}
+        original = gw_musicdl_core._build_client
+
+        class FakeClient:
+            def search(self, keyword):
+                return {}
+
+        def fake(source, cfg, overrides):
+            seen.clear()
+            seen.update(cfg)
+            return FakeClient()
+
+        gw_musicdl_core._build_client = fake
+        try:
+            gw_musicdl_core.search_one_source("NeteaseMusicClient", "晴天", 3,
+                                              netease_cookie="MUSIC_U=abc")
+            self.assertEqual(seen["default_search_cookies"], {"MUSIC_U": "abc"})
+            self.assertEqual(seen["default_parse_cookies"], {"MUSIC_U": "abc"})
+            self.assertEqual(seen["default_download_cookies"], {"MUSIC_U": "abc"})
+            gw_musicdl_core.search_one_source("KuwoMusicClient", "晴天", 3,
+                                              netease_cookie="MUSIC_U=abc")
+            self.assertNotIn("default_search_cookies", seen)
+        finally:
+            gw_musicdl_core._build_client = original
 
 
 class TestAdvancedSettings(Base):
@@ -1400,7 +1466,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.10.2")
+        self.assertEqual(app.VERSION, "2.11.0")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

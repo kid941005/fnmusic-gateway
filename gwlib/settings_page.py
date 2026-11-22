@@ -61,6 +61,8 @@ input[type=text],input[type=password],input[type=number]{background:#0e1526;bord
   <label class="check" style="margin-bottom:10px"><input id="online_enabled" type="checkbox"> 启用在线音源</label>
   <div id="platList"></div>
   <div class="field" style="margin-top:12px"><label>附加平台（可选，逗号分隔的 musicdl MusicClient 类名）</label><input id="extra_platforms" type="text" placeholder="例如 QQMusicClient,BilibiliMusicClient"></div>
+  <div class="field"><label>网易云 MUSIC_U Cookie（可选，留空不修改）</label><input id="netease_cookie" type="password" autocomplete="off" placeholder="粘贴 MUSIC_U=... 或整段 Cookie"></div>
+  <label class="check" style="margin-bottom:12px"><input id="clear_netease_cookie" type="checkbox"> 清除已保存的网易云 Cookie</label>
   <div class="row3">
     <div class="field"><label>单平台搜索条数（≤10）</label><input id="search_limit" type="number" min="1" max="10"></div>
     <div class="field"><label>单平台超时（秒）</label><input id="timeout" type="number" min="3" max="120"></div>
@@ -116,6 +118,9 @@ async function loadOnline(){
   try{var d=await api('/api/settings/online');onlineData=d
     el('online_enabled').checked=!!d.enabled
     el('extra_platforms').value=(d.extra_platforms||[]).join(',')
+    el('netease_cookie').value=''
+    el('netease_cookie').placeholder=d.netease_cookie_set?'已设置；留空不修改':'未设置；粘贴 MUSIC_U=... 或整段 Cookie'
+    el('clear_netease_cookie').checked=false
     renderPlatforms(d.platforms||[],d.extra_platforms||[])
     el('search_limit').value=d.search_limit;el('timeout').value=d.timeout;el('total_limit').value=d.total_limit;el('total_timeout').value=d.total_timeout
     out('onlineOut',d.deps_available?'依赖就绪':'缺少依赖：'+(d.deps_error||''))
@@ -125,8 +130,8 @@ function checkedPlatforms(){return Array.prototype.map.call(el('platList').query
 async function saveOnline(){
   out('onlineOut','保存中…')
   try{var extra=el('extra_platforms').value.split(',').map(function(x){return x.trim()}).filter(Boolean)
-    var d=await put('/api/settings/online',{enabled:el('online_enabled').checked,platforms:checkedPlatforms(),extra_platforms:extra,search_limit:Number(el('search_limit').value),timeout:Number(el('timeout').value),total_limit:Number(el('total_limit').value),total_timeout:Number(el('total_timeout').value)})
-    onlineData=d;renderPlatforms(d.platforms||[],d.extra_platforms||[]);out('onlineOut','已保存，音源已按新配置重建')
+    var d=await put('/api/settings/online',{enabled:el('online_enabled').checked,platforms:checkedPlatforms(),extra_platforms:extra,search_limit:Number(el('search_limit').value),timeout:Number(el('timeout').value),total_limit:Number(el('total_limit').value),total_timeout:Number(el('total_timeout').value),netease_cookie:el('netease_cookie').value,clear_netease_cookie:el('clear_netease_cookie').checked})
+    onlineData=d;el('netease_cookie').value='';el('netease_cookie').placeholder=d.netease_cookie_set?'已设置；留空不修改':'未设置；粘贴 MUSIC_U=... 或整段 Cookie';el('clear_netease_cookie').checked=false;renderPlatforms(d.platforms||[],d.extra_platforms||[]);out('onlineOut','已保存，音源已按新配置重建'+(d.netease_cookie_set?'（网易云 Cookie 已设置）':''))
   }catch(e){out('onlineOut','保存失败：'+e.message)}
 }
 async function testOne(p){

@@ -321,7 +321,35 @@ def _build_client(source: str, cfg: dict, overrides: dict):
     )
 
 
-def search_one_source(source: str, keyword: str, limit: int) -> list:
+def parse_netease_cookie(raw: str) -> dict:
+    """把用户粘贴的 MUSIC_U Cookie 归一化成 musicdl 需要的字典。
+
+    支持两种输入：只粘贴 MUSIC_U 的值，或粘贴完整的 Cookie 头
+    （MUSIC_U=...; 其他=...）。空输入返回空字典，不覆盖库默认 Cookie。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    if text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+        if not text:
+            return {}
+    if "=" in text:
+        jar = SimpleCookie()
+        try:
+            jar.load(text)
+        except Exception:
+            jar = None
+        if jar:
+            cookies = {str(name): str(morsel.value) for name, morsel in jar.items()
+                       if str(morsel.value)}
+            if cookies:
+                return cookies
+    return {"MUSIC_U": text}
+
+
+def search_one_source(source: str, keyword: str, limit: int,
+                      netease_cookie: str = "") -> list:
     """单个源搜索（worker 进程内执行，阻塞）。
 
     网络超时只作为「库层非活动超时」存在；整体预算由父进程回收 worker
@@ -334,6 +362,14 @@ def search_one_source(source: str, keyword: str, limit: int) -> list:
         "work_dir": CFG["work_dir"],
         "max_retries": 1,
     }
+    if source == "NeteaseMusicClient":
+        cookies = parse_netease_cookie(netease_cookie)
+        if cookies:
+            # musicdl 的 BaseMusicClient 对搜索/解析/下载分别读取 cookie 字典；
+            # 三处都给，避免搜索成功但播放直链因未登录而拿不到。
+            cfg["default_search_cookies"] = dict(cookies)
+            cfg["default_parse_cookies"] = dict(cookies)
+            cfg["default_download_cookies"] = dict(cookies)
     client = _build_client(source, cfg, request_overrides_for(source))
     result = client.search(keyword=keyword)
     return list(result.values())[0] if result else []
@@ -556,6 +592,7 @@ def run_search_task(task: dict, emit, on_stage=None) -> dict:
     fetch_size = max(1, int(task.get("fetch_size") or 10))
     limit = max(1, int(task.get("limit") or 1))
     song_id = task.get("song_id") or None
+    netease_cookie = str(task.get("netease_cookie") or "")
     budget_s = float(task.get("budget_s") or 0)
     deadline = time.monotonic() + budget_s
     stage = "search"
@@ -569,7 +606,8 @@ def run_search_task(task: dict, emit, on_stage=None) -> dict:
     if deadline is not None and time.monotonic() >= deadline:
         return {"count": 0, "partial": True}
     try:
-        songs = search_one_source(source, keyword, fetch_size)
+        songs = search_one_source(source, keyword, fetch_size,
+                                  netease_cookie=netease_cookie)
     except SearchStageError:
         raise
     except BaseException as exc:  # noqa: BLE001 统一转成带阶段的搜索异常

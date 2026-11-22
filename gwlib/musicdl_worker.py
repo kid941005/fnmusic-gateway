@@ -3,7 +3,8 @@
 
 JSON 行协议（UTF-8）：
   stdin   <- {"op": "search", "source": ..., "keyword": ..., "fetch_size": ...,
-              "limit": ..., "song_id": str|null, "budget_s": float}
+              "limit": ..., "song_id": str|null, "budget_s": float,
+              "netease_cookie": str}  # 仅 NeteaseMusicClient 使用，不落日志
   stdout  -> {"type": "ready"}
           -> {"type": "entry", "entry": [item, download_headers, lyric]}
           -> {"type": "result", "count": n, "partial": bool}

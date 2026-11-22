@@ -47,10 +47,11 @@ def deps_error():
 class _Worker:
     """单个平台的 musicdl 子进程，JSON 行协议。"""
 
-    def __init__(self, platform, work_dir, timeout):
+    def __init__(self, platform, work_dir, timeout, netease_cookie=""):
         self.platform = platform
         self.work_dir = work_dir
         self.timeout = max(3.0, float(timeout))
+        self.netease_cookie = str(netease_cookie or "").strip()
         self.proc = None
         self._q = queue.Queue()
         self._stderr = []
@@ -131,7 +132,8 @@ class _Worker:
                 self._start()
             task = {"op": "search", "source": self.platform, "keyword": keyword,
                     "fetch_size": max(1, min(10, int(limit))), "limit": max(1, int(limit)),
-                    "budget_s": max(1.0, float(timeout))}
+                    "budget_s": max(1.0, float(timeout)),
+                    "netease_cookie": self.netease_cookie if self.platform == "NeteaseMusicClient" else ""}
             try:
                 self.proc.stdin.write((json.dumps(task, ensure_ascii=False) + "\n").encode("utf-8"))
                 self.proc.stdin.flush()
@@ -199,9 +201,10 @@ class NativeMusicDLProvider:
     svc = "musicdl"
 
     def __init__(self, platforms=None, work_dir="", search_limit=10, timeout=25,
-                 total_limit=50, total_timeout=40, ttl=1800):
+                 total_limit=50, total_timeout=40, ttl=1800, netease_cookie=""):
         self.platforms = [p for p in (platforms or DEFAULT_PLATFORMS) if p]
         self.work_dir = work_dir or os.path.join(ROOT_DIR, "data", "musicdl_outputs")
+        self.netease_cookie = str(netease_cookie or "").strip()
         self.search_limit = max(1, int(search_limit or 10))
         self.timeout = max(3.0, float(timeout or 25))
         self.total_limit = max(1, int(total_limit or 50))
@@ -225,7 +228,8 @@ class NativeMusicDLProvider:
                 return worker
             if worker is not None:
                 worker.close()
-            worker = _Worker(platform, self.work_dir, self.timeout)
+            worker = _Worker(platform, self.work_dir, self.timeout,
+                             netease_cookie=self.netease_cookie)
             with self._lock:
                 self._workers[platform] = worker
             return worker

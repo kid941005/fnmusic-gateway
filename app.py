@@ -818,6 +818,7 @@ def online_settings():
         "timeout": ONLINE_TIMEOUT,
         "total_limit": ONLINE_TOTAL_LIMIT,
         "total_timeout": ONLINE_TOTAL_TIMEOUT,
+        "netease_cookie": "",
     }
     if "enabled" in cfg:
         out["enabled"] = _truthy(cfg["enabled"])
@@ -831,6 +832,7 @@ def online_settings():
                 out[key] = int(cfg[key])
             except ValueError:
                 pass
+    out["netease_cookie"] = str(cfg.get("netease_cookie") or "")
     return out
 
 
@@ -852,7 +854,20 @@ def new_native_provider(settings=None, platforms=None, timeout=None):
         search_limit=s["search_limit"],
         timeout=timeout or s["timeout"],
         total_limit=s["total_limit"],
-        total_timeout=s["total_timeout"])
+        total_timeout=s["total_timeout"],
+        netease_cookie=s.get("netease_cookie") or "")
+
+
+def _clean_netease_cookie(value):
+    """校验并清理网易云 Cookie；空字符串表示清除。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) > 4096:
+        raise BadRequest("网易云 MUSIC_U Cookie 过长（最多 4096 字符）")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise BadRequest("网易云 MUSIC_U Cookie 含非法控制字符")
+    return text
 
 
 def _online_int(patch, key, low, high, label):
@@ -881,6 +896,12 @@ def save_online_settings(patch):
             if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,63}$", name):
                 raise BadRequest("%s 含非法平台名：%s" % (label, name))
         store[key] = ",".join(dict.fromkeys(rows))
+    if _truthy(patch.get("clear_netease_cookie")):
+        store["netease_cookie"] = ""
+    elif "netease_cookie" in patch:
+        cookie = _clean_netease_cookie(patch.get("netease_cookie"))
+        if cookie:
+            store["netease_cookie"] = cookie
     for key, low, high, label in (
             ("search_limit", 1, 10, "单平台搜索条数"),
             ("timeout", 3, 120, "单平台超时"),
@@ -1759,6 +1780,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_online_get(self):
         s = online_settings()
+        s["netease_cookie_set"] = bool(str(s.get("netease_cookie") or "").strip())
+        s.pop("netease_cookie", None)
         s["services"] = [{"source": "musicdl", "platform": p, "url": "native"}
                          for p in online_platforms(s)]
         s["deps_available"] = online_deps_available()

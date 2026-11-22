@@ -12,7 +12,7 @@ FIELDS = {
     "fnos": ("base", "username", "password", "device_id", "insecure_tls"),
     # 内置在线音源（musicdl）
     "online": ("enabled", "platforms", "extra_platforms", "search_limit",
-               "timeout", "total_limit", "total_timeout"),
+               "timeout", "total_limit", "total_timeout", "netease_cookie"),
     # 网页「高级设置」写入的运行参数（值统一按字符串保存）
     "advanced": (
         "quality_default", "max_limit", "preview_min_seconds", "url_ttl",

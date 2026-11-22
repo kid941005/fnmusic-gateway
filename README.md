@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.13.0**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.1**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -426,7 +426,8 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | GET | `/api/playlists` | 列出飞牛音乐歌单（未配飞牛返回 400） |
 | GET | `/api/playlist?name=&limit=` | 按歌单名列出飞牛曲目（未配飞牛返回 400） |
 | GET | `/api/favorites?limit=` | 列出飞牛收藏（未配飞牛返回 400） |
-| GET | `/api/play?query=\|playlist=&index=&quality=` | 取签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
+| GET | `/api/play?query=\|playlist=&index=&quality=` | 取单曲签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
+| GET | `/playlist/<token>.mp3?exp=&sig=&q=` | 歌单/收藏连续播放流（由 `music_play` 的 `playlist`/`favorites` 生成，设备读取到 EOF） |
 | GET | `/api/status` | 上一次播放的是什么 |
 | GET | `/api/sources` | 各在线音源探活结果 |
 | GET | `/api/storage` | 缓存与本地下载目录用量 |
@@ -454,7 +455,7 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | `music_playlists` | 列出飞牛音乐歌单（未配飞牛不可用） |
 | `music_playlist_tracks` | 按歌单名列出飞牛曲目（未配飞牛不可用） |
 | `music_favorites` | 列出飞牛收藏（未配飞牛不可用） |
-| `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；可选 `quality` |
+| `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；`playlist=歌单名` 或 `favorites=true` 连续播放整个列表；可选 `quality` |
 | `music_favorite` | 配了飞牛时直接写飞牛收藏；在线曲目 add 时按最高音质下载到本地下载目录 |
 | `music_status` | 上一次播放的是什么（含音质） |
 | `music_download` | 显式下载在线歌曲到本地下载目录，可指定音质 |
@@ -487,7 +488,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 122 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放与快速搜索，全离线（mock）
+python tests/test_gateway.py -v   # 125 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放，全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 

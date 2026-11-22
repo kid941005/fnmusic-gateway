@@ -49,13 +49,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from gwlib import __version__ as VERSION
 from gwlib.errors import BadRequest, GatewayError, as_payload
-from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, normalize_quality
+from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, get_profile, normalize_quality
 from gwlib.storage import LibraryStore, MediaCache, TranscodeSlots, audio_seconds
 from gwlib.sources import FallbackProvider, is_ext_guid
 from gwlib.native_source import (NativeMusicDLProvider,
                                   deps_available as online_deps_available,
                                   deps_error as online_deps_error)
 from gwlib.playback import PlaybackService
+from gwlib.playlist import PlaylistRegistry, iter_clean_mp3
 from gwlib.mcp_tools import build_tools
 from gwlib.mcp_server import McpHttpBridge, McpService
 from gwlib.config import ConfigStore
@@ -683,6 +684,7 @@ def save_state(d):
 _ADV_BOOT = advanced_settings()
 CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
                    transcode_slots=_TRANSCODE_SLOTS)
+PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=200)
 LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG,
                        max_bytes=_ADV_BOOT["library_max_mb"] * _MIB)
 
@@ -802,7 +804,17 @@ class FnProvider:
         return [str(_first(r, "name", "title", default="")) for r in rows][:limit]
 
     def favorites(self, limit=100):
-        return dedupe(norm_track(t) for t in _rows(self.client.favorite_list(1, limit)))
+        rows = []
+        page = 1
+        while len(rows) < limit:
+            batch = _rows(self.client.favorite_list(page, 50))
+            if not batch:
+                break
+            rows.extend(norm_track(t) for t in batch)
+            page += 1
+            if len(batch) < 50:
+                break
+        return dedupe(rows)[:limit]
 
     def stream(self, guid):
         return self.client.stream_bytes(guid)
@@ -1141,6 +1153,52 @@ def make_url(base, guid, ttl=None, quality=None):
         base, g, exp, sign(guid, exp), urllib.parse.quote(q, safe=""))
 
 
+def make_playlist_url(base, token, ttl=None, quality=None):
+    exp = int(time.time()) + (ttl or URL_TTL)
+    guid = "pl:" + str(token)
+    q = normalize_quality(quality or QUALITY_DEFAULT)
+    return "%s/playlist/%s.mp3?exp=%d&sig=%s&q=%s" % (
+        base, urllib.parse.quote(str(token), safe=""), exp, sign(guid, exp),
+        urllib.parse.quote(q, safe=""))
+
+
+def build_playlist_info(p, tracks, label, base, quality=None):
+    """把多首曲目登记为一个连续播放流，返回给设备的直链信息。"""
+    rows = [t for t in (tracks or []) if isinstance(t, dict) and t.get("guid")]
+    if not rows:
+        raise BadRequest("没有可以连续播放的曲目")
+    profile = get_profile(quality or QUALITY_DEFAULT)
+    token = PLAYLISTS.put(rows, quality=profile["name"], ttl=URL_TTL)
+    if not token:
+        raise BadRequest("没有可以连续播放的曲目")
+    url = make_playlist_url(base, token, ttl=URL_TTL, quality=profile["name"])
+    total_s = 0.0
+    for track in rows:
+        try:
+            total_s += float(track.get("duration_s") or 0)
+        except (TypeError, ValueError):
+            pass
+    first = rows[0]
+    try:
+        if hasattr(CACHE, "prefetch"):
+            CACHE.prefetch(first["guid"], p, quality=profile["name"])
+    except Exception:
+        LOG.debug("playlist first prefetch failed", exc_info=True)
+    return {
+        "guid": "pl:" + token, "title": label or "连续播放",
+        "artist": "%d 首" % len(rows), "album": "",
+        "url": url, "lyric_url": "", "expires_in": URL_TTL,
+        "quality": profile["name"], "quality_label": profile["label"],
+        "bitrate": profile["bitrate"], "source": "local",
+        "preview": False, "duration": total_s or None, "saving": False,
+        "preparing": True, "playlist_token": token, "count": len(rows),
+        "device_args": {"url": url, "title": label or "连续播放", "artist": "",
+                        "lyric_url": "", "duration": int(round(total_s)) if total_s else 0},
+        "device_tool": "self.music.play_url",
+        "spoken": "正在连续播放%s" % (label or "歌单"),
+    }
+
+
 def with_web_url(info):
     """给 WebUI 的同源播放地址，避免 PUBLIC_BASE 与当前访问主机不一致导致播放失败。"""
     out = dict(info)
@@ -1398,6 +1456,35 @@ def _tool_music_favorites(args, p, base, limit, quality):
 
 def _tool_music_play(args, p, base, limit, quality):
     guid = str(args.get("guid") or "").strip()
+    playlist = str(args.get("playlist") or "").strip()
+    fav_raw = args.get("favorites")
+    favorites = str(fav_raw).strip().lower() in ("1", "true", "yes", "on") if fav_raw is not None else False
+    if playlist.strip().lower() in ("收藏", "我的收藏", "收藏夹", "收藏的歌单"):
+        favorites, playlist = True, ""
+    if favorites or playlist:
+        if favorites:
+            rows, label = p.favorites(200), "收藏"
+        else:
+            pl = resolve_playlist(p, playlist)
+            if not pl:
+                raise BadRequest("没有找到歌单「%s」" % playlist)
+            rows = p.playlist_tracks(pl["guid"], 500)
+            label = "歌单「%s」" % pl["name"]
+        start = max(0, _to_int(args.get("index"), 1) - 1)
+        rows = rows[start:]
+        if not rows:
+            raise BadRequest("列表里没有可播放的歌曲")
+        info = build_playlist_info(p, rows, label, base, quality)
+        total = len(rows)
+        return ("准备连续播放：%s，从第 %d 首开始，共 %d 首\n"
+                "直链（%d 分钟内有效）：%s\n"
+                "整条歌单预计 %d 秒\n"
+                "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
+                "artist 留空，lyric_url 留空，duration 填 %d。"
+                % (label, start + 1, total,
+                   max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
+                   int(info.get("duration") or 0), info["title"],
+                   int(info.get("duration") or 0)))
     if guid:
         track = {"guid": guid, "title": str(args.get("title") or "").strip() or guid,
                  "artist": str(args.get("artist") or "").strip()}
@@ -1713,6 +1800,7 @@ class Handler(BaseHTTPRequestHandler):
         if not ADMIN_TOKEN:
             return True
         if (path in ("/", "/healthz") or path == "/play" or path.startswith("/play/")
+                or path == "/playlist" or path.startswith("/playlist/")
                 or path == "/lyrics" or path.startswith("/lyrics/")):
             return True
         return self._admin_credential_ok()
@@ -2034,6 +2122,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_readyz()
             if path == "/play" or path.startswith("/play/"):
                 return self._handle_play(u, qs)
+            if path == "/playlist" or path.startswith("/playlist/"):
+                return self._handle_playlist(u, qs)
             if path == "/lyrics" or path.startswith("/lyrics/"):
                 return self._handle_lyrics(u, qs)
             if path == "/api/search/stream":
@@ -2324,6 +2414,59 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except BrokenPipeError:
                 pass
+
+    def _handle_playlist(self, u, qs):
+        token = ""
+        if u.path.startswith("/playlist/"):
+            token = urllib.parse.unquote(u.path[len("/playlist/"):])
+            if token.endswith(".mp3"):
+                token = token[:-4]
+        if not token:
+            return self._json({"error": "missing playlist token"}, 400)
+        exp = (qs.get("exp") or [""])[0]
+        sig = (qs.get("sig") or [""])[0]
+        if not verify("pl:" + token, exp, sig):
+            return self._json({"error": "invalid or expired signature"}, 403)
+        item = PLAYLISTS.get(token)
+        if not item or not item.get("tracks"):
+            return self._json({"error": "playlist expired"}, 404)
+        quality = (qs.get("q") or [""])[0] or item.get("quality") or "standard"
+        p = provider()
+        tracks = item["tracks"]
+        first_path = None
+        start_index = 0
+        for i, track in enumerate(tracks):
+            try:
+                first_path = CACHE.ensure(track["guid"], p, quality=quality)
+                start_index = i
+                break
+            except Exception as exc:
+                LOG.warning("playlist track %s prepare failed: %s", track.get("guid"), exc)
+        if not first_path:
+            return self._json({"error": "playlist tracks are unavailable"}, 502)
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if self.command == "HEAD":
+            return
+        try:
+            for offset, track in enumerate(tracks[start_index:]):
+                if offset == 0:
+                    path = first_path
+                else:
+                    try:
+                        path = CACHE.ensure(track["guid"], p, quality=quality)
+                    except Exception as exc:
+                        LOG.warning("playlist track %s skipped: %s", track.get("guid"), exc)
+                        continue
+                for block in iter_clean_mp3(path):
+                    self.wfile.write(block)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def _handle_play(self, u, qs):
         guid = (qs.get("guid") or [""])[0]

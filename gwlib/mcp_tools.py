@@ -31,26 +31,29 @@ def build_tools():
         },
         {
             "name": "music_playlist_tracks",
-            "description": "按歌单名列出飞牛音乐里的曲目（未配置飞牛音乐时不可用）。",
+            "description": "按歌单名列出飞牛音乐里的曲目（未配置飞牛音乐时不可用）。要连续播放整张歌单，直接调用 music_play 并传 playlist=歌单名。",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["name"]},
         },
         {
             "name": "music_favorites",
-            "description": "列出飞牛音乐的收藏（未配置飞牛音乐时不可用）。",
+            "description": "列出飞牛音乐的收藏（未配置飞牛音乐时不可用）。要连续播放收藏，调用 music_play 并传 favorites=true。",
             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
         },
         {
             "name": "music_play",
             "description": ("拿一首歌的可播放直链，同时给出歌名、歌手、歌词直链、总时长（秒）和音质（设备屏显要用）。"
                             "优先传 music_search 返回的 guid（最稳，不会同名播错）；没有 guid 时 query/playlist 二选一，index 从 1 开始。"
+                            "playlist 会连续播放整张歌单，favorites=true 会连续播放收藏列表（播完自动结束），不用逐首调用。"
                             "拿到结果后必须调用设备工具 self.music.play_url，并把 url/title/artist/lyric_url/duration 五个参数都填上。"),
             "inputSchema": {"type": "object", "properties": {
                 "guid": {"type": "string", "description": "music_search 返回的曲目 guid，优先使用"},
                 "query": {"type": "string"},
-                "playlist": {"type": "string"}, "index": {"type": "integer"},
+                "playlist": {"type": "string", "description": "歌单名；会连续播放整张歌单"},
+                "favorites": {"type": "boolean", "description": "true=连续播放收藏列表"},
+                "index": {"type": "integer", "description": "从列表第几首开始，默认 1"},
                 "quality": QUALITY_PROP},
-                "anyOf": [{"required": ["guid"]}, {"required": ["query"]}, {"required": ["playlist"]}]},
+                "anyOf": [{"required": ["guid"]}, {"required": ["query"]}, {"required": ["playlist"]}, {"required": ["favorites"]}]},
         },
         {
             "name": "music_favorite",

@@ -247,6 +247,16 @@ class TestHttp(Base):
         self.assertEqual(r3.status, 206)
         self.assertEqual(len(part), 100)
 
+    def test_playlist_stream(self):
+        out = app.call_tool("music_play", {"playlist": "睡前"}, "http://h")
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path + ("?" + parsed.query if parsed.query else "")
+        r, body = self.req("GET", path, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.getheader("Content-Type"), "audio/mpeg")
+        self.assertGreater(len(body), 1024)
+
     def test_bad_signature(self):
         r, d = self.req("GET", "/api/play?query=" + urllib.parse.quote("晴天"))
         path = d["url"].split("://", 1)[1].split("/", 1)[1]
@@ -1362,6 +1372,20 @@ class TestV2Playback(unittest.TestCase):
             {"guid": "mock-1", "title": "晴天", "artist": "周杰伦"}, self._Provider(), "http://h")
         self.assertFalse(info2["saving"])
 
+    def test_music_play_playlist_returns_continuous_stream(self):
+        out = app.call_tool("music_play", {"playlist": "睡前"}, "http://h")
+        self.assertIn("连续播放", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        path = urllib.parse.urlparse(url).path
+        self.assertIn("/playlist/", path)
+        token = path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        self.assertTrue(app.PLAYLISTS.get(token))
+
+    def test_music_play_favorites_returns_continuous_stream(self):
+        out = app.call_tool("music_play", {"favorites": True}, "http://h")
+        self.assertIn("连续播放", out)
+        self.assertIn("收藏", out)
+
     def test_prepare_fast_returns_before_cache_is_ready(self):
         info = self._svc().prepare(
             {"guid": "ext:musicdl:e2", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
@@ -1557,7 +1581,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.0")
+        self.assertEqual(app.VERSION, "2.13.1")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

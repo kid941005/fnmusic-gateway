@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2.13.1 (2026-11-22)
+
+### 修复：播放收藏/歌单只播放第一首
+- 根因：MCP `music_play` 一直只返回一首歌的 `self.music.play_url`；传入 `playlist` 时也只取 `index` 指向的那一首，设备没有「下一首」接口，所以收藏/歌单永远停在一首。
+- 新增连续播放流：`music_play` 传 `playlist=歌单名` 或 `favorites=true` 时，把整个列表登记为签名播放流 `/playlist/<token>.mp3`；该响应按顺序把多首 MP3 拼成一条音频流（每首跳过 ID3 标签，避免中途标签破坏解码），设备的 `self.music.play_url` 会一直读到 EOF，自然实现整张歌单/收藏连播。
+- MCP 工具描述、`music_favorites`/`music_playlist_tracks` 说明同步提示「连续播放请用 `music_play` 的 `playlist`/`favorites`」，避免模型先 browse 再 index 只播一首。
+- 版本 2.13.0 → **2.13.1**；测试 **125 个用例**（新增歌单/收藏连续播放与 `/playlist/` 流回归）。
+
 ## 2.13.0 (2026-11-22)
 
 ### 优化：小智点歌全链路提速

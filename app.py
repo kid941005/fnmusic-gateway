@@ -697,7 +697,41 @@ def fast_search_tracks(p, query, limit=10, budget=None):
 # ---------------------------------------------------------------- 状态
 _state_lock = threading.Lock()
 # 最近一次通过 music_play 启动的连续流 token；music_next/previous/status 以它为游标。
-_CURRENT_PLAYLIST_TOKEN = None
+class _PlaylistCursors:
+    """按客户端/会话保存当前连续播放游标，避免多设备互相覆盖。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = {}
+
+    def set(self, key, token, index=0, started_at=None):
+        with self._lock:
+            self._items[str(key or "default")] = (
+                str(token or ""), max(0, int(index)),
+                float(started_at if started_at is not None else time.time()))
+
+    def get(self, key):
+        with self._lock:
+            item = self._items.get(str(key or "default"))
+            if not item:
+                return None
+            return {"token": item[0], "index": item[1], "started_at": item[2]}
+
+    def clear(self, key):
+        with self._lock:
+            self._items.pop(str(key or "default"), None)
+
+
+CURRENT_PLAYLISTS = _PlaylistCursors()
+
+
+def _session_key(args=None, fallback=""):
+    raw = ""
+    if isinstance(args, dict):
+        raw = args.get("_session_id") or args.get("session_id") or ""
+    if not raw:
+        raw = fallback or ""
+    return str(raw).strip() or "default"
 
 
 def load_state():
@@ -723,7 +757,7 @@ def save_state(d):
 _ADV_BOOT = advanced_settings()
 CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
                    transcode_slots=_TRANSCODE_SLOTS)
-PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=200)
+PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=500)
 LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG,
                        max_bytes=_ADV_BOOT["library_max_mb"] * _MIB)
 
@@ -1372,37 +1406,51 @@ def make_url(base, guid, ttl=None, quality=None):
         base, g, exp, sign(guid, exp, q), urllib.parse.quote(q, safe=""))
 
 
-def make_playlist_url(base, token, ttl=None, quality=None):
+def make_playlist_url(base, token, ttl=None, quality=None, session=""):
     exp = int(time.time()) + (ttl or URL_TTL)
     guid = "pl:" + str(token)
     q = normalize_quality(quality or QUALITY_DEFAULT)
-    return "%s/playlist/%s.mp3?exp=%d&sig=%s&q=%s" % (
+    url = "%s/playlist/%s.mp3?exp=%d&sig=%s&q=%s" % (
         base, urllib.parse.quote(str(token), safe=""), exp, sign(guid, exp, q),
         urllib.parse.quote(q, safe=""))
+    if session:
+        url += "&s=" + urllib.parse.quote(str(session), safe="")
+    return url
 
 
-def build_playlist_info(p, tracks, label, base, quality=None, action="连续播放"):
+def build_playlist_info(p, tracks, label, base, quality=None, action="连续播放",
+                        start_index=0, session_key=""):
     """把多首曲目登记为一个连续播放流，返回给设备的直链信息。
 
-    连续流仍然只有一个 URL，但设备屏显必须拿到「第一首」的歌名/歌手/歌词/单曲时长，
+    连续流仍然只有一个 URL，但设备屏显必须拿到「当前首」的歌名/歌手/歌词/单曲时长，
     不能把歌单名和整表总时长当成一首歌；后续曲目由 music_status 按播放游标回填。
     """
     rows = [t for t in (tracks or []) if isinstance(t, dict) and t.get("guid")]
     if not rows:
         raise BadRequest("没有可以连续播放的曲目")
+    try:
+        start_index = max(0, min(int(start_index or 0), len(rows) - 1))
+    except (TypeError, ValueError):
+        start_index = 0
     profile = get_profile(quality or QUALITY_DEFAULT)
     playlist_label = label or "连续播放"
     token = PLAYLISTS.put(rows, quality=profile["name"], ttl=URL_TTL, label=playlist_label)
     if not token:
         raise BadRequest("没有可以连续播放的曲目")
-    url = make_playlist_url(base, token, ttl=URL_TTL, quality=profile["name"])
+    stored = PLAYLISTS.get(token)
+    if not stored or len(stored.get("tracks") or []) < len(rows):
+        raise BadRequest("列表过长，最多支持 %d 首" % (len(stored.get("tracks") or []) if stored else 0))
+    # 共享列表上的 index 仅作为无会话信息时的兜底；实际播放游标按 session 保存。
+    PLAYLISTS.set_index(token, start_index, time.time())
+    url = make_playlist_url(base, token, ttl=URL_TTL, quality=profile["name"],
+                            session=session_key)
     total_s = 0.0
     for track in rows:
         try:
             total_s += float(track.get("duration_s") or 0)
         except (TypeError, ValueError):
             pass
-    first = rows[0]
+    first = rows[start_index]
     try:
         first_duration = float(first.get("duration_s") or 0)
     except (TypeError, ValueError):
@@ -1427,13 +1475,14 @@ def build_playlist_info(p, tracks, label, base, quality=None, action="连续播�
         "bitrate": profile["bitrate"], "source": "local",
         "preview": False, "duration": first_duration or None, "saving": False,
         "preparing": True, "playlist_token": token, "count": len(rows),
+        "start_index": start_index,
         "playlist_label": playlist_label, "playlist_duration": total_s or None,
         "device_args": {"url": url, "title": first_title, "artist": first_artist,
                         "lyric_url": first_lyric_url,
                         "duration": int(round(first_duration)) if first_duration else 0},
         "device_tool": "self.music.play_url",
-        "spoken": "正在%s%s，第 1 首 %s" % (action, playlist_label,
-                                            ("，".join(x for x in (first_title, first_artist) if x))),
+        "spoken": "正在%s%s，第 %d 首 %s" % (action, playlist_label, start_index + 1,
+                                             ("，".join(x for x in (first_title, first_artist) if x))),
     }
 
 
@@ -1745,7 +1794,7 @@ def _wants_shuffle(text):
 
 
 def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
-                       favorites=False, shuffle=False, index=1):
+                       favorites=False, shuffle=False, index=1, session_key=""):
     """把歌单/收藏/歌手/专辑解析成连续播放流，MCP 与 REST 共用。"""
     if artist:
         item = resolve_artist(p, artist)
@@ -1762,7 +1811,7 @@ def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
         rows = p.album_tracks(item["guid"], 500)
         label = "专辑「%s」" % item["name"]
     elif favorites:
-        rows, label = p.favorites(200), "收藏"
+        rows, label = p.favorites(500), "收藏"
     elif playlist:
         # 先找真实歌单；只有确实没有同名歌单时，才把「收藏」类短语当收藏。
         pl = resolve_playlist(p, playlist)
@@ -1770,7 +1819,7 @@ def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
             rows = p.playlist_tracks(pl["guid"], 500)
             label = "歌单「%s」" % pl["name"]
         elif _wants_favorites(playlist):
-            rows, label = p.favorites(200), "收藏"
+            rows, label = p.favorites(500), "收藏"
         else:
             names = "、".join(str(x.get("name") or "") for x in (p.playlists() or [])[:8])
             raise BadRequest("没有找到歌单「%s」%s" % (playlist, ("，现有：" + names) if names else ""))
@@ -1782,15 +1831,18 @@ def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
         action = "随机播放"
     else:
         start = max(0, _to_int(index, 1) - 1)
-        rows = rows[start:]
         action = "连续播放"
     if not rows:
         raise BadRequest("列表里没有可播放的歌曲")
-    info = build_playlist_info(p, rows, label, base, quality, action=action)
+    # 保留完整列表，start 使用绝对索引；状态/前后曲/剩余数量都基于同一份列表。
+    start = max(0, min(start, len(rows) - 1))
+    info = build_playlist_info(p, rows, label, base, quality, action=action,
+                               start_index=start, session_key=session_key)
     return info, label, start, bool(shuffle), action, rows
 
 
 def _tool_music_play(args, p, base, limit, quality):
+    session_key = _session_key(args)
     guid = str(args.get("guid") or "").strip()
     playlist = str(args.get("playlist") or "").strip()
     query_text = str(args.get("query") or "").strip()
@@ -1814,15 +1866,14 @@ def _tool_music_play(args, p, base, limit, quality):
         if len(pre_rows) >= 2 and len(names) == 1 and _norm_text(query_text) in names:
             artist = query_text
     if favorites or playlist or artist or album:
-        global _CURRENT_PLAYLIST_TOKEN
         info, label, start, shuffle, action, rows = build_list_playback(
             p, base, quality, playlist=playlist, artist=artist, album=album,
-            favorites=favorites, shuffle=shuffle, index=args.get("index"))
+            favorites=favorites, shuffle=shuffle, index=args.get("index"),
+            session_key=session_key)
         total = len(rows)
         token = info.get("playlist_token")
-        _CURRENT_PLAYLIST_TOKEN = token
         if token:
-            PLAYLISTS.set_index(token, 0, time.time())
+            CURRENT_PLAYLISTS.set(session_key, token, start, time.time())
         args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
         order_note = "，随机顺序" if shuffle else ""
         return ("准备%s：%s，共 %d 首%s，当前第 %d 首\n"
@@ -1841,6 +1892,8 @@ def _tool_music_play(args, p, base, limit, quality):
                    int(info.get("duration") or 0), args_json,
                    info.get("title") or "", info.get("artist") or "",
                    int(info.get("duration") or 0)))
+    # 单曲播放明确结束上一段连续流，避免 music_status 继续沿用旧歌单状态。
+    CURRENT_PLAYLISTS.clear(session_key)
     if guid:
         track = {"guid": guid, "title": str(args.get("title") or "").strip() or guid,
                  "artist": str(args.get("artist") or "").strip()}
@@ -1886,13 +1939,15 @@ def _tool_music_play(args, p, base, limit, quality):
 
 def _tool_music_skip(args, p, base, quality, delta):
     """在当前收藏/歌单连续流里前后跳一首，返回该单曲的完整 device_args。"""
-    token = _CURRENT_PLAYLIST_TOKEN
+    session_key = _session_key(args)
+    cursor = CURRENT_PLAYLISTS.get(session_key)
+    token = cursor.get("token") if cursor else None
     item = PLAYLISTS.get(token) if token else None
     if not item or not item.get("tracks"):
         return "当前没有正在播放的收藏或歌单。请先让我播放收藏/歌单，再说下一曲或上一曲。"
     tracks = item["tracks"]
     total = len(tracks)
-    current = int(item.get("index", 0))
+    current = int(cursor.get("index", 0)) if cursor else 0
     target = current + int(delta)
     if target < 0:
         return "已经是第一首了，没有上一首（共 %d 首，当前第 %d 首）。" % (total, current + 1)
@@ -1900,7 +1955,7 @@ def _tool_music_skip(args, p, base, quality, delta):
         return "已经是最后一首了（共 %d 首，当前第 %d 首）。" % (total, current + 1)
     track = tracks[target]
     info = PLAYBACK.prepare(dict(track), p, base, quality=quality, wait=False)
-    PLAYLISTS.set_index(token, target, time.time())
+    CURRENT_PLAYLISTS.set(session_key, token, target, time.time())
     args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
     what = "下一首" if delta > 0 else "上一首"
     return ("准备播放%s：%s%s\n"
@@ -1992,13 +2047,15 @@ def _tool_music_storage(args, p, base, limit, quality):
 
 def _tool_music_status(args, p, base, limit, quality):
     # 连续流有游标时，返回“正在播放”的第 N 首，供设备在播放中刷新歌名/歌词/单曲时长。
-    token = _CURRENT_PLAYLIST_TOKEN
+    session_key = _session_key(args)
+    cursor = CURRENT_PLAYLISTS.get(session_key)
+    token = cursor.get("token") if cursor else None
     item = PLAYLISTS.get(token) if token else None
     if item and item.get("tracks"):
         tracks = item["tracks"]
-        idx = max(0, min(int(item.get("index", 0)), len(tracks) - 1))
+        idx = max(0, min(int(cursor.get("index", 0)), len(tracks) - 1))
         track = tracks[idx]
-        started = float(item.get("started_at") or time.time())
+        started = float(cursor.get("started_at") or time.time())
         elapsed = max(0, int(time.time() - started))
         try:
             duration = int(float(track.get("duration_s") or 0))
@@ -2040,9 +2097,11 @@ _TOOL_HANDLERS = {
 }
 
 
-def call_tool(name, args, base):
+def call_tool(name, args, base, session_id=""):
     """按工具名分派到独立实现，便于阅读、单测和后续扩展。"""
-    args = args or {}
+    args = dict(args or {})
+    if session_id and not args.get("_session_id"):
+        args["_session_id"] = str(session_id)
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
         raise RuntimeError("未知工具：%s" % name)
@@ -2205,6 +2264,14 @@ class Handler(BaseHTTPRequestHandler):
         if not _HOST_RE.match(host):
             host = "127.0.0.1:%d" % PORT
         return "http://" + host
+
+    def _client_key(self):
+        """同一来源地址视为同一设备/会话；MCP 侧还可显式传 session_id。"""
+        try:
+            host = (self.client_address or ("",))[0]
+        except Exception:
+            host = ""
+        return str(host or "default")
 
     def _admin_cookie_ok(self):
         raw = self.headers.get("Cookie") or ""
@@ -2827,6 +2894,7 @@ class Handler(BaseHTTPRequestHandler):
             return 0.0
 
     def _handle_api_play(self, qs):
+        session_key = self._client_key()
         guid = (qs.get("guid") or [""])[0].strip()
         query = (qs.get("query") or qs.get("q") or [""])[0]
         playlist = (qs.get("playlist") or [""])[0]
@@ -2835,6 +2903,7 @@ class Handler(BaseHTTPRequestHandler):
         p = provider()
         if guid:
             # WebUI 直接按 guid 播放：不再按标题重搜，避免同名曲/排序变化点错歌。
+            CURRENT_PLAYLISTS.clear(session_key)
             track = {"guid": guid,
                      "title": (qs.get("title") or [guid])[0],
                      "artist": (qs.get("artist") or [""])[0]}
@@ -2849,9 +2918,12 @@ class Handler(BaseHTTPRequestHandler):
             # 收藏/歌手/专辑/随机播放走整列表连续流；纯 playlist 保持旧的单曲行为。
             info, label, start, shuffled, _action, rows = build_list_playback(
                 p, self._base(), quality, playlist=playlist, artist=artist, album=album,
-                favorites=favorites, shuffle=shuffle, index=index)
+                favorites=favorites, shuffle=shuffle, index=index, session_key=session_key)
             info.update({"label": label, "index": start + 1, "count": len(rows), "shuffle": shuffled})
+            if info.get("playlist_token"):
+                CURRENT_PLAYLISTS.set(session_key, info["playlist_token"], start, time.time())
             return self._json(with_web_url(info))
+        CURRENT_PLAYLISTS.clear(session_key)
         rows, label = pick_tracks(p, query, playlist, 20)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)
@@ -2921,9 +2993,16 @@ class Handler(BaseHTTPRequestHandler):
         quality = quality or item.get("quality") or "standard"
         p = provider()
         tracks = item["tracks"]
+        session_key = (qs.get("s") or [""])[0].strip() or self._client_key()
+        cursor = CURRENT_PLAYLISTS.get(session_key)
+        if cursor and cursor.get("token") == token:
+            start_hint = int(cursor.get("index", 0))
+        else:
+            start_hint = int(item.get("index", 0) or 0)
+        start_index = max(0, min(start_hint, len(tracks) - 1))
         first_path = None
-        start_index = 0
-        for i, track in enumerate(tracks):
+        for i in range(start_index, len(tracks)):
+            track = tracks[i]
             try:
                 first_path = CACHE.ensure(track["guid"], p, quality=quality)
                 start_index = i
@@ -2932,8 +3011,7 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.warning("playlist track %s prepare failed: %s", track.get("guid"), exc)
         if not first_path:
             return self._json({"error": "playlist tracks are unavailable"}, 502)
-        global _CURRENT_PLAYLIST_TOKEN
-        _CURRENT_PLAYLIST_TOKEN = token
+        CURRENT_PLAYLISTS.set(session_key, token, start_index, time.time())
         PLAYLISTS.set_index(token, start_index, time.time())
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
@@ -2953,7 +3031,7 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         LOG.warning("playlist track %s skipped: %s", track.get("guid"), exc)
                         continue
-                PLAYLISTS.set_index(token, start_index + offset, time.time())
+                CURRENT_PLAYLISTS.set(session_key, token, start_index + offset, time.time())
                 for block in iter_clean_mp3(path):
                     self.wfile.write(block)
                     self.wfile.flush()
@@ -3065,6 +3143,7 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type": self.headers.get("Content-Type") or "application/json",
             "Accept": self.headers.get("Accept") or "application/json, text/event-stream",
             "X-GW-Base": self._base(),
+            "X-GW-Session": self._client_key(),
         }
         for key in ("Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID"):
             value = self.headers.get(key)
@@ -3152,7 +3231,7 @@ class Handler(BaseHTTPRequestHandler):
                 name = params.get("name") or ""
                 args = params.get("arguments") or {}
                 try:
-                    text = call_tool(name, args, self._base())
+                    text = call_tool(name, args, self._base(), session_id=self._client_key())
                     return {"jsonrpc": "2.0", "id": mid, "result": {
                         "content": [{"type": "text", "text": text}], "isError": False}}
                 except Exception as e:

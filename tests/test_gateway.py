@@ -1731,6 +1731,42 @@ class TestOptim213(unittest.TestCase):
         self.assertIn("第 1/2 首", out)
         self.assertIn("时长：", out)
 
+    def test_music_play_favorites_index_uses_absolute_index(self):
+        out = app.call_tool("music_play", {"favorites": True, "index": 2,
+                                           "_session_id": "t-index"}, "http://h")
+        self.assertIn("共 2 首", out)
+        self.assertIn("当前第 2 首", out)
+        st = app.call_tool("music_status", {"_session_id": "t-index"}, "http://h")
+        self.assertIn("第 2/2 首", st)
+
+    def test_single_play_clears_only_its_playlist_cursor(self):
+        app.call_tool("music_play", {"favorites": True, "_session_id": "s-a"}, "http://h")
+        app.call_tool("music_play", {"query": "晴天", "_session_id": "s-a"}, "http://h")
+        st = app.call_tool("music_status", {"_session_id": "s-a"}, "http://h")
+        self.assertNotIn("来自：收藏", st)
+        self.assertIn("上一次播放", st)
+        app.call_tool("music_play", {"favorites": True, "_session_id": "s-b"}, "http://h")
+        st_b = app.call_tool("music_status", {"_session_id": "s-b"}, "http://h")
+        self.assertIn("来自：收藏", st_b)
+
+    def test_playlist_cursor_isolated_per_session(self):
+        app.call_tool("music_play", {"favorites": True, "_session_id": "c1"}, "http://h")
+        app.call_tool("music_play", {"query": "晴天", "_session_id": "c2"}, "http://h")
+        s1 = app.call_tool("music_status", {"_session_id": "c1"}, "http://h")
+        s2 = app.call_tool("music_status", {"_session_id": "c2"}, "http://h")
+        self.assertIn("来自：收藏", s1)
+        self.assertNotIn("来自：收藏", s2)
+
+    def test_playlist_limit_is_explicit_not_silently_truncated(self):
+        class P:
+            def favorites(self, limit=200):
+                return [{"guid": "x%d" % i, "title": "t%d" % i, "artist": "a"}
+                        for i in range(501)]
+
+        with self.assertRaises(app.BadRequest) as cm:
+            app.build_list_playback(P(), "http://h", favorites=True)
+        self.assertIn("列表过长", str(cm.exception))
+
 
 class TestOptim2135(unittest.TestCase):
     """2.13.5：provider 生命周期、缓存保护、搜索兜底、列表优先级。"""
@@ -1879,7 +1915,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.6")
+        self.assertEqual(app.VERSION, "2.13.7")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

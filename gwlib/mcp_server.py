@@ -53,7 +53,7 @@ DEFAULT_INSTRUCTIONS = (
 
 
 class McpService:
-    """把网关的 11 个工具注册进官方 MCPServer 2.3。"""
+    """把网关的 13 个工具注册进官方 MCPServer 2.3。"""
 
     def __init__(self, call_tool: Callable[[str, dict, str], str], version: str,
                  default_base: str | Callable[[], str],
@@ -95,6 +95,20 @@ class McpService:
         base = self._default_base() if callable(self._default_base) else self._default_base
         return (base or "").rstrip("/")
 
+    def _session_from_ctx(self, ctx: Any) -> str:
+        """客户端/会话标识：优先显式 X-GW-Session，其次 MCP 会话 id。"""
+        if ctx is not None:
+            try:
+                headers = ctx.headers or {}
+                for key in ("x-gw-session", "X-GW-Session",
+                            "mcp-session-id", "Mcp-Session-Id"):
+                    value = headers.get(key)
+                    if value:
+                        return str(value).strip()
+            except Exception:
+                pass
+        return ""
+
     def _make_tool(self, spec: dict) -> "Tool":
         name = spec["name"]
         description = spec.get("description") or ""
@@ -115,8 +129,12 @@ class McpService:
         async def _fn(**kwargs: Any) -> str:
             ctx = kwargs.pop("ctx", None)
             base = self._base_from_ctx(ctx)
+            session = self._session_from_ctx(ctx)
             try:
                 # call_tool 是同步实现（含 ffmpeg/HTTP），放到线程池避免阻塞事件循环。
+                if session:
+                    return await asyncio.to_thread(self._call_tool, name, dict(kwargs),
+                                                   base, session)
                 return await asyncio.to_thread(self._call_tool, name, dict(kwargs), base)
             except ToolError:
                 raise

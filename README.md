@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.13.6**（2026-11-22） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.7**（2026-11-23） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -290,7 +290,7 @@ compose 里已经包含 `fnmusic-bridge` 服务（填 `MCP_ENDPOINT` 就会启�
 ~~~bash
 export MCP_ENDPOINT='wss://xxx:59826/mcp_endpoint/mcp/?token=...'
 docker compose up -d            # fnmusic-gateway + fnmusic-bridge
-docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 11 个工具" 即成功
+docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 13 个工具" 即成功
 ~~~
 
 不填 `MCP_ENDPOINT` 时桥接器会一直重连、不影响网关本体。
@@ -450,7 +450,7 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地下载目录 |
 | POST | `/mcp` | MCP streamable-http（JSON-RPC） |
 
-### MCP 工具（11 个）
+### MCP 工具（13 个）
 
 | 工具 | 用途 |
 |---|---|
@@ -460,8 +460,10 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | `music_playlist_tracks` | 按歌单名列出飞牛曲目（未配飞牛不可用） |
 | `music_favorites` | 列出飞牛收藏（未配飞牛不可用） |
 | `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；`playlist=歌单名` 或 `favorites=true` 连续播放整个列表；可选 `quality` |
+| `music_next` | 在连续播放的收藏/歌单中切到下一首，返回新的直链与 device_args |
+| `music_previous` | 在连续播放的收藏/歌单中切到上一首，返回新的直链与 device_args |
 | `music_favorite` | 配了飞牛时直接写飞牛收藏；在线曲目 add 时按最高音质下载到本地下载目录 |
-| `music_status` | 上一次播放的是什么（含音质） |
+| `music_status` | 连续流返回当前曲目/歌词/已播放秒数；否则返回上一次播放（含音质） |
 | `music_download` | 显式下载在线歌曲到本地下载目录，可指定音质 |
 | `music_sources` | 查看内置在线音源平台可用性 |
 | `music_storage` | 查看播放缓存与本地下载目录用量 |
@@ -492,7 +494,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 145 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
+python tests/test_gateway.py -v   # 151 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -504,7 +506,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 
 | 项 | 结果 |
 |---|---|
-| 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 11 个工具、call_tool 正常 |
+| 官方 MCP SDK 3.12 客户端（streamable-http） | initialize 成功（协商 2025-11-25）、tools/list 13 个工具、call_tool 正常 |
 | 2.1.0 官方 MCPServer 2.3（mock） | 内部 uvicorn 随机回环端口启动成功；initialize / tools-list / tools-call / notification / 坏 JSON 全通过；66 用例全绿 |
 | `/api/play?query=晴天` | 返回签名直链 + 预热 65244 字节 |
 | 直链下载 | 200，`ffprobe`：mp3 / 44100 / 2ch / 128000 |
@@ -516,7 +518,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（145 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源、网易云 Cookie、扫码登录、provider 生命周期与缓存保护） | 全绿：签名/过期/篡改、Range 206、MCP initialize+11 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（151 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源、网易云 Cookie、扫码登录、provider 生命周期与缓存保护） | 全绿：签名/过期/篡改、Range 206、MCP initialize+13 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
 
 内置 musicdl 平台与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（平台可用性取决于上游风控与网络；飞牛可在网页「设置」里点测试连接确认）。
 

@@ -18,6 +18,7 @@ fnmusic-gateway，不需要再拉起一个 stdio MCP 进程。
 环境变量：
     MCP_ENDPOINT   必填，接入点地址（ws:// 或 wss://）
     GW_MCP_URL     fnmusic-gateway 的 MCP 端点，默认 http://127.0.0.1:8766/mcp
+    GW_PUBLIC_BASE 设备可访问的网关地址前缀；桥接模式必填，用于生成签名直链
     GW_ADMIN_TOKEN 网关管理令牌（设置 GW_ADMIN_TOKEN 时必填）
     GW_TIMEOUT     单次工具调用超时秒数，默认 120（搜索+预热转码可能较慢）
     GW_CONCURRENCY 并发转发的工具调用上限，默认 4（避免单个慢工具卡住后续请求）
@@ -29,11 +30,13 @@ import json
 import logging
 import os
 import sys
+import uuid
 import urllib.error
 import urllib.request
 
 ENDPOINT = (os.environ.get("MCP_ENDPOINT") or "").strip()
 GW_MCP_URL = (os.environ.get("GW_MCP_URL") or "http://127.0.0.1:8766/mcp").strip()
+GW_PUBLIC_BASE = (os.environ.get("GW_PUBLIC_BASE") or "").strip().rstrip("/")
 
 
 def _env_float(name, default):
@@ -72,14 +75,40 @@ def mask_url(url: str) -> str:
     return head + "token=" + keep + "***"
 
 
-def _post_sync(payload: bytes):
-    """同步 POST 到网关；返回 (响应 JSON 或 None, 是否通知)。"""
+def _headers(session=""):
+    """构造转发头；session 用于网关按设备隔离歌单游标。"""
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
     if GW_ADMIN_TOKEN:
         headers["X-Admin-Token"] = GW_ADMIN_TOKEN
+    if GW_PUBLIC_BASE:
+        headers["X-GW-Base"] = GW_PUBLIC_BASE
+    if str(session or "").strip():
+        headers["X-GW-Session"] = str(session).strip()
+    return headers
+
+
+def _session_hint(msg):
+    """从 JSON-RPC 帧里提取可用的设备/会话标识。"""
+    items = msg if isinstance(msg, list) else [msg]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        for source in (item, meta, params):
+            for key in ("session_id", "sessionId", "device_id", "deviceId"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _post_sync(payload: bytes, session=""):
+    """同步 POST 到网关；返回响应 JSON 或 None。"""
+    headers = _headers(session)
     req = urllib.request.Request(
         GW_MCP_URL,
         data=payload,
@@ -114,7 +143,7 @@ def _post_sync(payload: bytes):
         return None
 
 
-async def forward(raw: str):
+async def forward(raw: str, session: str = ""):
     """把一帧 WS 文本转发给网关，返回要回写给接入点的 JSON 字符串。"""
     try:
         msg = json.loads(raw)
@@ -122,11 +151,12 @@ async def forward(raw: str):
         LOG.warning("ignore non-json frame: %s", raw[:120])
         return None
 
+    session = _session_hint(msg) or str(session or "").strip()
     batch = msg if isinstance(msg, list) else [msg]
     requests = [m for m in batch if isinstance(m, dict) and m.get("id") is not None]
     if not requests:
         # 全是通知（notifications/initialized 等）：转发后无需回包
-        await asyncio.to_thread(_post_sync, raw.encode("utf-8"))
+        await asyncio.to_thread(_post_sync, raw.encode("utf-8"), session)
         return None
 
     for m in requests:
@@ -137,7 +167,7 @@ async def forward(raw: str):
         elif method:
             LOG.info("<- %s id=%s", method, m.get("id"))
 
-    resp = await asyncio.to_thread(_post_sync, raw.encode("utf-8"))
+    resp = await asyncio.to_thread(_post_sync, raw.encode("utf-8"), session)
     if resp is None:
         # 网关没回包（超时 / 202 空体）：给每个请求回一条 JSON-RPC 错误。
         # 不回包的话接入点会一直等，用户侧表现为"工具无响应"。
@@ -163,7 +193,10 @@ async def serve():
     if not ENDPOINT:
         LOG.error("MCP_ENDPOINT 未设置，例如 wss://host:59826/mcp_endpoint/mcp/?token=xxx")
         sys.exit(2)
-    LOG.info("gateway = %s", GW_MCP_URL)
+    if not GW_PUBLIC_BASE:
+        LOG.error("GW_PUBLIC_BASE 未设置：桥接模式下设备直链会指向容器内地址，请设置为设备可访问的公网/局域网地址后重启")
+        sys.exit(2)
+    LOG.info("gateway = %s (public_base=%s)", GW_MCP_URL, GW_PUBLIC_BASE)
     LOG.info("endpoint = %s", mask_url(ENDPOINT))
 
     backoff = INITIAL_BACKOFF
@@ -172,7 +205,8 @@ async def serve():
             async with websockets.connect(
                 ENDPOINT, ping_interval=20, ping_timeout=20, max_size=None
             ) as ws:
-                LOG.info("接入点已连接（并发上限 %d）", GW_CONCURRENCY)
+                conn_session = "bridge-" + uuid.uuid4().hex
+                LOG.info("接入点已连接（并发上限 %d，会话 %s）", GW_CONCURRENCY, conn_session)
                 backoff = INITIAL_BACKOFF
                 slots = asyncio.Semaphore(GW_CONCURRENCY)
                 send_lock = asyncio.Lock()
@@ -180,7 +214,7 @@ async def serve():
 
                 async def handle(raw_text):
                     async with slots:
-                        reply = await forward(raw_text)
+                        reply = await forward(raw_text, session=conn_session)
                     if reply:
                         async with send_lock:
                             await ws.send(reply)

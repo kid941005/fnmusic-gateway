@@ -1,5 +1,5 @@
 # ============================================================================
-# fnmusic-gateway 2.13.6 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
+# fnmusic-gateway 2.13.8 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
 #
 # 只发布 1 个宿主机端口 8766：
 #   浏览器 → http://NAS_IP:8766/          原生首页与设置页
@@ -72,6 +72,7 @@ services:
     environment:
       MCP_ENDPOINT: "${MCP_ENDPOINT:-}"                           # 小智接入点地址；留空会一直重连（不影响网关）
       GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"                # 容器内直连网关
+      GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-}"                      # 设备可访问的网关地址前缀；桥接模式必填
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"
       GW_CONCURRENCY: "${GW_CONCURRENCY:-4}"      # 桥接器同时转发的小智请求数
 

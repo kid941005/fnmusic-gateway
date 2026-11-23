@@ -109,6 +109,10 @@ class TestAdminToken(Base):
         r, _ = self.req("GET", "/play/not-a-guid.mp3?exp=1&sig=bad")
         self.assertNotEqual(r.status, 401)
 
+    def test_playlist_path_is_public(self):
+        r, _ = self.req("GET", "/playlist/not-a-token.mp3?exp=1&sig=bad")
+        self.assertNotEqual(r.status, 401)
+
     def test_search_stream_sse(self):
         r, data = self.req("GET", "/api/search/stream?q=" + urllib.parse.quote("晴天") + "&limit=5",
                            raw=True, headers={"X-Admin-Token": "test-secret"})
@@ -119,6 +123,12 @@ class TestAdminToken(Base):
 
 
 class TestPure(unittest.TestCase):
+    def test_device_base_validation(self):
+        self.assertEqual(app._device_base("https://music.example.com/"), "https://music.example.com")
+        self.assertEqual(app._device_base(" http://192.168.1.2:8766 "), "http://192.168.1.2:8766")
+        self.assertEqual(app._device_base("ftp://x"), "")
+        self.assertEqual(app._device_base("not-a-url"), "")
+
     def test_sign_verify(self):
         exp = int(app.time.time()) + 60
         sig = app.sign("g1", exp)
@@ -404,6 +414,50 @@ class TestHttp(Base):
         self.assertEqual(r.status, 400)
         r, _ = self.req("DELETE", "/mcp", raw=True)
         self.assertEqual(r.status, 204)
+
+    def test_mcp_uses_forwarded_public_base(self):
+        body = {"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": {"name": "music_play", "arguments": {"favorites": True}}}
+        r, d = self.req("POST", "/mcp", body, headers={
+            "X-GW-Base": "https://device.example.com",
+            "X-GW-Session": "base-test",
+        })
+        self.assertEqual(r.status, 200)
+        text = d["result"]["content"][0]["text"]
+        self.assertIn("https://device.example.com/playlist/", text)
+
+    def test_mcp_session_header_isolates_playlist_cursor(self):
+        body = {"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                "params": {"name": "music_play", "arguments": {"favorites": True}}}
+        self.req("POST", "/mcp", body, headers={"X-GW-Session": "mcp-iso-a"})
+
+        def status(session):
+            req = {"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                   "params": {"name": "music_status", "arguments": {}}}
+            r, d = self.req("POST", "/mcp", req, headers={"X-GW-Session": session})
+            self.assertEqual(r.status, 200)
+            return d["result"]["content"][0]["text"]
+
+        self.assertIn("来自：收藏", status("mcp-iso-a"))
+        self.assertNotIn("来自：收藏", status("mcp-iso-b"))
+
+
+class TestBridgeForwarding(unittest.TestCase):
+    """桥接器：会话提示与转发头。"""
+
+    def test_session_hint_and_headers(self):
+        import bridge.mcp_pipe_http as pipe
+        self.assertEqual(pipe._session_hint({"params": {"_meta": {"session_id": "dev-1"}}}), "dev-1")
+        self.assertEqual(pipe._session_hint({"session_id": "dev-2"}), "dev-2")
+        old_base, old_token = pipe.GW_PUBLIC_BASE, pipe.GW_ADMIN_TOKEN
+        try:
+            pipe.GW_PUBLIC_BASE = "https://device.example.com"
+            pipe.GW_ADMIN_TOKEN = ""
+            h = pipe._headers("dev-3")
+            self.assertEqual(h["X-GW-Session"], "dev-3")
+            self.assertEqual(h["X-GW-Base"], "https://device.example.com")
+        finally:
+            pipe.GW_PUBLIC_BASE, pipe.GW_ADMIN_TOKEN = old_base, old_token
 
 
 class TestCache(Base):
@@ -1915,7 +1969,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.7")
+        self.assertEqual(app.VERSION, "2.13.8")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

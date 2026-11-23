@@ -36,7 +36,8 @@ async def main():
         await ws.close()
 
     async with websockets.serve(handler, "127.0.0.1", PORT):
-        env = dict(os.environ, MCP_ENDPOINT="ws://127.0.0.1:%d/" % PORT, GW_MCP_URL=GW)
+        env = dict(os.environ, MCP_ENDPOINT="ws://127.0.0.1:%d/" % PORT, GW_MCP_URL=GW,
+                   GW_PUBLIC_BASE=os.environ.get("GW_PUBLIC_BASE", "http://127.0.0.1:8799"))
         proc = subprocess.Popen([sys.executable, "-u", "bridge/mcp_pipe_http.py"],
                                 cwd=HERE, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)

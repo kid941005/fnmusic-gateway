@@ -145,7 +145,7 @@ class McpService:
         _fn.__name__ = name
         _fn.__doc__ = description
         _fn.__signature__ = inspect.Signature(parameters=params)
-        tool = Tool.from_function(_fn, name=name, description=description)
+        tool = Tool.from_function(_fn, name=name, description=description, context_kwarg="ctx")
         # 用原始 schema 覆盖自动生成的 schema，保留 enum / anyOf / 中文描述。
         tool.parameters = schema
         return tool

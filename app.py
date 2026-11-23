@@ -94,6 +94,20 @@ def _truthy(v):
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _device_base(value):
+    """校验并规范化返回给设备的地址前缀（只接受 http/https）。"""
+    v = str(value or "").strip().rstrip("/")
+    if not v:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(v)
+    except Exception:
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return ""
+    return v
+
+
 def _safe_next_path(raw, default="/"):
     """登录后跳转只允许站内路径，防开放重定向。"""
     raw = str(raw or "").strip()
@@ -124,7 +138,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 HOST = _env("GW_HOST", "0.0.0.0")
 PORT = _env_int("GW_PORT", 8766)
 # 单端口：只监听 GW_PORT。PUBLIC_BASE 只影响返回给设备的直链前缀，不再额外开监听端口。
-PUBLIC_BASE = (_env("GW_PUBLIC_BASE", "") or "").rstrip("/")
+PUBLIC_BASE = _device_base(_env("GW_PUBLIC_BASE", "") or "")
 URL_TTL = _env_int("GW_URL_TTL", 900)
 CACHE_DIR = _env("GW_CACHE_DIR", os.path.join(DATA_DIR, "cache"))
 CACHE_MAX = _env_int("GW_CACHE_MAX_BYTES", 8 * 1024 ** 3)
@@ -2265,6 +2279,15 @@ class Handler(BaseHTTPRequestHandler):
             host = "127.0.0.1:%d" % PORT
         return "http://" + host
 
+    def _request_base(self):
+        """本次请求返回给设备的直链前缀：显式 PUBLIC_BASE 优先；桥接器可注入合法 X-GW-Base。"""
+        base = self._base()
+        if not PUBLIC_BASE:
+            incoming = _device_base(self.headers.get("X-GW-Base"))
+            if incoming:
+                base = incoming
+        return base
+
     def _client_key(self):
         """同一来源地址视为同一设备/会话；MCP 侧还可显式传 session_id。"""
         try:
@@ -2272,6 +2295,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             host = ""
         return str(host or "default")
+
+    def _mcp_session_key(self):
+        """MCP 会话键：优先客户端/桥接器显式注入的会话头，其次来源地址。"""
+        for key in ("X-GW-Session", "x-gw-session", "Mcp-Session-Id", "mcp-session-id"):
+            value = (self.headers.get(key) or "").strip()
+            if value:
+                return value
+        return self._client_key()
+
+    def _request_session_key(self, qs=None):
+        """REST 会话键：优先 ?session=/?s=，其次 X-GW-Session，最后来源地址。"""
+        if qs:
+            for key in ("session", "s"):
+                value = (qs.get(key) or [""])[0].strip()
+                if value:
+                    return value
+        value = (self.headers.get("X-GW-Session") or "").strip()
+        return value or self._client_key()
 
     def _admin_cookie_ok(self):
         raw = self.headers.get("Cookie") or ""
@@ -2894,7 +2935,7 @@ class Handler(BaseHTTPRequestHandler):
             return 0.0
 
     def _handle_api_play(self, qs):
-        session_key = self._client_key()
+        session_key = self._request_session_key(qs)
         guid = (qs.get("guid") or [""])[0].strip()
         query = (qs.get("query") or qs.get("q") or [""])[0]
         playlist = (qs.get("playlist") or [""])[0]
@@ -2993,7 +3034,7 @@ class Handler(BaseHTTPRequestHandler):
         quality = quality or item.get("quality") or "standard"
         p = provider()
         tracks = item["tracks"]
-        session_key = (qs.get("s") or [""])[0].strip() or self._client_key()
+        session_key = self._request_session_key(qs)
         cursor = CURRENT_PLAYLISTS.get(session_key)
         if cursor and cursor.get("token") == token:
             start_hint = int(cursor.get("index", 0))
@@ -3139,11 +3180,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"jsonrpc": "2.0", "id": None,
                                "error": {"code": -32600, "message": "payload too large"}}, 413)
         # 优先走官方 MCPServer 2.3 的 streamable-http；它只监听 127.0.0.1 随机端口。
+        # 桥接器与网关分容器时，Host 是容器内地址；桥接器可显式注入公网前缀。
+        base = self._request_base()
         headers = {
             "Content-Type": self.headers.get("Content-Type") or "application/json",
             "Accept": self.headers.get("Accept") or "application/json, text/event-stream",
-            "X-GW-Base": self._base(),
-            "X-GW-Session": self._client_key(),
+            "X-GW-Base": base,
+            "X-GW-Session": self._mcp_session_key(),
         }
         for key in ("Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID"):
             value = self.headers.get(key)
@@ -3231,7 +3274,7 @@ class Handler(BaseHTTPRequestHandler):
                 name = params.get("name") or ""
                 args = params.get("arguments") or {}
                 try:
-                    text = call_tool(name, args, self._base(), session_id=self._client_key())
+                    text = call_tool(name, args, self._request_base(), session_id=self._mcp_session_key())
                     return {"jsonrpc": "2.0", "id": mid, "result": {
                         "content": [{"type": "text", "text": text}], "isError": False}}
                 except Exception as e:
@@ -3260,6 +3303,8 @@ def main():
     srv = GatewayServer((HOST, PORT), Handler)
     LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB)",
              VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
+    if not PUBLIC_BASE:
+        LOG.warning("未设置 GW_PUBLIC_BASE：直连设备会按请求 Host 推导直链；使用 MCP 接入点(wss)桥接时设备会收到容器内地址，请设置 GW_PUBLIC_BASE 为设备可访问地址")
     if not ADMIN_TOKEN:
         LOG.warning("未设置 GW_ADMIN_TOKEN：管理接口、MCP 与 WebUI 均无鉴权，只应内网访问")
     try:

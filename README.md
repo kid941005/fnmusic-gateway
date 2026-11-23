@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.13.7**（2026-11-23） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.8**（2026-11-23） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -25,8 +25,8 @@
 - **点歌更快**：MCP 搜索结果带 `guid`，播放优先按 `guid` 直取，避免同名/重搜播错；边搜边返回，最多等约 8 秒先播已出现的结果。
 - **首播不等转码**：播放接口立即返回签名直链，音频在后台准备；标准音质且源本身是 MP3 时直接复用，跳过 ffmpeg。
 - **内置在线音源**：musicdl 直接内置在网关镜像里，按平台并行搜索、解析直链、播放与下载，不再依赖独立音源容器。
-- **安全外网**：只发布一个 8766；公网反代只转发 `/play/` 与 `/lyrics/`，管理面与 WebUI 不暴露。
-- **多种接入**：11 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
+- **安全外网**：只发布一个 8766；公网反代只转发 `/play/`、`/lyrics/` 与 `/playlist/`，管理面与 WebUI 不暴露。
+- **多种接入**：13 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
 - **音质可选**：`standard / high / exhigh / lossless` 四档，设备始终拿 MP3，下载保留原始音质。
 - **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地下载目录。
 - **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / config / settings_page / mcp_tools / mcp_server，新增音源或音质策略不改播放层与 MCP 层。
@@ -60,7 +60,7 @@
 | `gwlib/musicdl_worker.py` | 每平台独立 JSON 行 worker（隔离卡死） | `python -m gwlib.musicdl_worker` |
 | `gwlib/home_page.py` | `/` 原生首页 | `HOME_HTML` |
 | `gwlib/login_page.py` | `/login` 登录页 | `login_html` |
-| `gwlib/mcp_tools.py` | 11 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
+| `gwlib/mcp_tools.py` | 13 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
 | `gwlib/mcp_server.py` | 官方 MCPServer 2.3 工具注册 + 回环 HTTP 桥 | `McpService` / `McpHttpBridge` |
 
 新增音源只需实现 `search/stream/lyrics` 并注册到 `sources.py`；新增音质只改 `quality.py` 的 `PROFILES`，播放层与 MCP 层无需改动。
@@ -137,8 +137,8 @@ http://NAS_IP:8766/?token=<GW_ADMIN_TOKEN>
 
 - **只发布 8766**：网关容器 `ports: 8766:8766`；不再有音源容器。
 - **内部回环**：官方 MCPServer 2.3 在容器内 `127.0.0.1` 的随机端口启动，只给网关自己转发 `/mcp`。
-- **鉴权**：`GW_ADMIN_TOKEN` 保护 `/api/*`、`/mcp`、WebUI；浏览器打开 `/` 或 `/settings` 会跳 `/login`，密码即令牌，登录后 HttpOnly Cookie，`/logout` 退出；`/play/`、`/lyrics/`、`/healthz` 匿名。
-- **公网**：Lucky/nginx 只反代 8766 的 `/play/` 与 `/lyrics/`；不要反代 `/`、`/api/`、`/mcp`。
+- **鉴权**：`GW_ADMIN_TOKEN` 保护 `/api/*`、`/mcp`、WebUI；浏览器打开 `/` 或 `/settings` 会跳 `/login`，密码即令牌，登录后 HttpOnly Cookie，`/logout` 退出；`/play/`、`/lyrics/`、`/playlist/`、`/healthz` 匿名。
+- **公网**：Lucky/nginx 只反代 8766 的 `/play/`、`/lyrics/` 与 `/playlist/`；不要反代 `/`、`/api/`、`/mcp`。
 - **本地下载目录**：下载与边播边存写到容器内 `/music`，compose 已挂到宿主机 `./music`；改 `GW_MUSIC_DIR` 即可换目录。
 - **桥接器**：只有使用小智“MCP 接入点（wss）”时才需要；不填 `MCP_ENDPOINT` 会一直重连，不影响网关。
 
@@ -164,7 +164,7 @@ docker compose up -d
 |---|---|---|
 | `GW_HOST` | 0.0.0.0 | 监听地址 |
 | `GW_PORT` | 8766 | 唯一端口（REST + MCP + WebUI，**只留内网**） |
-| `GW_PUBLIC_BASE` | 空=按请求 Host 推导 | **设备能访问的地址**，如 `https://fnmusic.example.com`；单端口版不需要另开端口 |
+| `GW_PUBLIC_BASE` | 空=按请求 Host 推导（仅直连可用） | **设备能访问的地址**，如 `https://fnmusic.example.com`；使用 MCP 接入点(wss)桥接时**必须显式设置**，否则设备会收到容器内地址 |
 | `GW_URL_TTL` | 900 | 直链有效期（秒） |
 | `GW_SIGN_SECRET` | 空=自动生成 `/data/sign.key` | 签名密钥，多副本部署要一致 |
 | `GW_DATA` | `./data` | 状态/密钥/token/歌词落盘目录 |
@@ -175,7 +175,7 @@ docker compose up -d
 | `GW_LOG_LEVEL` | INFO | 日志级别 |
 | `GW_MCP_TIMEOUT` | 300 | 网关转发到官方 MCPServer 内部回环服务的超时（秒） |
 | `GW_MCP_SEARCH_BUDGET` | 8 | MCP `music_search` 最多等待秒数；到点先返回已搜到的结果，避免小智端超时 |
-| `GW_ADMIN_TOKEN` | 空=不鉴权 | 管理令牌；设置后除 `/play/`、`/lyrics/`、`/healthz` 外的接口都要带 `X-Admin-Token` 或 `Authorization: Bearer`。WebUI 打开 `/` 会跳登录页，密码即令牌；也兼容 `?token=` 换取 Cookie |
+| `GW_ADMIN_TOKEN` | 空=不鉴权 | 管理令牌；设置后除 `/play/`、`/lyrics/`、`/playlist/`、`/healthz` 外的接口都要带 `X-Admin-Token` 或 `Authorization: Bearer`。WebUI 打开 `/` 会跳登录页，密码即令牌；也兼容 `?token=` 换取 Cookie |
 
 ### 飞牛音乐（可选，优先级最高）
 
@@ -378,23 +378,24 @@ curl -s "<上一步的 lyric_url>" | head -3   # 期望 [00:29.36] 故事的小�
 
 注意：musicdl 平台常受上游风控与超时影响（例如 Migu 单次 15 秒仍可能 timeout），可在设置里适当调大 `GW_ONLINE_TIMEOUT` / `GW_ONLINE_TOTAL_TIMEOUT`，或换用更稳定的平台。
 
-## 公网：只反代 8766 的 /play/ 与 /lyrics/
+## 公网：只反代 8766 的 /play/、/lyrics/ 与 /playlist/
 
-整个服务只有一个监听端口 **8766**。公网只让 Lucky/nginx 转发两个路径前缀：
+整个服务只有一个监听端口 **8766**。公网只让 Lucky/nginx 转发三个路径前缀：
 
 | 请求 | 是否反代到公网 |
 |---|---|
 | `GET/HEAD /play/<guid>.mp3?exp=&sig=` | 是（支持 Range） |
 | `GET/HEAD /lyrics/<guid>.lrc?exp=&sig=` | 是 |
+| `GET/HEAD /playlist/<token>.mp3?exp=&sig=&q=` | 是（歌单/收藏连续播放流） |
 | `/`、`/api/*`、`/mcp`、`/healthz`、`/readyz` | **否**（`/` 即原生 WebUI） |
 
 Lucky 配置要点：
 
 - 前端地址：`https://fnmusic.example.com:59826`
 - 后端地址：`http://192.168.50.100:8766`
-- 路径规则：只放行 `/play/*` 与 `/lyrics/*`；其余路径直接拒绝
+- 路径规则：只放行 `/play/*`、`/lyrics/*` 与 `/playlist/*`；其余路径直接拒绝
 - **不要**把 `/`（WebUI）反代到公网；WebUI 走内网或 VPN
-- `GW_PUBLIC_BASE` 可留空（按请求 Host 推导），也可显式设成公网域名，设备直链会用它
+- `GW_PUBLIC_BASE` 直连时可留空（按请求 Host 推导）；**经 MCP 接入点桥接时必须显式设成公网域名**，否则设备会拿到容器内地址
 
 验证（应全部符合上表）：
 
@@ -405,7 +406,7 @@ curl -s -o /dev/null -w '%{http_code}' https://fnmusic.example.com/; echo   # We
 curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' https://fnmusic.example.com/mcp; echo
 ~~~
 
-> 即使反代规则配错，管理接口仍需 `GW_ADMIN_TOKEN`；但正确做法仍是只转发 `/play/` 与 `/lyrics/`。
+> 即使反代规则配错，管理接口仍需 `GW_ADMIN_TOKEN`；但正确做法仍是只转发 `/play/`、`/lyrics/` 与 `/playlist/`。
 
 ### hairpin：家里设备拉公网域名会失败怎么办
 
@@ -430,7 +431,7 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | GET | `/api/playlists` | 列出飞牛音乐歌单（未配飞牛返回 400） |
 | GET | `/api/playlist?name=&limit=` | 按歌单名列出飞牛曲目（未配飞牛返回 400） |
 | GET | `/api/favorites?limit=` | 列出飞牛收藏（未配飞牛返回 400） |
-| GET | `/api/play?query=\|playlist=&index=&quality=` | 取单曲签名直链；主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
+| GET | `/api/play?query=\|playlist=&index=&quality=` | 取单曲签名直链；`favorites/artist/album/shuffle` 会返回 `/playlist` 连续流。主要字段 `url/title/artist/lyric_url/quality/bitrate/device_args/source/preview/duration` |
 | GET | `/playlist/<token>.mp3?exp=&sig=&q=` | 歌单/收藏连续播放流（由 `music_play` 的 `playlist`/`favorites` 生成，设备读取到 EOF） |
 | GET | `/api/status` | 上一次播放的是什么 |
 | GET | `/api/sources` | 各在线音源探活结果 |
@@ -494,7 +495,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 151 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
+python tests/test_gateway.py -v   # 156 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -518,7 +519,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 | 多音源兜底（mock 网关 + 假 musicdl 上游） | `/api/search?q=七里香` → `ext:musicdl:s7`；`/api/play` → source/preview=true/duration=4.0；直链 200 |
 | 2.0 音质 `high`（mock） | `/api/play?query=晴天&quality=high` → `bitrate=192k`，直链 `q=high`，ffprobe `bit_rate=192000` |
 | 2.0 下载与存储（mock） | `POST /api/download` 落盘成功；`GET /api/storage` 返回 cache/library 用量 |
-| `tests/test_gateway.py`（151 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源、网易云 Cookie、扫码登录、provider 生命周期与缓存保护） | 全绿：签名/过期/篡改、Range 206、MCP initialize+13 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
+| `tests/test_gateway.py`（156 用例，含官方 MCPServer 2.3、管理令牌、登录页、飞牛设置页与内置在线音源、网易云 Cookie、扫码登录、provider 生命周期与缓存保护） | 全绿：签名/过期/篡改、Range 206、MCP initialize+13 工具+call_tool、参数校验、转码不留残片、歌词、搜索别名与排序、在线音源设置/探活、飞牛配置读写/测试连接/登出、自签证书开关、登录页/退出/开放重定向防护、音质档位与缓存分键、新 REST |
 
 内置 musicdl 平台与真实飞牛音乐仍需在 NAS 同网段按上面的「直链自测」验收一次（平台可用性取决于上游风控与网络；飞牛可在网页「设置」里点测试连接确认）。
 
@@ -531,7 +532,7 @@ python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools
 - **无封面与进度条**：固件只显示歌名、歌手和滚动歌词。
 - **单实例**：缓存与签名密钥都在本地，多副本要共享 `/data`。
 - **在线音源依赖上游**：未登录时常只给试听片段，且单源同一时刻通常只能跑一个；用多源时靠 `/healthz` 选活。
-- **管理面默认无鉴权**：不设 `GW_ADMIN_TOKEN` 时 `/api/*`、`/mcp`、WebUI 全部裸奔；部署包默认关闭，公网务必设置。公网只反代 `/play/` 与 `/lyrics/`，WebUI 走内网/VPN。
+- **管理面默认无鉴权**：不设 `GW_ADMIN_TOKEN` 时 `/api/*`、`/mcp`、WebUI 全部裸奔；部署包默认关闭，公网务必设置。公网只反代 `/play/`、`/lyrics/` 与 `/playlist/`，WebUI 走内网/VPN。
 
 ## 仓库结构
 
@@ -543,6 +544,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（117 用例）、bridge_selftest.py
+tests/                    test_gateway.py（156 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 可选桥接器（只发布 8766）
 ~~~

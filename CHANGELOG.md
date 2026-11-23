@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2.13.8 (2026-11-23)
+
+### 修复：桥接直链、会话隔离与反向代理文档
+- **设备直链**：新增 `_device_base()` 校验并规范化 `GW_PUBLIC_BASE`（仅接受 http/https）；网关在未设置该变量时启动告警。桥接器新增 `GW_PUBLIC_BASE` 必填校验，并统一转发 `X-GW-Base`，避免设备收到容器内地址。
+- **会话隔离**：网关 MCP 会话键优先 `X-GW-Session` / `Mcp-Session-Id`，REST 优先 `?session=` / `?s=`；桥接器为每条接入点连接生成 `bridge-<uuid>` 会话并透传，同时支持从 JSON-RPC 帧提取 `session_id/device_id`。
+- **Context 注入修复**：官方 MCPServer 2.3 下显式使用 `Tool.from_function(..., context_kwarg="ctx")`，修复此前 `ctx` 为 None 导致转发头不生效的问题。
+- **文档**：README 与部署 README 的公网反代说明补充 `/playlist/*`；`.env.example` 与 compose 补充 `GW_PUBLIC_BASE`；README 工具数/测试数更新为 13/156。
+- 版本 2.13.7 → **2.13.8**；测试 **156 个用例**。
+
 ## 2.13.7 (2026-11-23)
 
 ### 修复：连续播放状态与工具文档

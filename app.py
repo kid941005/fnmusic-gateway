@@ -696,6 +696,8 @@ def fast_search_tracks(p, query, limit=10, budget=None):
 
 # ---------------------------------------------------------------- 状态
 _state_lock = threading.Lock()
+# 最近一次通过 music_play 启动的连续流 token；music_next/previous/status 以它为游标。
+_CURRENT_PLAYLIST_TOKEN = None
 
 
 def load_state():
@@ -1380,12 +1382,17 @@ def make_playlist_url(base, token, ttl=None, quality=None):
 
 
 def build_playlist_info(p, tracks, label, base, quality=None, action="连续播放"):
-    """把多首曲目登记为一个连续播放流，返回给设备的直链信息。"""
+    """把多首曲目登记为一个连续播放流，返回给设备的直链信息。
+
+    连续流仍然只有一个 URL，但设备屏显必须拿到「第一首」的歌名/歌手/歌词/单曲时长，
+    不能把歌单名和整表总时长当成一首歌；后续曲目由 music_status 按播放游标回填。
+    """
     rows = [t for t in (tracks or []) if isinstance(t, dict) and t.get("guid")]
     if not rows:
         raise BadRequest("没有可以连续播放的曲目")
     profile = get_profile(quality or QUALITY_DEFAULT)
-    token = PLAYLISTS.put(rows, quality=profile["name"], ttl=URL_TTL)
+    playlist_label = label or "连续播放"
+    token = PLAYLISTS.put(rows, quality=profile["name"], ttl=URL_TTL, label=playlist_label)
     if not token:
         raise BadRequest("没有可以连续播放的曲目")
     url = make_playlist_url(base, token, ttl=URL_TTL, quality=profile["name"])
@@ -1397,22 +1404,36 @@ def build_playlist_info(p, tracks, label, base, quality=None, action="连续播�
             pass
     first = rows[0]
     try:
+        first_duration = float(first.get("duration_s") or 0)
+    except (TypeError, ValueError):
+        first_duration = 0.0
+    first_title = str(first.get("title") or "").strip() or playlist_label
+    first_artist = str(first.get("artist") or "").strip()
+    try:
+        first_lyric_url = lyric_url_for(base, first)
+    except Exception:
+        LOG.debug("playlist first lyric url failed", exc_info=True)
+        first_lyric_url = ""
+    try:
         if hasattr(CACHE, "prefetch"):
             CACHE.prefetch(first["guid"], p, quality=profile["name"])
     except Exception:
         LOG.debug("playlist first prefetch failed", exc_info=True)
     return {
-        "guid": "pl:" + token, "title": label or "连续播放",
-        "artist": "%d 首" % len(rows), "album": "",
-        "url": url, "lyric_url": "", "expires_in": URL_TTL,
+        "guid": "pl:" + token, "title": first_title,
+        "artist": first_artist, "album": "",
+        "url": url, "lyric_url": first_lyric_url, "expires_in": URL_TTL,
         "quality": profile["name"], "quality_label": profile["label"],
         "bitrate": profile["bitrate"], "source": "local",
-        "preview": False, "duration": total_s or None, "saving": False,
+        "preview": False, "duration": first_duration or None, "saving": False,
         "preparing": True, "playlist_token": token, "count": len(rows),
-        "device_args": {"url": url, "title": label or "连续播放", "artist": "",
-                        "lyric_url": "", "duration": int(round(total_s)) if total_s else 0},
+        "playlist_label": playlist_label, "playlist_duration": total_s or None,
+        "device_args": {"url": url, "title": first_title, "artist": first_artist,
+                        "lyric_url": first_lyric_url,
+                        "duration": int(round(first_duration)) if first_duration else 0},
         "device_tool": "self.music.play_url",
-        "spoken": "正在%s%s" % (action, label or "歌单"),
+        "spoken": "正在%s%s，第 1 首 %s" % (action, playlist_label,
+                                            ("，".join(x for x in (first_title, first_artist) if x))),
     }
 
 
@@ -1602,6 +1623,33 @@ def lyric_url_for(base, track, ttl=None):
     return make_lyric_url(base, guid, ttl, track.get("title"), track.get("artist"))
 
 
+def _lrc_line_at(track, elapsed_s):
+    """从已缓存的 LRC 里取 elapsed_s 对应的当前歌词行；没有缓存或没有时间轴时返回空串。"""
+    guid = str((track or {}).get("guid") or "")
+    if not guid:
+        return ""
+    try:
+        path = lyric_cache_path(guid)
+        if os.path.getsize(path) <= 0:
+            return ""
+        with open(path, "r", encoding="utf-8", errors="replace") as fp:
+            text = fp.read(LYRIC_MAX_BYTES)
+    except OSError:
+        return ""
+    best, best_ts = "", -1.0
+    for line in text.splitlines():
+        m = re.match(r"^\s*\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\](.*)$", line)
+        if not m:
+            continue
+        mm, ss, frac, body = int(m.group(1)), int(m.group(2)), m.group(3) or "0", m.group(4).strip()
+        ts = mm * 60 + ss + int(frac.ljust(3, "0")[:3]) / 1000.0
+        if ts <= elapsed_s + 0.05:
+            best, best_ts = body, ts
+        else:
+            break
+    return best if best_ts >= 0 else ""
+
+
 PLAYBACK = PlaybackService(CACHE, LIBRARY, make_url, lyric_url_for, audio_seconds,
                            save_state, default_quality=_ADV_BOOT["quality_default"],
                            ttl=_ADV_BOOT["url_ttl"],
@@ -1766,18 +1814,32 @@ def _tool_music_play(args, p, base, limit, quality):
         if len(pre_rows) >= 2 and len(names) == 1 and _norm_text(query_text) in names:
             artist = query_text
     if favorites or playlist or artist or album:
+        global _CURRENT_PLAYLIST_TOKEN
         info, label, start, shuffle, action, rows = build_list_playback(
             p, base, quality, playlist=playlist, artist=artist, album=album,
             favorites=favorites, shuffle=shuffle, index=args.get("index"))
         total = len(rows)
-        return ("准备%s：%s，%s，共 %d 首\n"
+        token = info.get("playlist_token")
+        _CURRENT_PLAYLIST_TOKEN = token
+        if token:
+            PLAYLISTS.set_index(token, 0, time.time())
+        args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
+        order_note = "，随机顺序" if shuffle else ""
+        return ("准备%s：%s，共 %d 首%s，当前第 %d 首\n"
+                "歌曲：%s%s\n"
                 "直链（%d 分钟内有效）：%s\n"
-                "整条歌单预计 %d 秒\n"
-                "设备工具：self.music.play_url，参数 url 填上面的直链，title 填「%s」，"
-                "artist 留空，lyric_url 留空，duration 填 %d。"
-                % (action, label, ("随机顺序" if shuffle else "从第 %d 首开始" % (start + 1)), total,
+                "歌词直链：%s\n"
+                "单曲时长：%d 秒\n"
+                "device_args：%s\n"
+                "设备工具：self.music.play_url。参数取 device_args：url 填直链，title 填「%s」，"
+                "artist 填「%s」，lyric_url 填歌词直链（没有就留空），duration 填 %d。"
+                "歌词由设备每 10 秒通过 music_status 自动刷新；说「下一曲/上一曲」时调用 music_next/music_previous 后再用 self.music.play_url 播放新的 device_args。"
+                % (action, label, total, order_note, start + 1,
+                   info.get("title") or "", (" - " + info.get("artist")) if info.get("artist") else "",
                    max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
-                   int(info.get("duration") or 0), info["title"],
+                   info.get("lyric_url") or "（暂未取到，留空）",
+                   int(info.get("duration") or 0), args_json,
+                   info.get("title") or "", info.get("artist") or "",
                    int(info.get("duration") or 0)))
     if guid:
         track = {"guid": guid, "title": str(args.get("title") or "").strip() or guid,
@@ -1820,6 +1882,50 @@ def _tool_music_play(args, p, base, limit, quality):
                 info["lyric_url"] or "（这首歌查不到歌词，留空即可）",
                 int(info.get("duration") or 0),
                 info["title"], info["artist"] or "", int(info.get("duration") or 0)))
+
+
+def _tool_music_skip(args, p, base, quality, delta):
+    """在当前收藏/歌单连续流里前后跳一首，返回该单曲的完整 device_args。"""
+    token = _CURRENT_PLAYLIST_TOKEN
+    item = PLAYLISTS.get(token) if token else None
+    if not item or not item.get("tracks"):
+        return "当前没有正在播放的收藏或歌单。请先让我播放收藏/歌单，再说下一曲或上一曲。"
+    tracks = item["tracks"]
+    total = len(tracks)
+    current = int(item.get("index", 0))
+    target = current + int(delta)
+    if target < 0:
+        return "已经是第一首了，没有上一首（共 %d 首，当前第 %d 首）。" % (total, current + 1)
+    if target >= total:
+        return "已经是最后一首了（共 %d 首，当前第 %d 首）。" % (total, current + 1)
+    track = tracks[target]
+    info = PLAYBACK.prepare(dict(track), p, base, quality=quality, wait=False)
+    PLAYLISTS.set_index(token, target, time.time())
+    args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
+    what = "下一首" if delta > 0 else "上一首"
+    return ("准备播放%s：%s%s\n"
+            "来自：%s 第 %d/%d 首\n"
+            "直链（%d 分钟内有效）：%s\n"
+            "歌词直链：%s\n"
+            "单曲时长：%d 秒\n"
+            "device_args：%s\n"
+            "设备工具：self.music.play_url。参数取 device_args：url 填直链，title 填「%s」，"
+            "artist 填「%s」，lyric_url 填歌词直链（没有就留空），duration 填 %d。"
+            % (what, info.get("title") or "", (" - " + info.get("artist")) if info.get("artist") else "",
+               item.get("label") or "当前歌单", target + 1, total,
+               max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
+               info.get("lyric_url") or "（这首歌查不到歌词，留空即可）",
+               int(info.get("duration") or 0), args_json,
+               info.get("title") or "", info.get("artist") or "",
+               int(info.get("duration") or 0)))
+
+
+def _tool_music_next(args, p, base, limit, quality):
+    return _tool_music_skip(args, p, base, quality, +1)
+
+
+def _tool_music_previous(args, p, base, limit, quality):
+    return _tool_music_skip(args, p, base, quality, -1)
 
 
 def _tool_music_favorite(args, p, base, limit, quality):
@@ -1885,6 +1991,28 @@ def _tool_music_storage(args, p, base, limit, quality):
 
 
 def _tool_music_status(args, p, base, limit, quality):
+    # 连续流有游标时，返回“正在播放”的第 N 首，供设备在播放中刷新歌名/歌词/单曲时长。
+    token = _CURRENT_PLAYLIST_TOKEN
+    item = PLAYLISTS.get(token) if token else None
+    if item and item.get("tracks"):
+        tracks = item["tracks"]
+        idx = max(0, min(int(item.get("index", 0)), len(tracks) - 1))
+        track = tracks[idx]
+        started = float(item.get("started_at") or time.time())
+        elapsed = max(0, int(time.time() - started))
+        try:
+            duration = int(float(track.get("duration_s") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        lyric = _lrc_line_at(track, elapsed)
+        return ("正在播放：%s%s\n"
+                "来自：%s 第 %d/%d 首\n"
+                "时长：%d 秒\n"
+                "已播放：%d 秒\n"
+                "歌词：%s" % (
+                    track.get("title") or "", (" - " + track["artist"]) if track.get("artist") else "",
+                    item.get("label") or "当前歌单", idx + 1, len(tracks),
+                    duration, elapsed, lyric))
     st = load_state()
     if not st.get("title"):
         return "还没播放过。"
@@ -1902,6 +2030,8 @@ _TOOL_HANDLERS = {
     "music_playlist_tracks": _tool_music_playlist_tracks,
     "music_favorites": _tool_music_favorites,
     "music_play": _tool_music_play,
+    "music_next": _tool_music_next,
+    "music_previous": _tool_music_previous,
     "music_favorite": _tool_music_favorite,
     "music_download": _tool_music_download,
     "music_sources": _tool_music_sources,
@@ -2802,6 +2932,9 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.warning("playlist track %s prepare failed: %s", track.get("guid"), exc)
         if not first_path:
             return self._json({"error": "playlist tracks are unavailable"}, 502)
+        global _CURRENT_PLAYLIST_TOKEN
+        _CURRENT_PLAYLIST_TOKEN = token
+        PLAYLISTS.set_index(token, start_index, time.time())
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
         self.send_header("Cache-Control", "no-store")
@@ -2820,6 +2953,7 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         LOG.warning("playlist track %s skipped: %s", track.get("guid"), exc)
                         continue
+                PLAYLISTS.set_index(token, start_index + offset, time.time())
                 for block in iter_clean_mp3(path):
                     self.wfile.write(block)
                     self.wfile.flush()

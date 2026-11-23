@@ -25,7 +25,7 @@ class PlaylistRegistry:
         for key in dead:
             self._items.pop(key, None)
 
-    def put(self, tracks, quality="standard", ttl=None):
+    def put(self, tracks, quality="standard", ttl=None, label=""):
         clean = []
         for track in tracks or []:
             if not isinstance(track, dict) or not track.get("guid"):
@@ -47,6 +47,9 @@ class PlaylistRegistry:
                 "tracks": clean,
                 "quality": str(quality or "standard"),
                 "expires": time.time() + (self.ttl if ttl is None else max(1, int(ttl))),
+                "label": str(label or ""),
+                "index": 0,
+                "started_at": time.time(),
             }
         return token
 
@@ -60,7 +63,24 @@ class PlaylistRegistry:
                 "tracks": [dict(t) for t in item["tracks"]],
                 "quality": item["quality"],
                 "expires": item["expires"],
+                "label": item.get("label", ""),
+                "index": int(item.get("index", 0)),
+                "started_at": float(item.get("started_at", time.time())),
             }
+
+    def set_index(self, token, index, started_at=None):
+        """记录连续流当前播到第几首（用于 music_next/music_previous/music_status）。"""
+        with self._lock:
+            item = self._items.get(str(token or ""))
+            if not item:
+                return False
+            try:
+                idx = int(index)
+            except (TypeError, ValueError):
+                return False
+            item["index"] = max(0, min(idx, len(item["tracks"]) - 1))
+            item["started_at"] = float(started_at if started_at is not None else time.time())
+            return True
 
     def pop(self, token):
         with self._lock:

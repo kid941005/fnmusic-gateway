@@ -62,6 +62,18 @@ def build_tools():
                 "anyOf": [{"required": ["guid"]}, {"required": ["query"]}, {"required": ["playlist"]}, {"required": ["artist"]}, {"required": ["album"]}, {"required": ["favorites"]}]},
         },
         {
+            "name": "music_next",
+            "description": ("播放当前收藏/歌单的下一首。必须在 music_play 以 playlist/favorites/artist/album 播放过之后使用；"
+                            "返回该单曲的 device_args（url 与上一首不同，含 title/artist/lyric_url/duration），"
+                            "拿到后调用设备工具 self.music.play_url 播放。已经是最后一首时不会从头开始。"),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "music_previous",
+            "description": ("播放当前收藏/歌单的上一首。规则同 music_next；已经是第一首时不会循环到末尾。"),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
             "name": "music_favorite",
             "description": "收藏或取消收藏一首歌。action=add|remove，query 是歌名。配了飞牛音乐时直接写飞牛收藏；在线音源曲目 add 会按最高音质下载到本地下载目录（需配置 GW_DOWNLOAD_DIR）。",
             "inputSchema": {"type": "object", "properties": {
@@ -70,7 +82,7 @@ def build_tools():
         },
         {
             "name": "music_status",
-            "description": "上一次播放的是什么（含音质）。",
+            "description": "查询当前播放状态。连续流播放时返回当前第几首、歌名/歌手、单曲时长、已播放秒数和当前歌词行；没有连续流时返回上一次播放信息。",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {

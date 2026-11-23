@@ -394,7 +394,7 @@ class TestHttp(Base):
         self.assertTrue(r.getheader("Mcp-Session-Id"))
         self.assertEqual(d["result"]["serverInfo"]["name"], "fnmusic-gateway")
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(d["result"]["tools"]), 11)
+        self.assertEqual(len(d["result"]["tools"]), 13)
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                          "params": {"name": "music_status", "arguments": {}}})
         self.assertIn("content", d["result"])
@@ -1379,7 +1379,7 @@ class TestV2Quality(unittest.TestCase):
 
     def test_tool_catalog(self):
         names = [t["name"] for t in app.TOOLS]
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), 13)
         for n in ("music_download", "music_sources", "music_storage"):
             self.assertIn(n, names)
         play = [t for t in app.TOOLS if t["name"] == "music_play"][0]
@@ -1703,6 +1703,33 @@ class TestOptim213(unittest.TestCase):
         token = urllib.parse.urlparse(url).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
         self.assertEqual([t["guid"] for t in app.PLAYLISTS.get(token)["tracks"]],
                          ["mock-6", "mock-5"])
+
+    def _device_args(self, out):
+        line = [ln for ln in out.splitlines() if ln.startswith("device_args：")][-1]
+        return json.loads(line.split("：", 1)[1])
+
+    def test_music_next_returns_next_track_and_clamps(self):
+        first = app.call_tool("music_play", {"favorites": True}, "http://h")
+        self.assertIn("当前第 1 首", first)
+        args0 = self._device_args(first)
+        nxt = app.call_tool("music_next", {}, "http://h")
+        self.assertIn("准备播放下一首", nxt)
+        self.assertIn("第 2/2 首", nxt)
+        args1 = self._device_args(nxt)
+        self.assertNotEqual(args0["url"], args1["url"])
+        self.assertTrue(args1["title"])
+        over = app.call_tool("music_next", {}, "http://h")
+        self.assertIn("已经是最后一首", over)
+        prev = app.call_tool("music_previous", {}, "http://h")
+        self.assertIn("准备播放上一首", prev)
+        self.assertIn("第 1/2 首", prev)
+
+    def test_music_status_reports_current_track_and_lyric(self):
+        app.call_tool("music_play", {"favorites": True}, "http://h")
+        out = app.call_tool("music_status", {}, "http://h")
+        self.assertIn("正在播放", out)
+        self.assertIn("第 1/2 首", out)
+        self.assertIn("时长：", out)
 
 
 class TestOptim2135(unittest.TestCase):

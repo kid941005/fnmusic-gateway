@@ -366,6 +366,53 @@ class FnMusicClient:
             raise FnMusicError("stream empty body (%s)" % url)
         return ctype, total
 
+    def iter_stream(self, track_guid, retry=True):
+        """打开 /track/stream，按块返回，供网关边收边播；错误处理与 stream_to_path 一致。"""
+        url, headers, _ = self._build("/track/stream", {"guid": track_guid}, None)
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl)
+        except urllib.error.HTTPError as e:
+            head = e.read()[:200]
+            e.close()
+            if retry and self.username and self.password and self._invalid_token(e.code, self._decode_json(head)):
+                self.token = None
+                self.login()
+                return self.iter_stream(track_guid, retry=False)
+            raise FnMusicError("stream status=%s head=%r" % (e.code, head), e.code)
+        except Exception as e:
+            raise FnMusicError("stream network: %s (%s)" % (e, url))
+        ctype = resp.headers.get("Content-Type", "")
+        if "json" in ctype.lower():
+            raw = resp.read()
+            resp.close()
+            env = self._decode_json(raw)
+            if retry and self.username and self.password and self._invalid_token(200, env):
+                self.token = None
+                self.login()
+                return self.iter_stream(track_guid, retry=False)
+            raise FnMusicError("stream error body=%r" % raw[:200], 200,
+                               (env or {}).get("code"))
+
+        def _iter():
+            total = 0
+            try:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    yield chunk
+                if not total:
+                    raise FnMusicError("stream empty body (%s)" % url)
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+        return ctype, _iter()
+
     def stream_bytes(self, track_guid, retry=True):
         """下载 /track/stream 原始音频字节，返回 (content_type, bytes)。"""
         url, headers, _ = self._build("/track/stream", {"guid": track_guid}, None)

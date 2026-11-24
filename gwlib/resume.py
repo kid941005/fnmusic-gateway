@@ -5,7 +5,6 @@
 当前游标和已播放秒数。进程/容器重启后仍能恢复。调用方传入的 key
 来自小智桥接器生成的 X-GW-Session 或网关来源地址。
 """
-import copy
 import json
 import os
 import threading
@@ -56,7 +55,8 @@ class ResumeStore:
             data = self._load()
             now = time.time()
             self._prune(data, now)
-            item = copy.deepcopy(dict(value or {}))
+            # 调用方随后不会再改这个值；_save 同步序列化，浅拷贝即可避免整表深拷贝。
+            item = dict(value or {})
             item["updated_at"] = now
             data[key] = item
             self._save(data)
@@ -68,7 +68,7 @@ class ResumeStore:
             now = time.time()
             self._prune(data, now)
             item = data.get(key)
-            return copy.deepcopy(item) if isinstance(item, dict) else None
+            return item if isinstance(item, dict) else None
 
     def clear(self, key):
         key = str(key or "default")

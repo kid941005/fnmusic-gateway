@@ -4,16 +4,28 @@ import hashlib
 import inspect
 import logging
 import os
+import queue
 import re
 import subprocess
 import tempfile
 import threading
+import time
+import uuid
 import weakref
 
 from .errors import BadRequest, StorageError
 from .quality import get_profile
 
 LOG = logging.getLogger("fnmusic-gw.storage")
+
+# 预取调度：固定 worker 数，失败短 TTL 内不再重试；预取转码只占用剩余槽。
+PREFETCH_WORKERS = 2
+PREFETCH_FAILURE_TTL = 30.0
+PREFETCH_BUSY_TTL = 5.0
+
+
+class PrefetchBusy(StorageError):
+    """预取遇到转码槽位忙：不算永久失败，短 TTL 后可重试。"""
 
 
 def _accepts_quality(fn):
@@ -55,6 +67,23 @@ def _looks_like_mp3(path, content_type=""):
     return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] in (0xFB, 0xF3, 0xF2))
 
 
+def _looks_like_mp3_bytes(data, content_type=""):
+    """流式首块嗅探：Content-Type 或前几个字节是 MP3 时可直接透传。"""
+    ctype = (content_type or "").lower()
+    if "audio/mpeg" in ctype or "audio/mp3" in ctype or "mpeg" in ctype:
+        return True
+    head = bytes(data or b"")[:4]
+    return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] in (0xFB, 0xF3, 0xF2))
+
+
+def _call_iter_stream(provider, guid, quality=None):
+    """取 provider.iter_stream 的分块迭代器；老 provider 返回 None 由调用方回退。"""
+    fn = getattr(provider, "iter_stream", None)
+    if not callable(fn):
+        return None
+    return fn(guid, quality=quality) if _accepts_quality(fn) else fn(guid)
+
+
 def audio_seconds(path):
     """ffprobe 读时长（秒，float）；失败返回 None。"""
     try:
@@ -92,10 +121,21 @@ class TranscodeSlots:
             self._active += 1
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def try_enter(self, reserve=0):
+        """非阻塞获取槽位；reserve>0 时给前台保留至少这么多个空槽。"""
+        with self._cond:
+            if self._active + max(0, int(reserve)) >= self._limit:
+                return False
+            self._active += 1
+            return True
+
+    def release(self):
         with self._cond:
             self._active = max(0, self._active - 1)
             self._cond.notify()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
         return False
 
 
@@ -117,6 +157,11 @@ class MediaCache:
         self._slots = transcode_slots or TranscodeSlots(2)
         self._prefetching = set()
         self._prefetch_guard = threading.Lock()
+        self._prefetch_queue = queue.Queue(maxsize=64)
+        self._prefetch_failed = {}
+        self._prefetch_workers = []
+        self._prefetch_failure_ttl = PREFETCH_FAILURE_TTL
+        self._prefetch_busy_ttl = PREFETCH_BUSY_TTL
         self._cleanup_stale()
 
     def reconfigure(self, max_bytes=None, transcode_slots=None):
@@ -146,28 +191,64 @@ class MediaCache:
         return os.path.join(self.dir, self.key(guid, quality) + ".mp3")
 
     def prefetch(self, guid, provider, quality=None):
-        """后台准备缓存，不阻塞 MCP/WebUI 的播放请求。"""
+        """把下一首放入固定 worker 队列，阻塞播放线程的只是入队，不是下载/转码。"""
         profile = get_profile(quality)
         dst = self.path(guid, profile["name"])
-        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
-            return dst
+        try:
+            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+                return dst
+        except OSError:
+            pass
         key = os.path.basename(dst)
+        now = time.time()
         with self._prefetch_guard:
+            failed = self._prefetch_failed.get(key)
+            if failed and now - failed[0] < failed[1]:
+                return dst
             if key in self._prefetching:
                 return dst
             self._prefetching.add(key)
-
-        def run():
+            self._start_prefetch_workers_locked()
             try:
-                self.ensure(guid, provider, quality=profile["name"])
+                self._prefetch_queue.put_nowait((guid, provider, profile["name"], key))
+            except queue.Full:
+                self._prefetching.discard(key)
+                self.log.info("cache prefetch queue full, skip %s", guid)
+        return dst
+
+    def _start_prefetch_workers_locked(self):
+        if self._prefetch_workers:
+            return
+        for i in range(PREFETCH_WORKERS):
+            worker = threading.Thread(target=self._prefetch_worker, daemon=True,
+                                      name="cache-prefetch-%d" % (i + 1))
+            worker.start()
+            self._prefetch_workers.append(worker)
+
+    def _prefetch_worker(self):
+        while True:
+            item = self._prefetch_queue.get()
+            if item is None:
+                self._prefetch_queue.task_done()
+                return
+            guid, provider, qname, key = item
+            try:
+                self.ensure(guid, provider, quality=qname, prefetch=True)
+            except PrefetchBusy as exc:
+                with self._prefetch_guard:
+                    self._prefetch_failed[key] = (time.time(), self._prefetch_busy_ttl)
+                self.log.debug("cache prefetch busy for %s: %s", guid, exc)
             except Exception as exc:
+                with self._prefetch_guard:
+                    self._prefetch_failed[key] = (time.time(), self._prefetch_failure_ttl)
                 self.log.info("cache prefetch failed for %s: %s", guid, exc)
+            else:
+                with self._prefetch_guard:
+                    self._prefetch_failed.pop(key, None)
             finally:
                 with self._prefetch_guard:
                     self._prefetching.discard(key)
-
-        threading.Thread(target=run, daemon=True, name="cache-prefetch").start()
-        return dst
+                self._prefetch_queue.task_done()
 
     def _lock(self, key):
         with self._guard:
@@ -177,7 +258,7 @@ class MediaCache:
                 self._locks[key] = lock
             return lock
 
-    def ensure(self, guid, provider, timeout=180, quality=None):
+    def ensure(self, guid, provider, timeout=180, quality=None, prefetch=False):
         profile = get_profile(quality)
         dst = self.path(guid, profile["name"])
         if os.path.exists(dst) and os.path.getsize(dst) > 1024:
@@ -205,16 +286,17 @@ class MediaCache:
                        "-vn", "-map_metadata", "-1",
                        "-ac", str(channels), "-ar", str(sample_rate),
                        "-c:a", "libmp3lame", "-b:a", bitrate, "-f", "mp3", tmp]
-                with self._slots:
+                if prefetch:
+                    # 预取永远给前台播放留至少一个槽；槽不够就直接跳过，下轮再预取。
+                    if not self._slots.try_enter(reserve=1):
+                        raise PrefetchBusy("转码槽位忙，跳过预取: %s" % guid)
                     try:
-                        subprocess.run(cmd, check=True, timeout=timeout,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    except subprocess.TimeoutExpired:
-                        raise StorageError("ffmpeg 转码超时: %s" % guid)
-                    except subprocess.CalledProcessError as exc:
-                        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()[:200]
-                        raise StorageError("ffmpeg 转码失败: %s%s" % (
-                            guid, ("（%s）" % detail) if detail else ""))
+                        self._run_ffmpeg(cmd, timeout, guid)
+                    finally:
+                        self._slots.release()
+                else:
+                    with self._slots:
+                        self._run_ffmpeg(cmd, timeout, guid)
                 if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
                     raise StorageError("ffmpeg 转码失败: %s" % guid)
                 os.replace(tmp, dst)
@@ -227,6 +309,168 @@ class MediaCache:
             self._check_single_file(dst)
             self.evict(protect=dst)
             return dst
+
+    def stream(self, guid, provider, quality=None, chunk_size=65536, timeout=180):
+        """边收边播：首块到达即 yield，同时把完整音频写入缓存。
+
+        已缓存的曲目直接按块读文件；未缓存的曲目优先用 provider.iter_stream，
+        标准音质且源为 MP3 时原样透传，其余音质走 ffmpeg stdin/stdout 管道转码。
+        播放器断开时生成器被 close，临时文件会清理，不缓存半成品。
+        """
+        profile = get_profile(quality)
+        dst = self.path(guid, profile["name"])
+        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            with open(dst, "rb") as fh:
+                while True:
+                    block = fh.read(chunk_size)
+                    if not block:
+                        break
+                    yield block
+            return
+        if not callable(getattr(provider, "iter_stream", None)):
+            path = self.ensure(guid, provider, quality=quality, timeout=timeout)
+            with open(path, "rb") as fh:
+                while True:
+                    block = fh.read(chunk_size)
+                    if not block:
+                        break
+                    yield block
+            return
+        tmp = dst + ".stream-%s.part" % uuid.uuid4().hex
+        iterator = None
+        proc = None
+        errf = None
+        writer = None
+        with self._lock(os.path.basename(dst)):
+            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+                with open(dst, "rb") as fh:
+                    while True:
+                        block = fh.read(chunk_size)
+                        if not block:
+                            break
+                        yield block
+                return
+            try:
+                got = _call_iter_stream(provider, guid, profile["name"])
+                if not got:
+                    raise StorageError("provider does not support streaming: %s" % guid)
+                ctype, iterator = got
+                first = next(iterator, b"")
+                if not first:
+                    raise StorageError("empty audio for %s" % guid)
+                if profile["name"] == "standard" and _looks_like_mp3_bytes(first, ctype):
+                    writer = open(tmp, "wb")
+                    writer.write(first)
+                    yield first
+                    for chunk in iterator:
+                        if not chunk:
+                            continue
+                        writer.write(chunk)
+                        yield chunk
+                    writer.close()
+                    writer = None
+                else:
+                    bitrate = profile["bitrate"] or self._legacy_bitrate or "128k"
+                    sample_rate = profile["sample_rate"] or self._legacy_sample_rate or 44100
+                    channels = profile["channels"] or self._legacy_channels or 2
+                    cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-i", "pipe:0",
+                           "-vn", "-map_metadata", "-1",
+                           "-ac", str(channels), "-ar", str(sample_rate),
+                           "-c:a", "libmp3lame", "-b:a", bitrate,
+                           "-f", "mp3", "pipe:1"]
+                    errf = tempfile.TemporaryFile()
+                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=errf)
+                    feed_errors = []
+                    def _feed():
+                        try:
+                            proc.stdin.write(first)
+                            for chunk in iterator:
+                                if chunk:
+                                    proc.stdin.write(chunk)
+                        except (BrokenPipeError, OSError) as exc:
+                            feed_errors.append(exc)
+                        except Exception as exc:
+                            feed_errors.append(exc)
+                        finally:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+                    feeder = threading.Thread(target=_feed, daemon=True,
+                                              name="cache-stream-feed")
+                    feeder.start()
+                    with self._slots:
+                        writer = open(tmp, "wb")
+                        while True:
+                            out = proc.stdout.read(chunk_size)
+                            if not out:
+                                break
+                            writer.write(out)
+                            yield out
+                        writer.close()
+                        writer = None
+                        rc = proc.wait(timeout=timeout)
+                    if rc != 0:
+                        try:
+                            errf.seek(0)
+                            detail = errf.read().decode("utf-8", "replace").strip()[:200]
+                        except Exception:
+                            detail = ""
+                        raise StorageError("ffmpeg 流转码失败: %s%s" % (
+                            guid, ("（%s）" % detail) if detail else ""))
+                    if feed_errors:
+                        raise StorageError("音频源读取失败: %s（%s）" % (guid, feed_errors[0]))
+                if os.path.exists(tmp) and os.path.getsize(tmp) >= 1024:
+                    os.replace(tmp, dst)
+                    try:
+                        self._check_single_file(dst)
+                        self.evict(protect=dst)
+                    except StorageError as exc:
+                        self.log.warning("cache stream commit failed: %s", exc)
+            except StorageError:
+                raise
+            except Exception as exc:
+                raise StorageError("音频源读取失败: %s（%s）" % (guid, exc))
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                if iterator is not None:
+                    close = getattr(iterator, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                if errf is not None:
+                    try:
+                        errf.close()
+                    except Exception:
+                        pass
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    def _run_ffmpeg(self, cmd, timeout, guid):
+        try:
+            subprocess.run(cmd, check=True, timeout=timeout,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except subprocess.TimeoutExpired:
+            raise StorageError("ffmpeg 转码超时: %s" % guid)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or b"").decode("utf-8", "replace").strip()[:200]
+            raise StorageError("ffmpeg 转码失败: %s%s" % (
+                guid, ("（%s）" % detail) if detail else ""))
 
     def _check_single_file(self, path):
         """单曲超过缓存上限时明确报错，避免刚写入就被 evict 掉。"""

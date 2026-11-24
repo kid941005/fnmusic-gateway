@@ -31,6 +31,7 @@ GET /api/status                               上一次播放
 import difflib
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -57,7 +58,7 @@ from gwlib.native_source import (NativeMusicDLProvider,
                                   deps_available as online_deps_available,
                                   deps_error as online_deps_error)
 from gwlib.playback import PlaybackService
-from gwlib.playlist import PlaylistRegistry, iter_clean_mp3
+from gwlib.playlist import PlaylistRegistry, iter_clean_mp3, iter_clean_mp3_stream
 from gwlib.resume import ResumeStore
 from gwlib.mcp_tools import build_tools
 from gwlib.mcp_server import McpHttpBridge, McpService
@@ -773,6 +774,33 @@ def save_state(d):
             LOG.warning("save state failed: %s", e)
 
 
+# 续播记录只保留恢复播放必需的字段；music_status 每秒轮询时不再反复深拷贝整张歌单。
+_RESUME_TRACK_FIELDS = ("guid", "title", "artist")
+STATUS_RESUME_INTERVAL = 30.0
+_STATUS_RESUME_LAST = {}
+_STATUS_RESUME_LOCK = threading.Lock()
+
+
+def _resume_track(track):
+    if not isinstance(track, dict):
+        return {}
+    # title/artist 即使为空也保留键：PlaybackService 直接用 current["title"]/["artist"]。
+    out = {"guid": str(track.get("guid") or ""),
+           "title": str(track.get("title") or ""),
+           "artist": str(track.get("artist") or "")}
+    if track.get("duration_s") is not None:
+        out["duration_s"] = track.get("duration_s")
+    return out
+
+
+def _resume_marker(session_key, kind, index):
+    try:
+        idx = max(0, int(index or 0))
+    except (TypeError, ValueError):
+        idx = 0
+    return (str(session_key or "default"), str(kind or ""), idx)
+
+
 def _resume_save(session_key, kind, track=None, tracks=None, label="", quality=None,
                  index=0, position=0.0, token="", loop=False):
     """保存本会话的可续播状态；只是元数据，不包含音频。"""
@@ -789,13 +817,29 @@ def _resume_save(session_key, kind, track=None, tracks=None, label="", quality=N
             "started_at": time.time(), "token": str(token or ""),
             "loop": bool(loop)}
     if isinstance(track, dict):
-        data["track"] = dict(track)
+        compact = _resume_track(track)
+        if compact:
+            data["track"] = compact
     if tracks:
-        data["tracks"] = [dict(t) for t in tracks]
+        data["tracks"] = [c for c in (_resume_track(t) for t in tracks) if c]
     try:
         RESUMES.set(session_key, data)
+        with _STATUS_RESUME_LOCK:
+            _STATUS_RESUME_LAST[_resume_marker(session_key, kind, index)] = time.time()
     except Exception as exc:
         LOG.warning("save resume state failed: %s", exc)
+
+
+def _resume_save_status(session_key, kind, **kwargs):
+    """music_status 高频调用时的去抖写盘；同一会话/曲目每 30 秒最多落一次。"""
+    marker = _resume_marker(session_key, kind, kwargs.get("index", 0))
+    now = time.time()
+    with _STATUS_RESUME_LOCK:
+        if now - _STATUS_RESUME_LAST.get(marker, 0.0) < STATUS_RESUME_INTERVAL:
+            return False
+        _STATUS_RESUME_LAST[marker] = now
+    _resume_save(session_key, kind, **kwargs)
+    return True
 
 
 def _resume_get(session_key):
@@ -1025,6 +1069,9 @@ class FnProvider:
 
     def stream_to_path(self, guid, path, quality=None):
         return self.client.stream_to_path(guid, path)
+
+    def iter_stream(self, guid, quality=None):
+        return self.client.iter_stream(guid)
 
     def add_favorite(self, guid):
         self.client.favorite_add(guid)
@@ -2237,7 +2284,7 @@ def _tool_music_status(args, p, base, limit, quality):
     session_key = _session_key(args)
     cursor = CURRENT_PLAYLISTS.get(session_key)
     token = cursor.get("token") if cursor else None
-    item = PLAYLISTS.get(token) if token else None
+    item = PLAYLISTS.get(token, copy_tracks=False) if token else None
     if item and item.get("tracks"):
         tracks = item["tracks"]
         idx = max(0, min(int(cursor.get("index", 0)), len(tracks) - 1))
@@ -2251,9 +2298,9 @@ def _tool_music_status(args, p, base, limit, quality):
         except (TypeError, ValueError):
             duration = 0
         lyric = _lrc_line_at(track, elapsed)
-        _resume_save(session_key, "playlist", tracks=tracks, label=item.get("label") or "",
-                     quality=item.get("quality"), index=idx, position=min(elapsed, duration or elapsed),
-                     token=token, loop=bool(item.get("loop")))
+        _resume_save_status(session_key, "playlist", tracks=tracks, label=item.get("label") or "",
+                            quality=item.get("quality"), index=idx, position=min(elapsed, duration or elapsed),
+                            token=token, loop=bool(item.get("loop")))
         return ("正在播放：%s%s\n"
                 "来自：%s 第 %d/%d 首\n"
                 "时长：%d 秒\n"
@@ -2273,10 +2320,10 @@ def _tool_music_status(args, p, base, limit, quality):
         duration = _to_int(st.get("duration"), 0)
         if duration > 0:
             elapsed = min(elapsed, duration)
-        _resume_save(session_key, "single",
-                     track={"guid": st["guid"], "title": st.get("title") or st["guid"],
-                            "artist": st.get("artist") or "", "duration_s": st.get("duration")},
-                     quality=st.get("quality"), position=elapsed)
+        _resume_save_status(session_key, "single",
+                            track={"guid": st["guid"], "title": st.get("title") or st["guid"],
+                                   "artist": st.get("artist") or "", "duration_s": st.get("duration")},
+                            quality=st.get("quality"), position=elapsed)
     return "上一次播放：%s%s%s（%s）" % (
         st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", qn, when)
 
@@ -3427,15 +3474,40 @@ class Handler(BaseHTTPRequestHandler):
             start_hint = int(item.get("index", 0) or 0)
         start_index = max(0, min(start_hint, len(tracks) - 1))
         first_path = None
+        first_stream = None
+        first_chunk = b""
+        can_stream = (start_position == 0 and self._allow_stream() and
+                      callable(getattr(p, "iter_stream", None)))
         for i in range(start_index, len(tracks)):
             track = tracks[i]
+            raw_gen = None
+            stream = None
             try:
-                first_path = CACHE.ensure(track["guid"], p, quality=quality)
+                if can_stream:
+                    raw_gen = CACHE.stream(track["guid"], p, quality=quality)
+                    first_raw = next(raw_gen)
+                    stream = iter_clean_mp3_stream(itertools.chain((first_raw,), raw_gen))
+                    first_chunk = next(stream)
+                    first_stream = stream
+                else:
+                    first_path = CACHE.ensure(track["guid"], p, quality=quality)
                 start_index = i
                 break
             except Exception as exc:
                 LOG.warning("playlist track %s prepare failed: %s", track.get("guid"), exc)
-        if not first_path:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                if raw_gen is not None:
+                    try:
+                        raw_gen.close()
+                    except Exception:
+                        pass
+                first_stream = None
+                first_chunk = b""
+        if not first_path and first_stream is None:
             return self._json({"error": "playlist tracks are unavailable"}, 502)
         CURRENT_PLAYLISTS.set(session_key, token, start_index,
                                time.time() - start_position)
@@ -3455,9 +3527,37 @@ class Handler(BaseHTTPRequestHandler):
                 for offset, track in enumerate(tracks[start_index:]):
                     _prefetch_playlist_next(tracks, start_index + offset, p, quality, loop)
                     path_start = start_position if (first_cycle and offset == 0) else 0
+                    if offset == 0 and first_stream is not None:
+                        CURRENT_PLAYLISTS.set(session_key, token, start_index + offset,
+                                               time.time() - path_start)
+                        _resume_save(session_key, "playlist", tracks=tracks,
+                                     label=item.get("label") or "", quality=quality,
+                                     index=start_index + offset, position=path_start,
+                                     token=token, loop=loop)
+                        stream = first_stream
+                        first_stream = None
+                        chunk = first_chunk
+                        first_chunk = b""
+                        try:
+                            if chunk:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                            for block in stream:
+                                self.wfile.write(block)
+                                self.wfile.flush()
+                        finally:
+                            close = getattr(stream, "close", None)
+                            if callable(close):
+                                try:
+                                    close()
+                                except Exception:
+                                    pass
+                        continue
                     if offset == 0:
                         path = first_path
                     else:
+                        path = None
+                    if path is None:
                         try:
                             path = CACHE.ensure(track["guid"], p, quality=quality)
                         except Exception as exc:
@@ -3500,6 +3600,14 @@ class Handler(BaseHTTPRequestHandler):
         if not verify(guid, exp, sig, quality, start=start):
             LOG.warning("bad signature for %s", guid)
             return self._json({"error": "invalid or expired signature"}, 403)
+        cached = CACHE.path(guid, quality)
+        try:
+            cached_ok = os.path.exists(cached) and os.path.getsize(cached) > 1024
+        except OSError:
+            cached_ok = False
+        if not start and not cached_ok and self._allow_stream():
+            if self._serve_stream(guid, quality):
+                return
         try:
             path = CACHE.ensure(guid, provider(), quality=quality)
         except Exception as e:
@@ -3522,6 +3630,60 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             lyric_url = ""
         return self._serve_file(path, duration_ms=duration_ms, lyric_url=lyric_url)
+
+    def _allow_stream(self):
+        """首播是否可走无 Content-Length 的边收边播：只处理 GET 且无 Range / bytes=0-。"""
+        if self.command != "GET":
+            return False
+        rng = (self.headers.get("Range") or "").strip().lower()
+        return not rng or rng == "bytes=0-"
+
+    def _serve_stream(self, guid, quality=None):
+        """未缓存曲目首块到达即回 200 并持续写入；已在发送响应后返回 True。
+
+        返回 False 表示首块准备失败、尚未发送任何响应，调用方可回退完整缓存。
+        """
+        p = provider()
+        if not callable(getattr(p, "iter_stream", None)):
+            return False
+        gen = CACHE.stream(guid, p, quality=quality)
+        try:
+            first = next(gen)
+        except StopIteration:
+            try:
+                gen.close()
+            except Exception:
+                pass
+            return False
+        except Exception as exc:
+            try:
+                gen.close()
+            except Exception:
+                pass
+            LOG.warning("stream prepare %s failed: %s", guid, exc)
+            return False
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            if self.command == "HEAD":
+                return True
+            self.wfile.write(first)
+            self.wfile.flush()
+            for chunk in gen:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return True
+        finally:
+            try:
+                gen.close()
+            except Exception:
+                pass
+        return True
 
     def _serve_file(self, path, duration_ms=0, lyric_url=""):
         try:

@@ -2038,7 +2038,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.10")
+        self.assertEqual(app.VERSION, "2.13.11")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 
@@ -2139,6 +2139,231 @@ class TestPrefetchNext(Base):
             r, data = self.req("GET", url, raw=True)
         self.assertEqual(r.status, 200)
         pf.assert_any_call("mock-2", mock.ANY, quality="standard")
+
+
+class TestResumePollingOptimization(unittest.TestCase):
+    """2.13.11：status 轮询不深拷贝整表、续播记录只存必要字段、30 秒去抖。"""
+
+    def test_resume_tracks_keep_only_required_fields(self):
+        track = {"guid": "g1", "title": "t", "artist": "a", "duration_s": 12,
+                 "album": "al", "source": "ext:musicdl:x", "extra": "x"}
+        app._resume_save("compact-resume", "playlist", tracks=[track], label="L",
+                         quality="standard", index=0)
+        st = app._resume_get("compact-resume")
+        self.assertEqual(set(st["tracks"][0]),
+                         {"guid", "title", "artist", "duration_s"})
+        self.assertEqual(st["tracks"][0]["title"], "t")
+
+    def test_playlist_get_can_return_tracks_without_copy(self):
+        tracks = [dict(x) for x in app.MockProvider.TRACKS[:2]]
+        token = app.PLAYLISTS.put(tracks, quality="standard", label="nocopy")
+        first = app.PLAYLISTS.get(token, copy_tracks=False)
+        second = app.PLAYLISTS.get(token, copy_tracks=False)
+        self.assertIs(first["tracks"], second["tracks"])
+
+    def test_music_status_resume_save_is_throttled(self):
+        from unittest import mock
+        session = "status-throttle"
+        app.call_tool("music_play", {"favorites": True, "_session_id": session}, "http://h")
+        with app._STATUS_RESUME_LOCK:
+            app._STATUS_RESUME_LAST.clear()
+        with mock.patch.object(app, "_resume_save") as save:
+            app.call_tool("music_status", {"_session_id": session}, "http://h")
+            app.call_tool("music_status", {"_session_id": session}, "http://h")
+        self.assertEqual(save.call_count, 1)
+
+
+class TestPrefetchScheduler(unittest.TestCase):
+    """2.13.11：预取固定 worker + 去重 + 失败退避，转码槽给前台留余量。"""
+
+    def test_transcode_slots_try_enter_reserves_foreground_slot(self):
+        slots = gw_storage.TranscodeSlots(2)
+        self.assertTrue(slots.try_enter(reserve=1))
+        self.assertFalse(slots.try_enter(reserve=1))
+        slots.release()
+        self.assertTrue(slots.try_enter(reserve=1))
+        slots.release()
+        # 只有一个转码槽时必须完全让给前台，预取不得占用。
+        one = gw_storage.TranscodeSlots(1)
+        self.assertFalse(one.try_enter(reserve=1))
+
+    def test_prefetch_coalesces_duplicates_and_uses_bounded_workers(self):
+        d = tempfile.mkdtemp(prefix="gw-prefetchq-", dir=DATA)
+        calls = []
+
+        class P:
+            def stream_to_path(self, guid, path, quality=None):
+                calls.append(guid)
+                with open(path, "wb") as fh:
+                    fh.write(b"ID3" + b"\x00" * 2048)
+                return "audio/mpeg", 2051
+
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        cache.prefetch("a", P())
+        cache.prefetch("a", P())
+        cache.prefetch("b", P())
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            files = [n for n in os.listdir(d) if n.endswith(".mp3")]
+            if len(files) >= 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(len([n for n in os.listdir(d) if n.endswith(".mp3")]), 2)
+        self.assertEqual(sorted(calls), ["a", "b"])
+        self.assertEqual(len(cache._prefetch_workers), gw_storage.PREFETCH_WORKERS)
+
+    def test_prefetch_failure_is_backed_off(self):
+        d = tempfile.mkdtemp(prefix="gw-prefetchfail-", dir=DATA)
+
+        class Fail:
+            calls = 0
+
+            def stream_to_path(self, guid, path, quality=None):
+                Fail.calls += 1
+                raise RuntimeError("boom")
+
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        cache.prefetch("bad", Fail())
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            with cache._prefetch_guard:
+                done = "bad" in cache._prefetch_failed and not cache._prefetching
+            if done:
+                break
+            time.sleep(0.02)
+        self.assertEqual(Fail.calls, 1)
+        cache.prefetch("bad", Fail())
+        time.sleep(0.08)
+        self.assertEqual(Fail.calls, 1)  # 失败 TTL 内不再重复预取
+
+    def test_prefetch_transcode_skips_when_slot_is_busy(self):
+        d = tempfile.mkdtemp(prefix="gw-prefetchbusy-", dir=DATA)
+
+        class P:
+            def stream_to_path(self, guid, path, quality=None):
+                with open(path, "wb") as fh:
+                    fh.write(b"fLaC" + b"\x00" * 2048)
+                return "audio/flac", 2052
+
+        slots = gw_storage.TranscodeSlots(1)
+        self.assertTrue(slots.try_enter())
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024, transcode_slots=slots)
+        with self.assertRaises(gw_storage.PrefetchBusy):
+            cache.ensure("x", P(), quality="high", prefetch=True)
+        slots.release()
+
+
+class TestStreamingPlayback(Base):
+    """2.13.11：未缓存曲目边收边播，首块不等待全量下载。"""
+
+    @staticmethod
+    def _chunks():
+        return [b"ID3" + b"a" * 4096, b"b" * 4096, b"c" * 4096]
+
+    def test_media_cache_stream_yields_first_chunk_before_full_download(self):
+        d = tempfile.mkdtemp(prefix="gw-stream-", dir=DATA)
+        chunks = self._chunks()
+
+        class SlowProvider:
+            def iter_stream(self, guid, quality=None):
+                def gen():
+                    for i, chunk in enumerate(chunks):
+                        if i:
+                            time.sleep(0.05)
+                        yield chunk
+                return "audio/mpeg", gen()
+
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        gen = cache.stream("stream-key", SlowProvider())
+        started = time.monotonic()
+        first = next(gen)
+        first_ms = (time.monotonic() - started) * 1000.0
+        rest = list(gen)
+        total_ms = (time.monotonic() - started) * 1000.0
+        self.assertEqual(first, chunks[0])
+        self.assertEqual(first + b"".join(rest), b"".join(chunks))
+        self.assertLess(first_ms, 100.0)
+        self.assertGreater(total_ms, first_ms + 40.0)
+        cached = cache.path("stream-key")
+        self.assertTrue(os.path.exists(cached))
+        self.assertEqual(os.path.getsize(cached), sum(len(c) for c in chunks))
+
+    def test_media_cache_stream_uses_cached_file_without_provider(self):
+        d = tempfile.mkdtemp(prefix="gw-stream-hit-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        dst = cache.path("hit-key")
+        with open(dst, "wb") as fh:
+            fh.write(b"ID3" + b"z" * 2048)
+
+        class NeverCalled:
+            def iter_stream(self, guid, quality=None):
+                raise AssertionError("provider should not be called for cached file")
+
+        self.assertEqual(b"".join(cache.stream("hit-key", NeverCalled())),
+                         b"ID3" + b"z" * 2048)
+
+    def test_media_cache_stream_falls_back_when_provider_has_no_iter_stream(self):
+        d = tempfile.mkdtemp(prefix="gw-stream-fallback-", dir=DATA)
+
+        class LegacyProvider:
+            def stream(self, guid, quality=None):
+                return "audio/mpeg", b"ID3" + b"legacy" * 500
+
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        self.assertEqual(b"".join(cache.stream("legacy-key", LegacyProvider())),
+                         b"ID3" + b"legacy" * 500)
+
+    def test_media_cache_stream_cleans_tmp_on_provider_failure(self):
+        d = tempfile.mkdtemp(prefix="gw-stream-fail-", dir=DATA)
+
+        class Broken:
+            def iter_stream(self, guid, quality=None):
+                def gen():
+                    raise RuntimeError("upstream boom")
+                    yield b""
+                return "audio/mpeg", gen()
+
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        with self.assertRaises(gw_storage.StorageError):
+            next(cache.stream("broken-key", Broken()))
+        self.assertFalse(os.path.exists(cache.path("broken-key")))
+        self.assertFalse([n for n in os.listdir(d) if ".stream-" in n])
+
+    def test_play_streams_without_content_length(self):
+        from unittest import mock
+        guid = "ext:test:stream-http"
+
+        class Fake:
+            chunks = [b"ID3" + b"h" * 1024, b"t" * 1024]
+
+            def iter_stream(self, guid, quality=None):
+                return "audio/mpeg", iter(self.chunks)
+
+        with mock.patch.object(app, "provider", return_value=Fake()):
+            url = app.make_url("", guid, ttl=app.URL_TTL, quality="standard")
+            r, data = self.req("GET", url, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIsNone(r.getheader("Content-Length"))
+        self.assertEqual(data, b"".join(Fake.chunks))
+
+    def test_playlist_streams_first_track_without_content_length(self):
+        from unittest import mock
+        tracks = [
+            {"guid": "ext:test:pl-1", "title": "A", "artist": "a", "duration_s": 1},
+            {"guid": "ext:test:pl-2", "title": "B", "artist": "b", "duration_s": 1},
+        ]
+        token = app.PLAYLISTS.put(tracks, quality="standard")
+        url = app.make_playlist_url("", token, ttl=app.URL_TTL, quality="standard")
+
+        class Fake:
+            def iter_stream(self, guid, quality=None):
+                return "audio/mpeg", iter([b"\xff\xfb" + b"p" * 2048])
+
+        with mock.patch.object(app, "provider", return_value=Fake()):
+            r, data = self.req("GET", url, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertIsNone(r.getheader("Content-Length"))
+        self.assertTrue(data.startswith(b"\xff\xfb"))
 
 
 if __name__ == "__main__":

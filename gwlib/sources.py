@@ -225,6 +225,26 @@ class ExtProvider:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             return ctype, resp.read()
 
+    def iter_stream(self, guid, quality=None):
+        """打开上游音频，按 64 KiB 分块产出，供网关边收边播。"""
+        resp = self._open(guid, quality)
+        ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+
+        def _iter():
+            try:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+        return ctype, _iter()
+
     def stream_to_path(self, guid, path, quality=None):
         """流式写入文件，避免把整首无损音频读进内存。返回 (content_type, 字节数)。"""
         with self._open(guid, quality) as resp, open(path, "wb") as fh:
@@ -498,6 +518,16 @@ class FallbackProvider:
                 raise RuntimeError("在线音源未配置")
             return _call_stream(ext, guid, quality)
         return _call_stream(self._local(), guid, quality)
+
+    def iter_stream(self, guid, quality=None):
+        target = self._ext(guid) if is_ext_guid(guid) else self._local()
+        if not target:
+            raise RuntimeError("在线音源未配置")
+        fn = getattr(target, "iter_stream", None)
+        if callable(fn):
+            return fn(guid, quality=quality)
+        ctype, raw = _call_stream(target, guid, quality)
+        return ctype, iter((raw,))
 
     def stream_to_path(self, guid, path, quality=None):
         if is_ext_guid(guid):

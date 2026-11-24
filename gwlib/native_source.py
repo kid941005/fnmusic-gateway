@@ -459,6 +459,25 @@ class NativeMusicDLProvider:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             return ctype, resp.read()
 
+    def iter_stream(self, guid, quality=None):
+        resp = self._open(guid)
+        ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+
+        def _iter():
+            try:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+        return ctype, _iter()
+
     def stream_to_path(self, guid, path, quality=None):
         with self._open(guid) as resp, open(path, "wb") as fh:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"

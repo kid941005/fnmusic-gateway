@@ -54,14 +54,15 @@ class PlaylistRegistry:
             }
         return token
 
-    def get(self, token):
+    def get(self, token, copy_tracks=True):
         with self._lock:
             self._prune()
             item = self._items.get(str(token or ""))
             if not item:
                 return None
+            tracks = [dict(t) for t in item["tracks"]] if copy_tracks else item["tracks"]
             return {
-                "tracks": [dict(t) for t in item["tracks"]],
+                "tracks": tracks,
                 "quality": item["quality"],
                 "expires": item["expires"],
                 "label": item.get("label", ""),
@@ -112,3 +113,43 @@ def iter_clean_mp3(path, chunk_size=64 * 1024):
                 tail = data
         if tail and not tail.startswith(b"TAG"):
             yield tail
+
+
+def iter_clean_mp3_stream(chunks, chunk_size=64 * 1024):
+    """流式版本：边收边去掉每首开头的 ID3v2 和结尾的 ID3v1。"""
+    buf = b""
+    skip = 0
+    started = False
+    for block in chunks:
+        if not block:
+            continue
+        if skip:
+            if len(block) <= skip:
+                skip -= len(block)
+                continue
+            block = block[skip:]
+            skip = 0
+        if not started:
+            buf += block
+            if len(buf) < 10:
+                continue
+            if buf[:3] == b"ID3":
+                size = ((buf[6] & 0x7F) << 21) | ((buf[7] & 0x7F) << 14) | \
+                       ((buf[8] & 0x7F) << 7) | (buf[9] & 0x7F)
+                skip = 10 + size
+                started = True
+                if len(buf) <= skip:
+                    skip -= len(buf)
+                    buf = b""
+                else:
+                    buf = buf[skip:]
+                    skip = 0
+            else:
+                started = True
+        else:
+            buf += block
+        while len(buf) > 128:
+            yield buf[:-128]
+            buf = buf[-128:]
+    if buf and not buf.startswith(b"TAG"):
+        yield buf

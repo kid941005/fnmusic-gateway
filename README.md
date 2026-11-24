@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.13.8**（2026-11-23） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.9**（2026-11-24） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -26,7 +26,7 @@
 - **首播不等转码**：播放接口立即返回签名直链，音频在后台准备；标准音质且源本身是 MP3 时直接复用，跳过 ffmpeg。
 - **内置在线音源**：musicdl 直接内置在网关镜像里，按平台并行搜索、解析直链、播放与下载，不再依赖独立音源容器。
 - **安全外网**：只发布一个 8766；公网反代只转发 `/play/`、`/lyrics/` 与 `/playlist/`，管理面与 WebUI 不暴露。
-- **多种接入**：13 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
+- **多种接入**：16 个 MCP 工具、REST 插件、MCP 接入点（wss）桥接三种方式任选。
 - **音质可选**：`standard / high / exhigh / lossless` 四档，设备始终拿 MP3，下载保留原始音质。
 - **下载与边播边存**：在线歌曲可在播放时同步落盘（`GW_TEE_SAVE`），也可显式 `music_download` 下载到本地下载目录。
 - **模块解耦**：`gwlib/` 拆出 errors / quality / storage / sources / playback / config / settings_page / mcp_tools / mcp_server，新增音源或音质策略不改播放层与 MCP 层。
@@ -60,7 +60,7 @@
 | `gwlib/musicdl_worker.py` | 每平台独立 JSON 行 worker（隔离卡死） | `python -m gwlib.musicdl_worker` |
 | `gwlib/home_page.py` | `/` 原生首页 | `HOME_HTML` |
 | `gwlib/login_page.py` | `/login` 登录页 | `login_html` |
-| `gwlib/mcp_tools.py` | 13 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
+| `gwlib/mcp_tools.py` | 16 个 MCP 工具定义 | `build_tools` / `QUALITY_ENUM` |
 | `gwlib/mcp_server.py` | 官方 MCPServer 2.3 工具注册 + 回环 HTTP 桥 | `McpService` / `McpHttpBridge` |
 
 新增音源只需实现 `search/stream/lyrics` 并注册到 `sources.py`；新增音质只改 `quality.py` 的 `PROFILES`，播放层与 MCP 层无需改动。
@@ -251,7 +251,7 @@ docker compose up -d
 
 把 `examples/mcp_server_settings.snippet.json` 的内容并进
 `main/xiaozhi-server/data/.mcp_server_settings.json`，重启服务端。
-`mcp_manager.py` 启动时读这个文件，把网关的 11 个 `music_*` 工具挂到所有智能体上。
+`mcp_manager.py` 启动时读这个文件，把网关的 16 个 `music_*` 工具挂到所有智能体上。
 
 ### 方式 B：插件调 REST（推荐，能一次调用完成“查歌 + 播放”）
 
@@ -290,7 +290,7 @@ compose 里已经包含 `fnmusic-bridge` 服务（填 `MCP_ENDPOINT` 就会启�
 ~~~bash
 export MCP_ENDPOINT='wss://xxx:59826/mcp_endpoint/mcp/?token=...'
 docker compose up -d            # fnmusic-gateway + fnmusic-bridge
-docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 13 个工具" 即成功
+docker logs -f fnmusic-bridge   # 看到 "接入点已连接" 和 "tools/list -> 16 个工具" 即成功
 ~~~
 
 不填 `MCP_ENDPOINT` 时桥接器会一直重连、不影响网关本体。
@@ -446,12 +446,12 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | POST | `/api/settings/online/test` | 对所选平台逐一探活并试搜 1 首，返回 `{ok,ms,results}` |
 | GET | `/api/settings/advanced` | 读取高级运行参数（config 优先，环境变量默认） |
 | PUT | `/api/settings/advanced` | 保存高级运行参数并立即生效（只提交需要改的字段） |
-| POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid`）；在线歌曲 add 时按最高音质下载到本地下载目录 |
+| POST | `/api/favorite` | body `{"action":"add\|remove","query":"歌名"}`（也可传 `guid` 或 `current=true` 当前曲目）；在线歌曲 add 时按最高音质下载到本地下载目录 |
 | POST | `/api/warm` | body `{"guid":"...","quality":"high"}`，预转码到缓存 |
 | POST | `/api/download` | body `{"guid":"..."}` 或 `{"query":"歌名","quality":"lossless"}`，下载到本地下载目录 |
 | POST | `/mcp` | MCP streamable-http（JSON-RPC） |
 
-### MCP 工具（13 个）
+### MCP 工具（16 个）
 
 | 工具 | 用途 |
 |---|---|
@@ -460,10 +460,13 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | `music_playlists` | 列出飞牛音乐歌单（未配飞牛不可用） |
 | `music_playlist_tracks` | 按歌单名列出飞牛曲目（未配飞牛不可用） |
 | `music_favorites` | 列出飞牛收藏（未配飞牛不可用） |
-| `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；`playlist=歌单名` 或 `favorites=true` 连续播放整个列表；可选 `quality` |
+| `music_play` | 拿直链 + 歌名/歌手/歌词直链 + 音质，提示调用设备 `self.music.play_url`；`playlist=歌单名`、`favorites=true`、`artist=歌手`、`album=专辑`、`library=true` 连续播放整个列表；`shuffle=true` 随机；`loop=one/all/off` 单曲/列表循环；可选 `quality` |
 | `music_next` | 在连续播放的收藏/歌单中切到下一首，返回新的直链与 device_args |
 | `music_previous` | 在连续播放的收藏/歌单中切到上一首，返回新的直链与 device_args |
-| `music_favorite` | 配了飞牛时直接写飞牛收藏；在线曲目 add 时按最高音质下载到本地下载目录 |
+| `music_loop` | 切换循环模式：`mode=one` 单曲循环 / `all` 列表循环 / `off` 顺序播放 |
+| `music_resume` | 从上次停止的位置继续播放；单曲按秒切片，歌单恢复到对应曲目与进度 |
+| `music_stop` | 停止当前播放并记录进度，之后可用 `music_resume` 接着放 |
+| `music_favorite` | 收藏/取消收藏：可传 `query`、`guid` 或 `current=true`（当前曲目）；配了飞牛时直接写飞牛收藏，在线曲目 add 时按最高音质下载到本地下载目录 |
 | `music_status` | 连续流返回当前曲目/歌词/已播放秒数；否则返回上一次播放（含音质） |
 | `music_download` | 显式下载在线歌曲到本地下载目录，可指定音质 |
 | `music_sources` | 查看内置在线音源平台可用性 |
@@ -495,7 +498,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 156 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
+python tests/test_gateway.py -v   # 164 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 
@@ -544,6 +547,6 @@ bridge/mcp_pipe_http.py   小智 MCP 接入点桥接器
 examples/                 MCP 配置片段与 xiaozhi 插件
 docs/refactor-2.0.md      2.0 改造方案（问题清单/架构/MCP/缓存/部署/验收/回滚）
 docs/acceptance-2.0.md    2.0 分级落地验收报告（P0→P2 逐项自测）
-tests/                    test_gateway.py（156 用例）、bridge_selftest.py
+tests/                    test_gateway.py（164 用例）、bridge_selftest.py
 docker-compose.yml        单端口：网关 + 可选桥接器（只发布 8766）
 ~~~

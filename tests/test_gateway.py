@@ -404,7 +404,7 @@ class TestHttp(Base):
         self.assertTrue(r.getheader("Mcp-Session-Id"))
         self.assertEqual(d["result"]["serverInfo"]["name"], "fnmusic-gateway")
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(d["result"]["tools"]), 13)
+        self.assertEqual(len(d["result"]["tools"]), 16)
         r, d = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                          "params": {"name": "music_status", "arguments": {}}})
         self.assertIn("content", d["result"])
@@ -1433,7 +1433,7 @@ class TestV2Quality(unittest.TestCase):
 
     def test_tool_catalog(self):
         names = [t["name"] for t in app.TOOLS]
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 16)
         for n in ("music_download", "music_sources", "music_storage"):
             self.assertIn(n, names)
         play = [t for t in app.TOOLS if t["name"] == "music_play"][0]
@@ -1822,6 +1822,75 @@ class TestOptim213(unittest.TestCase):
         self.assertIn("列表过长", str(cm.exception))
 
 
+    def test_music_play_library_uses_all_tracks(self):
+        out = app.call_tool("music_play", {"library": True, "_session_id": "lib-play"}, "http://h")
+        self.assertIn("音乐库", out)
+        self.assertIn("共 6 首", out)
+        st = app.call_tool("music_status", {"_session_id": "lib-play"}, "http://h")
+        self.assertIn("第 1/6 首", st)
+
+    def test_music_single_loop_uses_playlist_stream(self):
+        out = app.call_tool("music_play", {"query": "晴天", "loop": "one",
+                                           "_session_id": "loop-one"}, "http://h")
+        self.assertIn("单曲循环", out)
+        self.assertIn("共 1 首", out)
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        token = urllib.parse.urlparse(url).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        item = app.PLAYLISTS.get(token)
+        self.assertTrue(item["loop"])
+        self.assertEqual(len(item["tracks"]), 1)
+
+    def test_music_loop_mode_all_then_off(self):
+        app.call_tool("music_play", {"favorites": True, "_session_id": "loop-mode"}, "http://h")
+        all_out = app.call_tool("music_loop", {"mode": "all", "_session_id": "loop-mode"}, "http://h")
+        self.assertIn("循环播放", all_out)
+        token = urllib.parse.urlparse(
+            [ln for ln in all_out.splitlines() if "http" in ln][0].split("：")[-1]
+        ).path.split("/playlist/")[1].rsplit(".mp3", 1)[0]
+        self.assertTrue(app.PLAYLISTS.get(token)["loop"])
+        off_out = app.call_tool("music_loop", {"mode": "off", "_session_id": "loop-mode"}, "http://h")
+        self.assertIn("顺序播放", off_out)
+
+    def test_music_stop_then_resume_playlist(self):
+        app.call_tool("music_play", {"favorites": True, "_session_id": "stop-resume"}, "http://h")
+        stopped = app.call_tool("music_stop", {"_session_id": "stop-resume"}, "http://h")
+        self.assertIn("已停止", stopped)
+        resumed = app.call_tool("music_resume", {"_session_id": "stop-resume"}, "http://h")
+        self.assertIn("继续播放", resumed)
+        self.assertIn("共 2 首", resumed)
+
+    def test_music_resume_playlist_uses_saved_position(self):
+        tracks = [dict(x) for x in app.MockProvider.TRACKS[:2]]
+        app._resume_save("pl-pos", "playlist", tracks=tracks, label="收藏",
+                         quality="standard", index=0, position=30, token="")
+        out = app.call_tool("music_resume", {"_session_id": "pl-pos"}, "http://h")
+        self.assertIn("继续播放", out)
+        self.assertIn("start=30", out)
+
+    def test_music_resume_single_uses_signed_start(self):
+        track = dict(app.MockProvider.TRACKS[0])
+        app._resume_save("single-pos", "single", track=track,
+                         quality="standard", position=12)
+        out = app.call_tool("music_resume", {"_session_id": "single-pos"}, "http://h")
+        self.assertIn("从约 12 秒继续", out)
+        self.assertIn("start=12", out)
+
+    def test_music_favorite_current_and_by_guid(self):
+        app.call_tool("music_play", {"favorites": True, "_session_id": "fav-x"}, "http://h")
+        added = app.call_tool("music_favorite", {"action": "add", "current": True,
+                                                 "_session_id": "fav-x"}, "http://h")
+        self.assertIn("已收藏", added)
+        removed = app.call_tool("music_favorite", {"action": "remove", "guid": "mock-1"}, "http://h")
+        self.assertIn("已取消收藏：晴天", removed)
+
+    def test_make_url_start_is_signed(self):
+        url = app.make_url("http://h", "g", 60, quality="standard", start=15)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        self.assertEqual(qs["start"], ["15"])
+        self.assertTrue(app.verify("g", qs["exp"][0], qs["sig"][0], "standard", start=15))
+        self.assertFalse(app.verify("g", qs["exp"][0], qs["sig"][0], "standard"))
+
+
 class TestOptim2135(unittest.TestCase):
     """2.13.5：provider 生命周期、缓存保护、搜索兜底、列表优先级。"""
 
@@ -1969,7 +2038,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.8")
+        self.assertEqual(app.VERSION, "2.13.9")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

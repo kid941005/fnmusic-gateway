@@ -4,6 +4,7 @@ data/cache/
 data/mock/
 data/sign.key
 data/state.json
+data/resume.json
 data/moods.json
 data/.fnmusic_token.json
 data/config.json

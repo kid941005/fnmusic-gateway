@@ -58,6 +58,7 @@ from gwlib.native_source import (NativeMusicDLProvider,
                                   deps_error as online_deps_error)
 from gwlib.playback import PlaybackService
 from gwlib.playlist import PlaylistRegistry, iter_clean_mp3
+from gwlib.resume import ResumeStore
 from gwlib.mcp_tools import build_tools
 from gwlib.mcp_server import McpHttpBridge, McpService
 from gwlib.config import ConfigStore
@@ -144,6 +145,7 @@ CACHE_DIR = _env("GW_CACHE_DIR", os.path.join(DATA_DIR, "cache"))
 CACHE_MAX = _env_int("GW_CACHE_MAX_BYTES", 8 * 1024 ** 3)
 MOCK = _env_bool("GW_MOCK", False)
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+RESUME_FILE = os.path.join(DATA_DIR, "resume.json")
 MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
 HTTP_BODY_CAP = 1024 * 1024
 MCP_BODY_CAP = 4 * 1024 * 1024
@@ -378,19 +380,23 @@ def _load_secret():
 SECRET = _load_secret()
 
 
-def _sign_raw(guid, exp):
+def _sign_raw(guid, exp, start=0):
     msg = ("%s|%d" % (guid, exp)).encode("utf-8")
+    if start:
+        msg += ("|%d" % int(start)).encode("utf-8")
     return hmac.new(SECRET, msg, hashlib.sha256).hexdigest()[:40]
 
 
-def sign(guid, exp, quality=None):
-    """签名绑定 guid/过期时间/音质，避免改 URL 的 q 参数越权取高音质。"""
+def sign(guid, exp, quality=None, start=0):
+    """签名绑定 guid/过期时间/音质；有续播秒数时一并绑定。"""
     q = normalize_quality(quality or QUALITY_DEFAULT)
     msg = ("%s|%d|%s" % (guid, exp, q)).encode("utf-8")
+    if start:
+        msg += ("|%d" % int(start)).encode("utf-8")
     return hmac.new(SECRET, msg, hashlib.sha256).hexdigest()[:40]
 
 
-def verify(guid, exp, sig, quality=None):
+def verify(guid, exp, sig, quality=None, start=0):
     try:
         exp = int(exp)
     except Exception:
@@ -399,8 +405,8 @@ def verify(guid, exp, sig, quality=None):
         return False
     given = str(sig or "")
     # 兼容旧版本已发出的、只签 guid+exp 的 URL（URL_TTL 内平滑升级）。
-    return (hmac.compare_digest(sign(guid, exp, quality), given) or
-            hmac.compare_digest(_sign_raw(guid, exp), given))
+    return (hmac.compare_digest(sign(guid, exp, quality, start), given) or
+            hmac.compare_digest(_sign_raw(guid, exp, start), given))
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -767,11 +773,69 @@ def save_state(d):
             LOG.warning("save state failed: %s", e)
 
 
+def _resume_save(session_key, kind, track=None, tracks=None, label="", quality=None,
+                 index=0, position=0.0, token="", loop=False):
+    """保存本会话的可续播状态；只是元数据，不包含音频。"""
+    try:
+        position = max(0.0, float(position or 0))
+    except (TypeError, ValueError):
+        position = 0.0
+    try:
+        index = max(0, int(index or 0))
+    except (TypeError, ValueError):
+        index = 0
+    data = {"kind": kind, "quality": quality or DEFAULT_QUALITY,
+            "label": str(label or ""), "index": index, "position": position,
+            "started_at": time.time(), "token": str(token or ""),
+            "loop": bool(loop)}
+    if isinstance(track, dict):
+        data["track"] = dict(track)
+    if tracks:
+        data["tracks"] = [dict(t) for t in tracks]
+    try:
+        RESUMES.set(session_key, data)
+    except Exception as exc:
+        LOG.warning("save resume state failed: %s", exc)
+
+
+def _resume_get(session_key):
+    try:
+        return RESUMES.get(session_key)
+    except Exception:
+        return None
+
+
+def _resume_clear(session_key):
+    try:
+        RESUMES.clear(session_key)
+    except Exception:
+        pass
+
+
+def _current_playback_track(session_key):
+    """当前会话正在播放的曲目；优先连续流游标，其次续播记录，最后全局上次播放。"""
+    cursor = CURRENT_PLAYLISTS.get(session_key)
+    item = PLAYLISTS.get(cursor.get("token")) if cursor else None
+    if item and item.get("tracks"):
+        idx = max(0, min(int(cursor.get("index", 0)), len(item["tracks"]) - 1))
+        return dict(item["tracks"][idx])
+    st = _resume_get(session_key) or {}
+    if isinstance(st.get("track"), dict) and st["track"].get("guid"):
+        return dict(st["track"])
+    last = load_state()
+    if last.get("guid"):
+        return {"guid": last["guid"], "title": last.get("title") or last["guid"],
+                "artist": last.get("artist") or "",
+                "duration_s": last.get("duration")}
+    return None
+
+
 # ---------------------------------------------------------------- 转码缓存
 _ADV_BOOT = advanced_settings()
 CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
                    transcode_slots=_TRANSCODE_SLOTS)
 PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=500)
+RESUMES = ResumeStore(RESUME_FILE)
 LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG,
                        max_bytes=_ADV_BOOT["library_max_mb"] * _MIB)
 
@@ -1412,28 +1476,31 @@ def pick_tracks(p, query="", playlist="", limit=10):
     raise BadRequest("需要 query 或 playlist 之一")
 
 
-def make_url(base, guid, ttl=None, quality=None):
+def make_url(base, guid, ttl=None, quality=None, start=0):
     exp = int(time.time()) + (ttl or URL_TTL)
     g = urllib.parse.quote(guid, safe="")
     q = normalize_quality(quality or QUALITY_DEFAULT)
-    return "%s/play/%s.mp3?exp=%d&sig=%s&q=%s" % (
-        base, g, exp, sign(guid, exp, q), urllib.parse.quote(q, safe=""))
+    extra = "&start=%d" % int(start) if start else ""
+    return "%s/play/%s.mp3?exp=%d&sig=%s&q=%s%s" % (
+        base, g, exp, sign(guid, exp, q, start), urllib.parse.quote(q, safe=""), extra)
 
 
-def make_playlist_url(base, token, ttl=None, quality=None, session=""):
+def make_playlist_url(base, token, ttl=None, quality=None, session="", start=0):
     exp = int(time.time()) + (ttl or URL_TTL)
     guid = "pl:" + str(token)
     q = normalize_quality(quality or QUALITY_DEFAULT)
     url = "%s/playlist/%s.mp3?exp=%d&sig=%s&q=%s" % (
-        base, urllib.parse.quote(str(token), safe=""), exp, sign(guid, exp, q),
-        urllib.parse.quote(q, safe=""))
+        base, urllib.parse.quote(str(token), safe=""), exp,
+        sign(guid, exp, q, int(start or 0)), urllib.parse.quote(q, safe=""))
+    if start:
+        url += "&start=%d" % int(start)
     if session:
         url += "&s=" + urllib.parse.quote(str(session), safe="")
     return url
 
 
 def build_playlist_info(p, tracks, label, base, quality=None, action="连续播放",
-                        start_index=0, session_key=""):
+                        start_index=0, session_key="", loop=False, start_position=0):
     """把多首曲目登记为一个连续播放流，返回给设备的直链信息。
 
     连续流仍然只有一个 URL，但设备屏显必须拿到「当前首」的歌名/歌手/歌词/单曲时长，
@@ -1448,7 +1515,7 @@ def build_playlist_info(p, tracks, label, base, quality=None, action="连续播�
         start_index = 0
     profile = get_profile(quality or QUALITY_DEFAULT)
     playlist_label = label or "连续播放"
-    token = PLAYLISTS.put(rows, quality=profile["name"], ttl=URL_TTL, label=playlist_label)
+    token = PLAYLISTS.put(rows, quality=profile["name"], ttl=URL_TTL, label=playlist_label, loop=loop)
     if not token:
         raise BadRequest("没有可以连续播放的曲目")
     stored = PLAYLISTS.get(token)
@@ -1456,8 +1523,12 @@ def build_playlist_info(p, tracks, label, base, quality=None, action="连续播�
         raise BadRequest("列表过长，最多支持 %d 首" % (len(stored.get("tracks") or []) if stored else 0))
     # 共享列表上的 index 仅作为无会话信息时的兜底；实际播放游标按 session 保存。
     PLAYLISTS.set_index(token, start_index, time.time())
+    try:
+        start_position = max(0, int(start_position or 0))
+    except (TypeError, ValueError):
+        start_position = 0
     url = make_playlist_url(base, token, ttl=URL_TTL, quality=profile["name"],
-                            session=session_key)
+                            session=session_key, start=start_position)
     total_s = 0.0
     for track in rows:
         try:
@@ -1489,7 +1560,8 @@ def build_playlist_info(p, tracks, label, base, quality=None, action="连续播�
         "bitrate": profile["bitrate"], "source": "local",
         "preview": False, "duration": first_duration or None, "saving": False,
         "preparing": True, "playlist_token": token, "count": len(rows),
-        "start_index": start_index,
+        "start_index": start_index, "start_position": start_position,
+        "loop": bool(loop),
         "playlist_label": playlist_label, "playlist_duration": total_s or None,
         "device_args": {"url": url, "title": first_title, "artist": first_artist,
                         "lyric_url": first_lyric_url,
@@ -1509,7 +1581,8 @@ def with_web_url(info):
             # 连续播放列表要用 /playlist 流，不能当成普通单曲 /play。
             out["web_url"] = make_playlist_url("", guid[3:],
                                                ttl=out.get("expires_in"),
-                                               quality=out.get("quality"))
+                                               quality=out.get("quality"),
+                                               start=out.get("start_position") or 0)
         else:
             out["web_url"] = make_url("", guid, ttl=out.get("expires_in"),
                                       quality=out.get("quality"))
@@ -1808,9 +1881,13 @@ def _wants_shuffle(text):
 
 
 def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
-                       favorites=False, shuffle=False, index=1, session_key=""):
+                       favorites=False, shuffle=False, index=1, session_key="",
+                       library=False, loop=False):
     """把歌单/收藏/歌手/专辑解析成连续播放流，MCP 与 REST 共用。"""
-    if artist:
+    if library:
+        rows = p.list_tracks(500)
+        label = "音乐库"
+    elif artist:
         item = resolve_artist(p, artist)
         if not item:
             names = "、".join(str(x.get("name") or "") for x in (getattr(p, "artist_items", lambda: [])() or [])[:8])
@@ -1848,11 +1925,62 @@ def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
         action = "连续播放"
     if not rows:
         raise BadRequest("列表里没有可播放的歌曲")
+    if loop:
+        action = "随机循环" if shuffle else "循环播放"
     # 保留完整列表，start 使用绝对索引；状态/前后曲/剩余数量都基于同一份列表。
     start = max(0, min(start, len(rows) - 1))
     info = build_playlist_info(p, rows, label, base, quality, action=action,
-                               start_index=start, session_key=session_key)
+                               start_index=start, session_key=session_key, loop=loop)
     return info, label, start, bool(shuffle), action, rows
+
+
+def _format_list_playback(info, label, total, start, shuffle, action):
+    args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
+    order_note = "，随机顺序" if shuffle else ""
+    return ("准备%s：%s，共 %d 首%s，当前第 %d 首\n"
+            "歌曲：%s%s\n"
+            "直链（%d 分钟内有效）：%s\n"
+            "歌词直链：%s\n"
+            "单曲时长：%d 秒\n"
+            "device_args：%s\n"
+            "设备工具：self.music.play_url。参数取 device_args：url 填直链，title 填「%s」，"
+            "artist 填「%s」，lyric_url 填歌词直链（没有就留空），duration 填 %d。"
+            "歌词由设备每 10 秒通过 music_status 自动刷新；说「下一曲/上一曲」时调用 music_next/music_previous 后再用 self.music.play_url 播放新的 device_args。"
+            % (action, label, total, order_note, start + 1,
+               info.get("title") or "", (" - " + info.get("artist")) if info.get("artist") else "",
+               max(1, (info.get("expires_in") or URL_TTL) // 60), info["url"],
+               info.get("lyric_url") or "（暂未取到，留空）",
+               int(info.get("duration") or 0), args_json,
+               info.get("title") or "", info.get("artist") or "",
+               int(info.get("duration") or 0)))
+
+
+def _saved_list_response(st, p, base, quality=None, session_key="", action="继续播放",
+                         loop=None, start=None):
+    """从续播记录恢复一个连续播放列表，并登记新的游标。"""
+    tracks = [dict(t) for t in (st.get("tracks") or [])
+              if isinstance(t, dict) and t.get("guid")]
+    if not tracks:
+        raise BadRequest("没有可继续播放的歌曲列表")
+    if start is None:
+        start = _to_int(st.get("index"), 0)
+    start = max(0, min(int(start), len(tracks) - 1))
+    label = str(st.get("label") or "当前列表")
+    q = quality or st.get("quality") or QUALITY_DEFAULT
+    lp = bool(st.get("loop")) if loop is None else bool(loop)
+    try:
+        position = max(0, int(float(st.get("position") or 0)))
+    except (TypeError, ValueError):
+        position = 0
+    info = build_playlist_info(p, tracks, label, base, q, action=action,
+                               start_index=start, session_key=session_key, loop=lp,
+                               start_position=position)
+    token = info.get("playlist_token")
+    if token:
+        CURRENT_PLAYLISTS.set(session_key, token, start, time.time() - position)
+    _resume_save(session_key, "playlist", tracks=tracks, label=label, quality=q,
+                 index=start, position=position, token=token, loop=lp)
+    return _format_list_playback(info, label, len(tracks), start, False, action)
 
 
 def _tool_music_play(args, p, base, limit, quality):
@@ -1862,6 +1990,10 @@ def _tool_music_play(args, p, base, limit, quality):
     query_text = str(args.get("query") or "").strip()
     artist = str(args.get("artist") or "").strip()
     album = str(args.get("album") or "").strip()
+    library = _truthy(args.get("library")) or _truthy(args.get("all"))
+    loop_mode = str(args.get("loop") or "").strip().lower()
+    loop_one = loop_mode in ("one", "single", "single_loop", "单曲循环", "单曲")
+    loop_all = loop_mode in ("all", "list", "循环", "列表循环")
     fav_raw = args.get("favorites")
     favorites = _truthy(fav_raw)
     shuffle = _truthy(args.get("shuffle")) or _truthy(args.get("random"))
@@ -1879,15 +2011,18 @@ def _tool_music_play(args, p, base, limit, quality):
         names = {_norm_text(t.get("artist")) for t in pre_rows if t.get("artist")}
         if len(pre_rows) >= 2 and len(names) == 1 and _norm_text(query_text) in names:
             artist = query_text
-    if favorites or playlist or artist or album:
+    if favorites or playlist or artist or album or library:
         info, label, start, shuffle, action, rows = build_list_playback(
             p, base, quality, playlist=playlist, artist=artist, album=album,
             favorites=favorites, shuffle=shuffle, index=args.get("index"),
-            session_key=session_key)
+            session_key=session_key, library=library, loop=loop_all)
         total = len(rows)
         token = info.get("playlist_token")
         if token:
             CURRENT_PLAYLISTS.set(session_key, token, start, time.time())
+        _resume_save(session_key, "playlist", tracks=rows, label=label,
+                     quality=quality or info.get("quality"), index=start,
+                     token=token, loop=loop_all)
         args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
         order_note = "，随机顺序" if shuffle else ""
         return ("准备%s：%s，共 %d 首%s，当前第 %d 首\n"
@@ -1930,7 +2065,21 @@ def _tool_music_play(args, p, base, limit, quality):
             raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
         track = rows[idx - 1]
         total = len(rows)
+    if loop_one:
+        only_label = "单曲循环"
+        only_info = build_playlist_info(p, [track], only_label, base, quality,
+                                        action="单曲循环", start_index=0,
+                                        session_key=session_key, loop=True)
+        only_token = only_info.get("playlist_token")
+        if only_token:
+            CURRENT_PLAYLISTS.set(session_key, only_token, 0, time.time())
+        _resume_save(session_key, "playlist", tracks=[track], label=only_label,
+                     quality=quality or only_info.get("quality"), index=0,
+                     token=only_token, loop=True)
+        return _format_list_playback(only_info, only_label, 1, 0, False, "单曲循环")
     info = PLAYBACK.prepare(track, p, base, quality=quality, wait=False)
+    _resume_save(session_key, "single", track=track,
+                 quality=quality or info.get("quality"), position=0.0)
     src_line = ("\n来源：在线音源 %s" % info["source"]) if info["source"] != "local" else ""
     prev_line = ""
     if info["preview"]:
@@ -1970,6 +2119,9 @@ def _tool_music_skip(args, p, base, quality, delta):
     track = tracks[target]
     info = PLAYBACK.prepare(dict(track), p, base, quality=quality, wait=False)
     CURRENT_PLAYLISTS.set(session_key, token, target, time.time())
+    _resume_save(session_key, "playlist", tracks=tracks, label=item.get("label") or "",
+                 quality=quality or item.get("quality"), index=target, token=token,
+                 loop=bool(item.get("loop")))
     args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
     what = "下一首" if delta > 0 else "上一首"
     return ("准备播放%s：%s%s\n"
@@ -2000,23 +2152,42 @@ def _tool_music_previous(args, p, base, limit, quality):
 def _tool_music_favorite(args, p, base, limit, quality):
     action = str(args.get("action") or "").lower()
     q = str(args.get("query") or "").strip()
-    if not q:
-        raise BadRequest("query 不能为空")
-    rows = p.search(q, 5)
-    if not rows:
-        raise BadRequest("没找到「%s」" % q)
-    t = rows[0]
+    guid = str(args.get("guid") or "").strip()
+    title = str(args.get("title") or "").strip()
+    artist = str(args.get("artist") or "").strip()
+    current = _truthy(args.get("current"))
+    if action not in ("add", "remove"):
+        raise BadRequest("action 只能是 add 或 remove")
+    if current:
+        t = _current_playback_track(_session_key(args))
+        if not t:
+            raise BadRequest("当前没有正在播放的歌曲，无法按 current 收藏/取消收藏")
+    elif guid:
+        t = {"guid": guid, "title": title or guid, "artist": artist}
+        info_fn = getattr(p, "track_info", None)
+        if callable(info_fn):
+            try:
+                found = info_fn(guid)
+            except Exception:
+                found = None
+            if isinstance(found, dict):
+                t.update({k: v for k, v in found.items() if v})
+    elif q:
+        rows = p.search(q, 5)
+        if not rows:
+            raise BadRequest("没找到「%s」" % q)
+        t = rows[0]
+    else:
+        raise BadRequest("需要 query、guid 或 current=true 之一")
     if action == "add":
         if is_ext_guid(t["guid"]) and hasattr(p, "download_ext"):
             fp, n = p.download_ext(t, quality or "lossless")
             return "已收藏并下载到本地曲库：%s（%s，%.1f MB）" % (
-                t["title"], fp, n / 1048576.0)
+                t.get("title") or t["guid"], fp, n / 1048576.0)
         p.add_favorite(t["guid"])
-        return "已收藏：%s" % t["title"]
-    if action == "remove":
-        p.remove_favorite(t["guid"])
-        return "已取消收藏：%s" % t["title"]
-    raise BadRequest("action 只能是 add 或 remove")
+        return "已收藏：%s" % (t.get("title") or t["guid"])
+    p.remove_favorite(t["guid"])
+    return "已取消收藏：%s" % (t.get("title") or t["guid"])
 
 
 def _tool_music_download(args, p, base, limit, quality):
@@ -2076,6 +2247,9 @@ def _tool_music_status(args, p, base, limit, quality):
         except (TypeError, ValueError):
             duration = 0
         lyric = _lrc_line_at(track, elapsed)
+        _resume_save(session_key, "playlist", tracks=tracks, label=item.get("label") or "",
+                     quality=item.get("quality"), index=idx, position=min(elapsed, duration or elapsed),
+                     token=token, loop=bool(item.get("loop")))
         return ("正在播放：%s%s\n"
                 "来自：%s 第 %d/%d 首\n"
                 "时长：%d 秒\n"
@@ -2090,8 +2264,137 @@ def _tool_music_status(args, p, base, limit, quality):
     at = _to_int(st.get("at"))
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)) if at > 0 else "时间未知"
     qn = ("（音质 %s）" % st.get("quality")) if st.get("quality") else ""
+    if st.get("guid"):
+        elapsed = max(0, int(time.time() - _to_int(st.get("at"), int(time.time()))))
+        duration = _to_int(st.get("duration"), 0)
+        if duration > 0:
+            elapsed = min(elapsed, duration)
+        _resume_save(session_key, "single",
+                     track={"guid": st["guid"], "title": st.get("title") or st["guid"],
+                            "artist": st.get("artist") or "", "duration_s": st.get("duration")},
+                     quality=st.get("quality"), position=elapsed)
     return "上一次播放：%s%s%s（%s）" % (
         st.get("title"), (" - " + st["artist"]) if st.get("artist") else "", qn, when)
+
+
+def _format_resume_single(info, position):
+    args_json = json.dumps(info.get("device_args") or {}, ensure_ascii=False)
+    return ("准备继续播放：%s%s\n"
+            "从约 %d 秒继续\n"
+            "直链（%d 分钟内有效）：%s\n"
+            "歌词直链：%s\n"
+            "单曲时长：%d 秒\n"
+            "device_args：%s\n"
+            "设备工具：self.music.play_url。参数取 device_args：url 填直链，title 填「%s」，"
+            "artist 填「%s」，lyric_url 填歌词直链（没有就留空），duration 填 %d。"
+            % (info.get("title") or "", (" - " + info["artist"]) if info.get("artist") else "",
+               int(position or 0), max(1, (info.get("expires_in") or URL_TTL) // 60),
+               info["url"], info.get("lyric_url") or "（这首歌查不到歌词，留空即可）",
+               int(info.get("duration") or 0), args_json, info.get("title") or "",
+               info.get("artist") or "", int(info.get("duration") or 0)))
+
+
+def _tool_music_resume(args, p, base, limit, quality):
+    """从本会话保存的续播记录继续播放；单曲按秒数切片，列表按原游标恢复。"""
+    session_key = _session_key(args)
+    st = _resume_get(session_key) or {}
+    kind = str(st.get("kind") or "")
+    if kind == "playlist" and st.get("tracks"):
+        return _saved_list_response(st, p, base, quality, session_key,
+                                     action="继续播放", loop=bool(st.get("loop")))
+    track = None
+    position = 0
+    if kind == "single" and isinstance(st.get("track"), dict) and st["track"].get("guid"):
+        track = dict(st["track"])
+        try:
+            position = max(0, int(float(st.get("position") or 0)))
+        except (TypeError, ValueError):
+            position = 0
+    if not track:
+        track = _current_playback_track(session_key)
+    if not track:
+        return "没有找到可继续播放的记录。请先播放歌曲或歌单，再让我继续播放。"
+    q = quality or st.get("quality")
+    info = PLAYBACK.prepare(track, p, base, quality=q, wait=False, start=position)
+    _resume_save(session_key, "single", track=track, quality=q, position=position)
+    return _format_resume_single(info, position)
+
+
+def _tool_music_stop(args, p, base, limit, quality):
+    """停止当前播放，但保留续播位置，用户之后说继续播放可以接着放。"""
+    session_key = _session_key(args)
+    cursor = CURRENT_PLAYLISTS.get(session_key)
+    token = cursor.get("token") if cursor else None
+    item = PLAYLISTS.get(token) if token else None
+    saved = False
+    if item and item.get("tracks"):
+        tracks = item["tracks"]
+        idx = max(0, min(int(cursor.get("index", 0)), len(tracks) - 1))
+        track = tracks[idx]
+        started = float(cursor.get("started_at") or time.time())
+        elapsed = max(0, int(time.time() - started))
+        try:
+            duration = int(float(track.get("duration_s") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        _resume_save(session_key, "playlist", tracks=tracks, label=item.get("label") or "",
+                     quality=item.get("quality"), index=idx,
+                     position=min(elapsed, duration or elapsed), token=token,
+                     loop=bool(item.get("loop")))
+        saved = True
+    else:
+        st = load_state()
+        if st.get("guid"):
+            elapsed = max(0, int(time.time() - _to_int(st.get("at"), int(time.time()))))
+            duration = _to_int(st.get("duration"), 0)
+            if duration > 0:
+                elapsed = min(elapsed, duration)
+            _resume_save(session_key, "single",
+                         track={"guid": st["guid"], "title": st.get("title") or st["guid"],
+                                "artist": st.get("artist") or "",
+                                "duration_s": st.get("duration")},
+                         quality=st.get("quality"), position=elapsed)
+            saved = True
+    CURRENT_PLAYLISTS.clear(session_key)
+    if saved:
+        return "已停止当前播放，已记录播放进度。下次说「继续播放」可以从这里接着放。\n设备工具：self.music.stop"
+    return "当前没有正在播放的音乐。\n设备工具：self.music.stop"
+
+
+def _tool_music_loop(args, p, base, limit, quality):
+    """切换当前播放的循环模式：one 单曲循环 / all 列表循环 / off 关闭循环。"""
+    session_key = _session_key(args)
+    mode = str(args.get("mode") or "").strip().lower()
+    if mode in ("one", "single", "单曲循环", "单曲"):
+        track = _current_playback_track(session_key)
+        if not track:
+            return "当前没有正在播放的歌曲，无法切换单曲循环。请先播放一首歌。"
+        st = {"tracks": [track], "label": "单曲循环", "quality": quality,
+              "loop": True, "index": 0}
+        return _saved_list_response(st, p, base, quality, session_key,
+                                    action="单曲循环", loop=True, start=0)
+    if mode in ("all", "list", "列表循环", "循环"):
+        st = _resume_get(session_key) or {}
+        if not st.get("tracks"):
+            track = _current_playback_track(session_key)
+            if not track:
+                return "当前没有正在播放的歌曲，无法切换列表循环。请先播放歌单或收藏。"
+            st = {"tracks": [track], "label": "单曲循环", "quality": quality, "index": 0}
+        return _saved_list_response(st, p, base, quality, session_key,
+                                    action="循环播放", loop=True)
+    if mode in ("off", "none", "顺序播放", "关闭循环", "normal"):
+        st = _resume_get(session_key) or {}
+        if st.get("tracks"):
+            return _saved_list_response(st, p, base, quality, session_key,
+                                        action="顺序播放", loop=False)
+        track = _current_playback_track(session_key)
+        if not track:
+            return "当前没有正在播放的歌曲，无法关闭循环。"
+        info = PLAYBACK.prepare(track, p, base, quality=quality, wait=False)
+        _resume_save(session_key, "single", track=track,
+                     quality=quality or info.get("quality"), position=0)
+        return _format_resume_single(info, 0)
+    raise BadRequest("mode 只能是 one / all / off")
 
 
 _TOOL_HANDLERS = {
@@ -2104,6 +2407,9 @@ _TOOL_HANDLERS = {
     "music_next": _tool_music_next,
     "music_previous": _tool_music_previous,
     "music_favorite": _tool_music_favorite,
+    "music_loop": _tool_music_loop,
+    "music_resume": _tool_music_resume,
+    "music_stop": _tool_music_stop,
     "music_download": _tool_music_download,
     "music_sources": _tool_music_sources,
     "music_storage": _tool_music_storage,
@@ -2130,6 +2436,39 @@ def call_tool(name, args, base, session_id=""):
 MCP_SERVICE = McpService(call_tool, VERSION,
                          lambda: PUBLIC_BASE or ("http://127.0.0.1:%d" % PORT), logger=LOG)
 MCP_BRIDGE = McpHttpBridge(MCP_SERVICE, timeout=advanced_settings()["mcp_timeout"], logger=LOG)
+
+
+def _resume_audio_file(path, start):
+    """从缓存 MP3 生成从 start 秒开始的切片，断点续播用；失败时退回原文件。"""
+    try:
+        start = max(0, int(start or 0))
+    except (TypeError, ValueError):
+        return path
+    if start <= 0 or not path:
+        return path
+    src = os.path.abspath(str(path))
+    dst = "%s.resume-%d.mp3" % (os.path.splitext(src)[0], start)
+    try:
+        if os.path.getsize(dst) > 1024:
+            return dst
+    except OSError:
+        pass
+    tmp = dst + ".part"
+    try:
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", src, "-ss", str(start), "-vn", "-map_metadata", "-1",
+                        "-c:a", "copy", "-f", "mp3", tmp],
+                       check=True, timeout=180)
+        if os.path.getsize(tmp) > 1024:
+            os.replace(tmp, dst)
+            return dst
+    except Exception as exc:
+        LOG.warning("resume slice %s from %ss failed: %s", src, start, exc)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return path
 
 
 # ---------------------------------------------------------------- HTTP
@@ -2800,7 +3139,13 @@ class Handler(BaseHTTPRequestHandler):
                 if action not in ("add", "remove"):
                     raise BadRequest("action 只能是 add 或 remove")
                 guid = str(body.get("guid") or "").strip()
-                if not guid:
+                current = _truthy(body.get("current"))
+                if current:
+                    track = _current_playback_track(self._request_session_key())
+                    if not track:
+                        raise BadRequest("当前没有正在播放的歌曲，无法按 current 收藏/取消收藏")
+                    guid = track["guid"]
+                elif not guid:
                     rows = p.search(str(body.get("query") or ""), 1)
                     if not rows:
                         return self._json({"error": "track not found"}, 404)
@@ -2955,12 +3300,20 @@ class Handler(BaseHTTPRequestHandler):
         artist = (qs.get("artist") or [""])[0].strip()
         album = (qs.get("album") or [""])[0].strip()
         shuffle = _truthy((qs.get("shuffle") or [""])[0])
-        if favorites or artist or album or shuffle:
-            # 收藏/歌手/专辑/随机播放走整列表连续流；纯 playlist 保持旧的单曲行为。
+        library = _truthy((qs.get("library") or [""])[0]) or _truthy((qs.get("all") or [""])[0])
+        loop_mode = (qs.get("loop") or [""])[0].strip().lower()
+        loop_all = loop_mode in ("all", "list", "循环", "列表循环")
+        if favorites or artist or album or shuffle or library or loop_all:
+            # 收藏/歌手/专辑/随机/整库/循环走整列表连续流；纯 playlist 保持旧的单曲行为。
             info, label, start, shuffled, _action, rows = build_list_playback(
                 p, self._base(), quality, playlist=playlist, artist=artist, album=album,
-                favorites=favorites, shuffle=shuffle, index=index, session_key=session_key)
-            info.update({"label": label, "index": start + 1, "count": len(rows), "shuffle": shuffled})
+                favorites=favorites, shuffle=shuffle, index=index, session_key=session_key,
+                library=library, loop=loop_all)
+            info.update({"label": label, "index": start + 1, "count": len(rows),
+                         "shuffle": shuffled, "loop": loop_all})
+            _resume_save(session_key, "playlist", tracks=rows, label=label,
+                         quality=quality or info.get("quality"), index=start,
+                         token=info.get("playlist_token"), loop=loop_all)
             if info.get("playlist_token"):
                 CURRENT_PLAYLISTS.set(session_key, info["playlist_token"], start, time.time())
             return self._json(with_web_url(info))
@@ -3026,7 +3379,8 @@ class Handler(BaseHTTPRequestHandler):
         exp = (qs.get("exp") or [""])[0]
         sig = (qs.get("sig") or [""])[0]
         quality = (qs.get("q") or [""])[0] or "standard"
-        if not verify("pl:" + token, exp, sig, quality):
+        start_position = max(0, self._qs_int(qs, "start", 0))
+        if not verify("pl:" + token, exp, sig, quality, start=start_position):
             return self._json({"error": "invalid or expired signature"}, 403)
         item = PLAYLISTS.get(token)
         if not item or not item.get("tracks"):
@@ -3052,8 +3406,9 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.warning("playlist track %s prepare failed: %s", track.get("guid"), exc)
         if not first_path:
             return self._json({"error": "playlist tracks are unavailable"}, 502)
-        CURRENT_PLAYLISTS.set(session_key, token, start_index, time.time())
-        PLAYLISTS.set_index(token, start_index, time.time())
+        CURRENT_PLAYLISTS.set(session_key, token, start_index,
+                               time.time() - start_position)
+        PLAYLISTS.set_index(token, start_index, time.time() - start_position)
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
         self.send_header("Cache-Control", "no-store")
@@ -3062,20 +3417,36 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         if self.command == "HEAD":
             return
+        loop = bool(item.get("loop"))
+        first_cycle = True
         try:
-            for offset, track in enumerate(tracks[start_index:]):
-                if offset == 0:
-                    path = first_path
-                else:
-                    try:
-                        path = CACHE.ensure(track["guid"], p, quality=quality)
-                    except Exception as exc:
-                        LOG.warning("playlist track %s skipped: %s", track.get("guid"), exc)
-                        continue
-                CURRENT_PLAYLISTS.set(session_key, token, start_index + offset, time.time())
-                for block in iter_clean_mp3(path):
-                    self.wfile.write(block)
-                    self.wfile.flush()
+            while True:
+                for offset, track in enumerate(tracks[start_index:]):
+                    path_start = start_position if (first_cycle and offset == 0) else 0
+                    if offset == 0:
+                        path = first_path
+                    else:
+                        try:
+                            path = CACHE.ensure(track["guid"], p, quality=quality)
+                        except Exception as exc:
+                            LOG.warning("playlist track %s skipped: %s", track.get("guid"), exc)
+                            continue
+                    if path_start:
+                        path = _resume_audio_file(path, path_start)
+                    CURRENT_PLAYLISTS.set(session_key, token, start_index + offset,
+                                           time.time() - path_start)
+                    _resume_save(session_key, "playlist", tracks=tracks,
+                                 label=item.get("label") or "", quality=quality,
+                                 index=start_index + offset, position=path_start,
+                                 token=token, loop=loop)
+                    for block in iter_clean_mp3(path):
+                        self.wfile.write(block)
+                        self.wfile.flush()
+                first_cycle = False
+                start_position = 0
+                if not loop:
+                    break
+                start_index = 0
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
@@ -3093,7 +3464,8 @@ class Handler(BaseHTTPRequestHandler):
         exp = (qs.get("exp") or [""])[0]
         sig = (qs.get("sig") or [""])[0]
         quality = (qs.get("q") or [""])[0] or None
-        if not verify(guid, exp, sig, quality):
+        start = max(0, self._qs_int(qs, "start", 0))
+        if not verify(guid, exp, sig, quality, start=start):
             LOG.warning("bad signature for %s", guid)
             return self._json({"error": "invalid or expired signature"}, 403)
         try:
@@ -3101,6 +3473,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             LOG.exception("transcode %s failed", guid)
             return self._json({"error": "transcode failed: %s" % e}, 502)
+        if start:
+            path = _resume_audio_file(path, start)
         duration_ms = 0
         try:
             secs = PLAYBACK.audio_seconds(path)

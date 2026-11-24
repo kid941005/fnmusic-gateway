@@ -25,7 +25,7 @@ class PlaylistRegistry:
         for key in dead:
             self._items.pop(key, None)
 
-    def put(self, tracks, quality="standard", ttl=None, label=""):
+    def put(self, tracks, quality="standard", ttl=None, label="", loop=False):
         clean = []
         for track in tracks or []:
             if not isinstance(track, dict) or not track.get("guid"):
@@ -50,6 +50,7 @@ class PlaylistRegistry:
                 "label": str(label or ""),
                 "index": 0,
                 "started_at": time.time(),
+                "loop": bool(loop),
             }
         return token
 
@@ -66,6 +67,7 @@ class PlaylistRegistry:
                 "label": item.get("label", ""),
                 "index": int(item.get("index", 0)),
                 "started_at": float(item.get("started_at", time.time())),
+                "loop": bool(item.get("loop", False)),
             }
 
     def set_index(self, token, index, started_at=None):

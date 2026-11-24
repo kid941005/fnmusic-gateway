@@ -73,7 +73,7 @@ class PlaybackService:
         except Exception as exc:
             LOG.info("playback prefetch failed for %s: %s", guid, exc)
 
-    def prepare(self, track, provider, base, quality=None, save=True, ttl=None, wait=True):
+    def prepare(self, track, provider, base, quality=None, save=True, ttl=None, wait=True, start=0):
         profile = get_profile(quality or self.default_quality)
         current = dict(track)
         path = None
@@ -103,7 +103,12 @@ class PlaybackService:
             duration = self._duration_from_track(current)
         preview = bool(duration and duration < self.preview_min_seconds)
 
-        url = self.make_url(base, current["guid"], ttl=ttl, quality=profile["name"])
+        start = max(0, int(start or 0))
+        if start:
+            url = self.make_url(base, current["guid"], ttl=ttl,
+                                quality=profile["name"], start=start)
+        else:
+            url = self.make_url(base, current["guid"], ttl=ttl, quality=profile["name"])
         try:
             lyric_url = self.lyric_url_for(base, current, ttl=ttl)
         except Exception as exc:
@@ -115,7 +120,7 @@ class PlaybackService:
         state = {"guid": current["guid"], "title": current["title"], "artist": current["artist"],
                  "source": current.get("source") or "local", "preview": preview,
                  "duration": duration, "quality": profile["name"], "at": int(time.time()),
-                 "url": url}
+                 "position": start, "url": url}
         try:
             self.save_state(state)
         except Exception as exc:
@@ -130,6 +135,7 @@ class PlaybackService:
             "device_args": {"url": url, "title": current["title"],
                             "artist": current.get("artist") or "", "lyric_url": lyric_url,
                             "duration": int(round(duration)) if duration else 0},
+            "resume_position": start,
             "device_tool": "self.music.play_url",
             "spoken": "%s%s" % (current["title"],
                                 ("，" + current["artist"]) if current.get("artist") else ""),

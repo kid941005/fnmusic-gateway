@@ -49,11 +49,12 @@ DEFAULT_INSTRUCTIONS = (
     "这是音乐播放网关（飞牛音乐优先，在线音源兜底）。先用 music_search 找到歌，"
     "music_play 会返回签名直链；拿到直链后必须调用设备工具 self.music.play_url，"
     "并传入 url、title、artist、lyric_url、duration（秒，整数）五个参数。"
+    "用户说切歌/下一首/换一首时调用 music_next，说上一首/前一首时调用 music_previous，不要用 music_play 处理切歌。"
 )
 
 
 class McpService:
-    """把网关的 13 个工具注册进官方 MCPServer 2.3。"""
+    """把网关的 16 个工具注册进官方 MCPServer 2.3。"""
 
     def __init__(self, call_tool: Callable[[str, dict, str], str], version: str,
                  default_base: str | Callable[[], str],

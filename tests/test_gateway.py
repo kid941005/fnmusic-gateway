@@ -2038,7 +2038,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.9")
+        self.assertEqual(app.VERSION, "2.13.10")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 
@@ -2093,6 +2093,52 @@ class TestRelease201(unittest.TestCase):
         self.assertEqual(size, 300)
         self.assertTrue(fp.endswith(".mp3"))
         self.assertEqual(os.path.getsize(fp), 300)
+
+class TestPrefetchNext(Base):
+    """连续播放/切歌时后台预取下一首，降低二次起播等待。"""
+
+    def _tracks(self):
+        return [dict(x) for x in app.MockProvider.TRACKS[:3]]
+
+    def test_prefetch_helper_skips_last_without_loop_and_wraps_with_loop(self):
+        from unittest import mock
+        tracks = self._tracks()
+        with mock.patch.object(app.CACHE, "prefetch") as pf:
+            app._prefetch_playlist_next(tracks, 0, app.MockProvider(), "standard", False)
+            pf.assert_called_once_with("mock-2", mock.ANY, quality="standard")
+            pf.reset_mock()
+            app._prefetch_playlist_next(tracks, 2, app.MockProvider(), "standard", False)
+            pf.assert_not_called()
+            app._prefetch_playlist_next(tracks, 2, app.MockProvider(), "standard", True)
+            pf.assert_called_once_with("mock-1", mock.ANY, quality="standard")
+
+    def test_music_status_prefetches_next_playlist_track(self):
+        from unittest import mock
+        app.call_tool("music_play", {"favorites": True, "_session_id": "pf-status"}, "http://h")
+        with mock.patch.object(app.CACHE, "prefetch") as pf:
+            app.call_tool("music_status", {"_session_id": "pf-status"}, "http://h")
+        pf.assert_any_call("mock-5", mock.ANY, quality="standard")
+
+    def test_music_next_prefetches_following_track(self):
+        from unittest import mock
+        app.call_tool("music_play", {"library": True, "_session_id": "pf-next"}, "http://h")
+        with mock.patch.object(app.CACHE, "prefetch") as pf:
+            app.call_tool("music_next", {"_session_id": "pf-next"}, "http://h")
+        pf.assert_any_call("mock-3", mock.ANY, quality="standard")
+
+    def test_playlist_stream_prefetches_second_track(self):
+        from unittest import mock
+        tracks = [dict(x) for x in app.MockProvider.TRACKS[:2]]
+        token = app.PLAYLISTS.put(tracks, quality="standard", label="prefetch")
+        path = os.path.join(tempfile.mkdtemp(prefix="gw-prefetch-", dir=DATA), "a.mp3")
+        with open(path, "wb") as fh:
+            fh.write(b"ID3" + b"\x00" * 4096)
+        with mock.patch.object(app.CACHE, "ensure", return_value=path), \
+                mock.patch.object(app.CACHE, "prefetch") as pf:
+            url = app.make_playlist_url("", token, ttl=app.URL_TTL, quality="standard")
+            r, data = self.req("GET", url, raw=True)
+        self.assertEqual(r.status, 200)
+        pf.assert_any_call("mock-2", mock.ANY, quality="standard")
 
 
 if __name__ == "__main__":

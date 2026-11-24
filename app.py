@@ -2119,6 +2119,8 @@ def _tool_music_skip(args, p, base, quality, delta):
     track = tracks[target]
     info = PLAYBACK.prepare(dict(track), p, base, quality=quality, wait=False)
     CURRENT_PLAYLISTS.set(session_key, token, target, time.time())
+    _prefetch_playlist_next(tracks, target, p, quality or item.get("quality"),
+                            bool(item.get("loop")))
     _resume_save(session_key, "playlist", tracks=tracks, label=item.get("label") or "",
                  quality=quality or item.get("quality"), index=target, token=token,
                  loop=bool(item.get("loop")))
@@ -2240,6 +2242,8 @@ def _tool_music_status(args, p, base, limit, quality):
         tracks = item["tracks"]
         idx = max(0, min(int(cursor.get("index", 0)), len(tracks) - 1))
         track = tracks[idx]
+        _prefetch_playlist_next(tracks, idx, p, item.get("quality") or quality,
+                                bool(item.get("loop")))
         started = float(cursor.get("started_at") or time.time())
         elapsed = max(0, int(time.time() - started))
         try:
@@ -2469,6 +2473,33 @@ def _resume_audio_file(path, start):
     except OSError:
         pass
     return path
+
+
+def _prefetch_playlist_next(tracks, index, p, quality=None, loop=False):
+    """后台预取当前曲目的下一首，降低连续播放/手动切歌的等待。"""
+    if not tracks:
+        return
+    try:
+        current = max(0, int(index or 0))
+    except (TypeError, ValueError):
+        return
+    if current >= len(tracks):
+        return
+    nxt = current + 1
+    if nxt >= len(tracks):
+        if not loop:
+            return
+        nxt = 0
+    if nxt == current:
+        return
+    track = tracks[nxt]
+    if not isinstance(track, dict) or not track.get("guid"):
+        return
+    try:
+        if hasattr(CACHE, "prefetch"):
+            CACHE.prefetch(track["guid"], p, quality=quality or "standard")
+    except Exception:
+        LOG.debug("prefetch next playlist track failed", exc_info=True)
 
 
 # ---------------------------------------------------------------- HTTP
@@ -3422,6 +3453,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 for offset, track in enumerate(tracks[start_index:]):
+                    _prefetch_playlist_next(tracks, start_index + offset, p, quality, loop)
                     path_start = start_position if (first_cycle and offset == 0) else 0
                     if offset == 0:
                         path = first_path

@@ -194,7 +194,11 @@ LIBRARY_MAX_BYTES = _env_int("GW_LIBRARY_MAX_BYTES", 0)
 # 搜索：别名纠错 + 相关度打分（中文 ASR 常把歌名/歌手听成同音字）
 SMART_SEARCH = _env_bool("GW_SMART_SEARCH", True)
 MCP_SEARCH_BUDGET = max(1.0, float(_env("GW_MCP_SEARCH_BUDGET", "8")))
+# 播放时的搜索预算：本地命中就立即开播，在线只作为兜底补足，不能把本地歌拖到 40 秒。
+PLAY_SEARCH_BUDGET = max(1.0, float(_env("GW_PLAY_SEARCH_BUDGET", "3")))
 FNOS_SEARCH_TIMEOUT = max(1, _env_int("GW_FNOS_SEARCH_TIMEOUT", 5))
+# 整库连播上限：飞牛曲库可能上千首，按 200/页拉取；列表容量与之匹配，避免只播前 500 首。
+LIBRARY_PLAY_LIMIT = max(500, _env_int("GW_LIBRARY_PLAY_LIMIT", 2000))
 ALIASES_FILE = _env("GW_ALIASES_FILE", os.path.join(DATA_DIR, "music_aliases.json"))
 
 # ---------------------------------------------------------------- 高级设置
@@ -684,6 +688,7 @@ def search_tracks(p, query, limit=10):
 
 def fast_search_tracks(p, query, limit=10, budget=None):
     """MCP 快速搜索：本地/在线边搜边返回，最多等 budget 秒，先到先播。"""
+    t0 = time.monotonic()
     q = (query or "").strip()
     if not q:
         return [], ""
@@ -712,7 +717,11 @@ def fast_search_tracks(p, query, limit=10, budget=None):
             raw.extend(p.search(q, max(limit, 10)))
         except Exception as e:
             LOG.warning("fast search fallback %r failed: %s", q, e)
-    return rank_tracks(fixed, dedupe(raw), limit), fixed
+    rows = rank_tracks(fixed, dedupe(raw), limit)
+    LOG.info("fast search %r: %d 首，用时 %.0fms（预算 %.1fs）",
+             fixed, len(rows), (time.monotonic() - t0) * 1000.0,
+             max(1.0, float(budget or MCP_SEARCH_BUDGET)))
+    return rows, fixed
 
 
 # ---------------------------------------------------------------- 状态
@@ -878,7 +887,7 @@ def _current_playback_track(session_key):
 _ADV_BOOT = advanced_settings()
 CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
                    transcode_slots=_TRANSCODE_SLOTS)
-PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=500)
+PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=LIBRARY_PLAY_LIMIT)
 RESUMES = ResumeStore(RESUME_FILE)
 LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG,
                        max_bytes=_ADV_BOOT["library_max_mb"] * _MIB)
@@ -988,6 +997,10 @@ class FnProvider:
             token_file=FNOS_TOKEN_FILE, timeout=FNOS_TIMEOUT,
             insecure_tls=bool(s.get("insecure_tls")))
         self.client.ensure_token()
+        # 整库列表缓存：music_play library 重复触发时不再反复翻页。
+        self._tracks_cache = (0.0, [])
+        self._tracks_cache_ttl = 60.0
+        self._tracks_lock = threading.Lock()
 
     def search(self, q, limit=10):
         rows = dedupe(norm_track(t) for t in _rows(self.client.search_track(
@@ -1007,7 +1020,29 @@ class FnProvider:
         return row
 
     def list_tracks(self, limit=20):
-        return dedupe(norm_track(t) for t in _rows(self.client.track_list(1, limit)))
+        """按页拉取曲库；整库可能有上千首，单页最多 200，短暂缓存避免重复翻页。"""
+        limit = max(1, int(limit or 20))
+        now = time.time()
+        with self._tracks_lock:
+            ts, cached = self._tracks_cache
+            if cached and now - ts < self._tracks_cache_ttl and len(cached) >= limit:
+                return [dict(t) for t in cached[:limit]]
+        rows = []
+        page = 1
+        page_size = min(200, limit)
+        while len(rows) < limit:
+            size = min(page_size, limit - len(rows))
+            batch = _rows(self.client.track_list(page, size))
+            if not batch:
+                break
+            rows.extend(norm_track(t) for t in batch)
+            if len(batch) < size:
+                break
+            page += 1
+        rows = dedupe(rows)[:limit]
+        with self._tracks_lock:
+            self._tracks_cache = (now, [dict(t) for t in rows])
+        return rows
 
     def playlists(self):
         return [norm_playlist(p) for p in _rows(self.client.playlist_list(1, 200))]
@@ -1504,7 +1539,7 @@ def shuffle_tracks(tracks):
     return out
 
 
-def pick_tracks(p, query="", playlist="", limit=10):
+def pick_tracks(p, query="", playlist="", limit=10, budget=None):
     if playlist:
         pl = resolve_playlist(p, playlist)
         if not pl:
@@ -1512,7 +1547,8 @@ def pick_tracks(p, query="", playlist="", limit=10):
         return p.playlist_tracks(pl["guid"], 200)[:limit], "歌单「%s」" % pl["name"]
     if query:
         if SMART_SEARCH:
-            rows, fixed = search_tracks(p, query, limit)
+            # 播放走快速搜索：本地/在线边搜边回，最多等 budget 秒；本地有歌就先播本地。
+            rows, fixed = fast_search_tracks(p, query, limit, budget=budget)
         else:
             rows, fixed = p.search(query, limit), ""
         if not rows:
@@ -1932,7 +1968,7 @@ def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
                        library=False, loop=False):
     """把歌单/收藏/歌手/专辑解析成连续播放流，MCP 与 REST 共用。"""
     if library:
-        rows = p.list_tracks(500)
+        rows = p.list_tracks(LIBRARY_PLAY_LIMIT)
         label = "音乐库"
     elif artist:
         item = resolve_artist(p, artist)
@@ -2054,7 +2090,7 @@ def _tool_music_play(args, p, base, limit, quality):
     pre_rows = None
     pre_label = ""
     if not guid and not playlist and not artist and not album and not favorites and query_text:
-        pre_rows, pre_label = pick_tracks(p, query_text, "", 20)
+        pre_rows, pre_label = pick_tracks(p, query_text, "", 20, budget=PLAY_SEARCH_BUDGET)
         names = {_norm_text(t.get("artist")) for t in pre_rows if t.get("artist")}
         if len(pre_rows) >= 2 and len(names) == 1 and _norm_text(query_text) in names:
             artist = query_text
@@ -2106,7 +2142,7 @@ def _tool_music_play(args, p, base, limit, quality):
         if pre_rows is not None:
             rows, label = pre_rows, pre_label
         else:
-            rows, label = pick_tracks(p, query_text, playlist, 20)
+            rows, label = pick_tracks(p, query_text, playlist, 20, budget=PLAY_SEARCH_BUDGET)
         idx = _to_int(args.get("index"), 1)
         if idx < 1 or idx > len(rows):
             raise BadRequest("序号 %d 超出范围（共 %d 首）" % (idx, len(rows)))
@@ -3396,7 +3432,7 @@ class Handler(BaseHTTPRequestHandler):
                 CURRENT_PLAYLISTS.set(session_key, info["playlist_token"], start, time.time())
             return self._json(with_web_url(info))
         CURRENT_PLAYLISTS.clear(session_key)
-        rows, label = pick_tracks(p, query, playlist, 20)
+        rows, label = pick_tracks(p, query, playlist, 20, budget=PLAY_SEARCH_BUDGET)
         if index < 1 or index > len(rows):
             return self._json({"error": "index out of range", "count": len(rows)}, 400)
         info = PLAYBACK.prepare(rows[index - 1], p, self._base(), quality=quality, wait=False)
@@ -3463,6 +3499,7 @@ class Handler(BaseHTTPRequestHandler):
         item = PLAYLISTS.get(token)
         if not item or not item.get("tracks"):
             return self._json({"error": "playlist expired"}, 404)
+        t_playlist_start = time.monotonic()
         quality = quality or item.get("quality") or "standard"
         p = provider()
         tracks = item["tracks"]
@@ -3518,6 +3555,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+        LOG.info("playlist %s first track ready in %.0fms (index=%d, stream=%s)",
+                 token, (time.monotonic() - t_playlist_start) * 1000.0,
+                 start_index, first_stream is not None)
         if self.command == "HEAD":
             return
         loop = bool(item.get("loop"))
@@ -3643,6 +3683,7 @@ class Handler(BaseHTTPRequestHandler):
 
         返回 False 表示首块准备失败、尚未发送任何响应，调用方可回退完整缓存。
         """
+        t0 = time.monotonic()
         p = provider()
         if not callable(getattr(p, "iter_stream", None)):
             return False
@@ -3673,6 +3714,7 @@ class Handler(BaseHTTPRequestHandler):
                 return True
             self.wfile.write(first)
             self.wfile.flush()
+            LOG.info("stream first byte %s in %.0fms", guid, (time.monotonic() - t0) * 1000.0)
             for chunk in gen:
                 self.wfile.write(chunk)
                 self.wfile.flush()

@@ -1815,7 +1815,7 @@ class TestOptim213(unittest.TestCase):
         class P:
             def favorites(self, limit=200):
                 return [{"guid": "x%d" % i, "title": "t%d" % i, "artist": "a"}
-                        for i in range(501)]
+                        for i in range(app.LIBRARY_PLAY_LIMIT + 1)]
 
         with self.assertRaises(app.BadRequest) as cm:
             app.build_list_playback(P(), "http://h", favorites=True)
@@ -2033,12 +2033,73 @@ class TestOptim2135(unittest.TestCase):
         self.assertIn("准备播放", out)
 
 
+class TestPlaybackOptimizations(unittest.TestCase):
+    """播放优化：本地优先搜索、整库分页/容量、播放阶段日志基建。"""
+
+    def test_pick_tracks_prefers_local_results_without_waiting_online(self):
+        class SlowOnline:
+            def __init__(self):
+                self.calls = []
+
+            def search_stream(self, q, limit=10, deadline_s=None):
+                self.calls.append((q, deadline_s))
+                yield {"guid": "local-1", "title": "晴天", "artist": "本地", "source": "local"}
+                end = time.monotonic() + max(0.0, float(deadline_s or 0))
+                while time.monotonic() < end:
+                    time.sleep(0.01)
+
+            def search(self, q, limit=10):
+                raise AssertionError("播放应优先走 search_stream 快速路径")
+
+        p = SlowOnline()
+        t0 = time.monotonic()
+        rows, label = app.pick_tracks(p, "晴天", limit=20, budget=0.4)
+        elapsed = time.monotonic() - t0
+        self.assertEqual([r["guid"] for r in rows], ["local-1"])
+        self.assertLess(elapsed, 1.5)
+        self.assertIn("晴天", label)
+        self.assertEqual(p.calls[0][0], "晴天")
+
+    def test_fn_provider_list_tracks_pages_and_caches(self):
+        class FakeClient:
+            def __init__(self, total):
+                self.total = total
+                self.calls = []
+
+            def track_list(self, page, page_size):
+                self.calls.append((page, page_size))
+                start = (page - 1) * page_size
+                return {"list": [{"guid": "t%d" % i, "title": "t%d" % i, "artist": "a"}
+                                 for i in range(start, min(start + page_size, self.total))]}
+
+        p = object.__new__(app.FnProvider)
+        p.client = FakeClient(1342)
+        p._tracks_cache = (0.0, [])
+        p._tracks_cache_ttl = 60.0
+        p._tracks_lock = threading.Lock()
+        rows = p.list_tracks(1200)
+        self.assertEqual(len(rows), 1200)
+        self.assertEqual([c[1] for c in p.client.calls], [200] * 6)
+        calls = len(p.client.calls)
+        self.assertEqual(len(p.list_tracks(20)), 20)
+        self.assertEqual(len(p.client.calls), calls)
+
+    def test_library_playback_uses_more_than_500_tracks(self):
+        class P:
+            def list_tracks(self, limit=20):
+                return [{"guid": "lib-%d" % i, "title": "歌曲%d" % i, "artist": "a",
+                         "duration_s": 10} for i in range(limit)]
+
+        out = app._tool_music_play({"library": True}, P(), "http://h", 10, "standard")
+        self.assertIn("共 %d 首" % app.LIBRARY_PLAY_LIMIT, out)
+
+
 class TestRelease201(unittest.TestCase):
     """2.0.1：流式落盘、弱引用锁、单版本常量、搜索总上限/总超时。"""
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.11")
+        self.assertEqual(app.VERSION, "2.13.12")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

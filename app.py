@@ -53,7 +53,8 @@ from gwlib import __version__ as VERSION
 from gwlib.errors import BadRequest, GatewayError, as_payload
 from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, get_profile, normalize_quality
 from gwlib.storage import LibraryStore, MediaCache, TranscodeSlots, audio_seconds
-from gwlib.sources import FallbackProvider, is_ext_guid
+from gwlib.sources import (FallbackProvider, filter_search_source, is_ext_guid,
+                           normalize_search_source)
 from gwlib.native_source import (NativeMusicDLProvider,
                                   deps_available as online_deps_available,
                                   deps_error as online_deps_error)
@@ -691,7 +692,35 @@ def rank_tracks(query, rows, limit=10):
     return [t for _, t in scored][:limit]
 
 
-def search_tracks(p, query, limit=10):
+def provider_search(p, query, limit=10, source="all"):
+    """按范围搜索：all/local/online；旧 provider 不支持 source 时按结果来源过滤。"""
+    source = normalize_search_source(source)
+    if source == "all":
+        return p.search(query, limit)
+    try:
+        return p.search(query, limit, source=source)
+    except TypeError:
+        return filter_search_source(p.search(query, limit), source)
+
+
+def provider_search_stream(p, query, limit=10, deadline_s=None, source="all"):
+    """流式版本；旧 provider 没有 search_stream 或不支持 source 时退化为一次性搜索。"""
+    source = normalize_search_source(source)
+    stream = getattr(p, "search_stream", None)
+    if not callable(stream):
+        return iter(provider_search(p, query, limit, source))
+    if source == "all":
+        try:
+            return stream(query, limit, deadline_s=deadline_s)
+        except TypeError:
+            return stream(query, limit)
+    try:
+        return stream(query, limit, deadline_s=deadline_s, source=source)
+    except TypeError:
+        return iter(provider_search(p, query, limit, source))
+
+
+def search_tracks(p, query, limit=10, source="all"):
     """搜索 + 别名纠正 + 打分排序；别名生效时同时用原词兜底（防别名表写错）。"""
     q = (query or "").strip()
     if not q:
@@ -699,18 +728,18 @@ def search_tracks(p, query, limit=10):
     fixed, changed = apply_aliases(q)
     raw = []
     try:
-        raw.extend(p.search(fixed, max(limit * 3, 20)))
+        raw.extend(provider_search(p, fixed, max(limit * 3, 20), source))
     except Exception as e:
         LOG.warning("search %r failed: %s", fixed, e)
     if changed:
         try:
-            raw.extend(p.search(q, max(limit, 10)))
+            raw.extend(provider_search(p, q, max(limit, 10), source))
         except Exception as e:
             LOG.warning("search %r failed: %s", q, e)
     return rank_tracks(fixed, dedupe(raw), limit), fixed
 
 
-def fast_search_tracks(p, query, limit=10, budget=None):
+def fast_search_tracks(p, query, limit=10, budget=None, source="all"):
     """MCP 快速搜索：本地/在线边搜边返回，最多等 budget 秒，先到先播。"""
     t0 = time.monotonic()
     q = (query or "").strip()
@@ -719,26 +748,20 @@ def fast_search_tracks(p, query, limit=10, budget=None):
     fixed, changed = apply_aliases(q)
     deadline = time.monotonic() + max(1.0, float(budget or MCP_SEARCH_BUDGET))
     raw = []
-    stream = getattr(p, "search_stream", None)
     try:
-        if callable(stream):
-            try:
-                iterator = stream(fixed, max(1, limit),
-                                  deadline_s=max(0.2, deadline - time.monotonic()))
-            except TypeError:
-                iterator = stream(fixed, max(1, limit))
-            for track in iterator:
-                raw.append(track)
-                if len(raw) >= limit or time.monotonic() >= deadline:
-                    break
-        else:
-            raw.extend(p.search(fixed, max(limit * 3, 20)))
+        iterator = provider_search_stream(
+            p, fixed, max(1, limit),
+            deadline_s=max(0.2, deadline - time.monotonic()), source=source)
+        for track in iterator:
+            raw.append(track)
+            if len(raw) >= limit or time.monotonic() >= deadline:
+                break
     except Exception as e:
         LOG.warning("fast search %r failed: %s", fixed, e)
     # 别名生效但结果太少时，用原词补一次，避免别名表写错导致搜不到。
     if changed and len(raw) < limit and time.monotonic() < deadline:
         try:
-            raw.extend(p.search(q, max(limit, 10)))
+            raw.extend(provider_search(p, q, max(limit, 10), source))
         except Exception as e:
             LOG.warning("fast search fallback %r failed: %s", q, e)
     rows = rank_tracks(fixed, dedupe(raw), limit)
@@ -1062,7 +1085,8 @@ class MockProvider:
         q = (q or "").lower()
         return [t for t in self.TRACKS if q in t["title"].lower() or q in t["artist"].lower()][:limit]
 
-    def search(self, q, limit=10):
+    def search(self, q, limit=10, source="all"):
+        # 自测 provider 不区分本地/在线，两个入口都给结果，方便验证 WebUI。
         return self._match(q, limit)
 
     def track_info(self, guid):
@@ -1153,7 +1177,9 @@ class FnProvider:
         self._tracks_cache_ttl = 60.0
         self._tracks_lock = threading.Lock()
 
-    def search(self, q, limit=10):
+    def search(self, q, limit=10, source="all"):
+        if normalize_search_source(source) == "online":
+            return []
         rows = dedupe(norm_track(t) for t in _rows(self.client.search_track(
             q, 1, limit, timeout=min(FNOS_SEARCH_TIMEOUT, FNOS_TIMEOUT))))
         for row in rows:
@@ -2814,6 +2840,7 @@ class Handler(BaseHTTPRequestHandler):
         if not q:
             raise BadRequest("参数 q 不能为空")
         limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
+        source = normalize_search_source((qs.get("source") or [""])[0])
         p = provider()
         fixed, changed = apply_aliases(q)
         self._sse_start()
@@ -2840,10 +2867,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._sse_send({"type": "track", "track": track})
 
         def _iter(term, want):
-            stream = getattr(p, "search_stream", None)
-            if callable(stream):
-                return stream(term, want)
-            return p.search(term, want)
+            return provider_search_stream(p, term, want, source=source)
 
         try:
             broken = False
@@ -2867,7 +2891,12 @@ class Handler(BaseHTTPRequestHandler):
             local_count = sum(int(m.get("local_count") or 0) for m in metas)
             online_count = sum(int(m.get("online_count") or 0) for m in metas)
             if not metas:
-                online_count = max(0, count - local_count)
+                if source == "local":
+                    local_count, online_count = count, 0
+                elif source == "online":
+                    local_count, online_count = 0, count
+                else:
+                    online_count = max(0, count - local_count)
             local_error = "；".join(str(m.get("local_error")) for m in metas if m.get("local_error"))
             online_error = "；".join(str(m.get("online_error")) for m in metas if m.get("online_error"))
             self._sse_send({"type": "done", "query": q, "count": count,
@@ -3338,11 +3367,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not q:
                     raise BadRequest("参数 q 不能为空")
                 limit = clamp_limit(self._qs_int(qs, "limit", 10), 10)
+                source = normalize_search_source((qs.get("source") or [""])[0])
                 p = provider()
                 if SMART_SEARCH:
-                    rows, fixed = search_tracks(p, q, limit)
+                    rows, fixed = search_tracks(p, q, limit, source)
                 else:
-                    rows, fixed = p.search(q, limit), ""
+                    rows, fixed = provider_search(p, q, limit, source), ""
                 out = {"query": q, "count": len(rows), "tracks": rows}
                 meta_fn = getattr(p, "last_search_meta", None)
                 if callable(meta_fn):
@@ -3352,6 +3382,11 @@ class Handler(BaseHTTPRequestHandler):
                         meta = {}
                     if isinstance(meta, dict):
                         out.update(meta)
+                if "local_count" not in out:
+                    if source == "local":
+                        out["local_count"], out["online_count"] = len(rows), 0
+                    elif source == "online":
+                        out["local_count"], out["online_count"] = 0, len(rows)
                 if fixed and fixed != _norm_text(q):
                     out["corrected"] = fixed
                 return self._json(out)

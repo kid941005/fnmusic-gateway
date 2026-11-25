@@ -328,8 +328,10 @@ class NativeMusicDLProvider:
         return tracks
 
     # ---- provider contract ----
-    def search(self, q, limit=10):
+    def search(self, q, limit=10, source="all"):
         q = str(q or "").strip()
+        if str(source or "").strip().lower() == "local":
+            return []
         if not q or not self.platforms:
             return []
         per = max(1, min(10, int(limit or 10)))
@@ -362,9 +364,11 @@ class NativeMusicDLProvider:
                     return rows[:cap]
         return rows[:cap]
 
-    def search_stream(self, q, limit=10, deadline_s=None):
+    def search_stream(self, q, limit=10, deadline_s=None, source="all"):
         """多平台并行搜索，哪个平台先探活成功就先产出哪首，不等全部完成。"""
         q = str(q or "").strip()
+        if str(source or "").strip().lower() == "local":
+            return
         if not q or not self.platforms:
             return
         per = max(1, min(10, int(limit or 10)))

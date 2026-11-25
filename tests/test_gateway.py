@@ -512,6 +512,18 @@ class TestHome(Base):
         self.assertIn(b"fmtSize", body)
         self.assertIn("下载音质".encode("utf-8"), body)
 
+    def test_home_search_has_source_switch(self):
+        from gwlib import home_page
+        text = home_page.HOME_HTML
+        self.assertIn('id="srcSeg"', text)
+        for value in ("all", "local", "online"):
+            self.assertIn('data-src="%s"' % value, text)
+        self.assertIn("&source=", text)
+        self.assertIn("function setSource", text)
+        self.assertIn("function searchStat", text)
+        self.assertIn("本地曲库没有搜到结果", text)
+        self.assertIn("在线音源没有搜到结果", text)
+
     def test_settings_page_has_online_card(self):
         cookie = self._cookie()
         r, body = self.req("GET", "/settings", headers={"Cookie": cookie}, raw=True)
@@ -1272,6 +1284,30 @@ class TestFallback(unittest.TestCase):
         self.assertEqual(fp.track_info("l1")["title"], "晴天")
         self.assertEqual(fp.track_info("ext:musicdl:e1")["title"], "七里香")
 
+    def test_search_source_local_and_online(self):
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        ext = _FakeExt([{"guid": "ext:musicdl:e1", "title": "晴天", "artist": "陈奕迅",
+                         "source": "musicdl"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [ext]
+        only_local = fp.search("晴天", 5, source="local")
+        self.assertEqual([r["guid"] for r in only_local], ["l1"])
+        self.assertEqual(fp.last_search_meta()["online_count"], 0)
+        only_online = fp.search("晴天", 5, source="online")
+        self.assertEqual([r["guid"] for r in only_online], ["ext:musicdl:e1"])
+        self.assertEqual(fp.last_search_meta()["local_count"], 0)
+
+    def test_search_stream_source_online_skips_local(self):
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        ext = _FakeExt([{"guid": "ext:musicdl:e1", "title": "晴天", "artist": "陈奕迅",
+                         "source": "musicdl"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [ext]
+        rows = list(fp.search_stream("晴天", 5, source="online"))
+        self.assertEqual([r["guid"] for r in rows], ["ext:musicdl:e1"])
+        rows = list(fp.search_stream("晴天", 5, source="local"))
+        self.assertEqual([r["guid"] for r in rows], ["l1"])
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg")
     def test_audio_seconds(self):
         _ct, wav = app.MockProvider().stream("x")
@@ -1309,6 +1345,48 @@ class TestFallback(unittest.TestCase):
                 fp.download_ext({"guid": "ext:musicdl:e", "title": "t", "artist": "a"})
         finally:
             app.DOWNLOAD_DIR = old
+
+
+class TestSearchSourceHttp(Base):
+    """/api/search?source=local|online 只返回对应来源。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._old_token = app.ADMIN_TOKEN
+        app.ADMIN_TOKEN = "tok-src"
+
+    @classmethod
+    def tearDownClass(cls):
+        app.ADMIN_TOKEN = cls._old_token
+        super().tearDownClass()
+
+    def _cookie(self):
+        r, _ = self.req("GET", "/?token=" + app.ADMIN_TOKEN, raw=True)
+        self.assertEqual(r.status, 302)
+        return (r.getheader("Set-Cookie") or "").split(";")[0]
+
+    def test_api_search_source_filters(self):
+        local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
+        ext = _FakeExt([{"guid": "ext:musicdl:e1", "title": "晴天", "artist": "陈奕迅",
+                         "source": "musicdl"}])
+        fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
+        fp.exts = [ext]
+        old = app._PROVIDER
+        app._PROVIDER = fp
+        try:
+            cookie = self._cookie()
+            headers = {"Cookie": cookie}
+            r, body = self.req("GET", "/api/search?q=%E6%99%B4%E5%A4%A9&limit=10&source=local",
+                               headers=headers)
+            self.assertEqual(r.status, 200)
+            self.assertEqual([t["guid"] for t in body["tracks"]], ["l1"])
+            r, body = self.req("GET", "/api/search?q=%E6%99%B4%E5%A4%A9&limit=10&source=online",
+                               headers=headers)
+            self.assertEqual(r.status, 200)
+            self.assertEqual([t["guid"] for t in body["tracks"]], ["ext:musicdl:e1"])
+        finally:
+            app._PROVIDER = old
 
 
 class TestFnClientBase(unittest.TestCase):
@@ -2476,7 +2554,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.15")
+        self.assertEqual(app.VERSION, "2.13.16")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

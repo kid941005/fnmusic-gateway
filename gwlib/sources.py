@@ -90,6 +90,26 @@ def _norm_text(s):
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(s or "").casefold())
 
 
+def normalize_search_source(value):
+    """搜索范围：all=本地+在线，local=只搜飞牛本地库，online=只搜在线音源。"""
+    text = str(value or "").strip().lower()
+    return text if text in ("local", "online") else "all"
+
+
+def filter_search_source(rows, source):
+    """给不支持 source 参数的旧 provider 做结果过滤。"""
+    source = normalize_search_source(source)
+    if source == "all":
+        return list(rows or [])
+    out = []
+    for track in rows or []:
+        src = str(track.get("source") or "").strip().lower()
+        is_local = src in ("local", "download")
+        if (source == "local") == is_local:
+            out.append(track)
+    return out
+
+
 def is_ext_guid(guid):
     return str(guid or "").startswith(EXT_PREFIX)
 
@@ -416,18 +436,23 @@ class FallbackProvider:
                 pass
         return out
 
-    def search(self, q, limit=10):
+    def search(self, q, limit=10, source="all"):
         # 总结果上限：所有源加起来最多 total_limit 条
         cap = min(max(1, int(limit or 1)), self.total_limit)
+        source = normalize_search_source(source)
         meta = {"local_count": 0, "online_count": 0,
                 "local_error": "", "online_error": ""}
         self._search_meta.value = meta
         rows = []
-        if self.base is not None:
+        if source == "local":
+            rows = self.local_search(q, cap) if self.base is not None else []
+            meta["local_count"] = len(rows)
+            return rows[:cap]
+        if source != "online" and self.base is not None:
             rows = self.local_search(q, cap)
         meta["local_count"] = len(rows)
         # 本地有任何可播放结果就不再访问在线源：本地起播远快于在线。
-        if rows and any(self._is_local_playable(t) for t in rows):
+        if source != "online" and rows and any(self._is_local_playable(t) for t in rows):
             return rows[:cap]
         if len(rows) >= cap or not self.exts:
             return rows
@@ -480,9 +505,10 @@ class FallbackProvider:
         meta["online_count"] = max(0, len(rows) - meta["local_count"])
         return rows[:cap]
 
-    def search_stream(self, q, limit=10, deadline_s=None):
+    def search_stream(self, q, limit=10, deadline_s=None, source="all"):
         """本地优先，在线音源边搜边出；每拿到一首就 yield，不等全部完成。"""
         cap = min(max(1, int(limit or 1)), self.total_limit)
+        source = normalize_search_source(source)
         meta = {"local_count": 0, "online_count": 0,
                 "local_error": "", "online_error": ""}
         self._search_meta.value = meta
@@ -498,7 +524,7 @@ class FallbackProvider:
             return True
 
         local_playable = False
-        if self.base is not None:
+        if source != "online" and self.base is not None:
             try:
                 local = self.local_search(q, cap)
             except Exception as exc:
@@ -512,6 +538,9 @@ class FallbackProvider:
                     yield track
             meta["local_count"] = len(rows)
 
+        if source == "local":
+            meta["online_count"] = 0
+            return
         # 本地已有可播放结果时直接结束，不等待在线源。
         if local_playable or len(rows) >= cap or not self.exts:
             meta["online_count"] = 0

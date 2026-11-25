@@ -22,6 +22,9 @@ a{color:#8db4ff;text-decoration:none}.btn{border:1px solid var(--line);backgroun
 .card h2{font-size:16px;margin:0 0 12px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 input{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radius:9px;padding:10px 12px;font:inherit;min-width:0}
 #q{flex:1;min-width:220px}
+.seg{display:flex;gap:4px;background:var(--input,#0e1526);border:1px solid var(--line);border-radius:9px;padding:3px}
+.seg button{border:0;background:transparent;color:var(--mut);border-radius:6px;padding:6px 10px;font:inherit;font-size:13px;cursor:pointer}
+.seg button.on{background:var(--acc);color:#fff}
 .pill{display:inline-block;padding:3px 9px;border-radius:999px;background:#1b2540;color:var(--mut);font-size:12px;margin-left:6px}
 .pill.ok{background:rgba(55,201,138,.15);color:var(--ok)}.pill.bad{background:rgba(255,107,107,.15);color:var(--bad)}
 .track{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
@@ -66,6 +69,11 @@ __THEME_SCRIPT__
   <h2>搜索歌曲</h2>
   <div class="row">
     <input id="q" placeholder="输入歌名 / 歌手，例如 周杰伦 晴天" autocomplete="off">
+    <div class="seg" id="srcSeg" role="group" aria-label="搜索范围">
+      <button type="button" class="on" data-src="all">全部</button>
+      <button type="button" data-src="local">本地</button>
+      <button type="button" data-src="online">在线</button>
+    </div>
     <button class="btn primary" id="go">搜索</button>
     <span id="dlq" class="pill">下载音质：-</span>
   </div>
@@ -94,10 +102,28 @@ async function loadStatus(){
 }
 var lastRows=[]
 var searchES=null
+var searchSource='all'
 function stopSearch(){if(searchES){searchES.close();searchES=null}}
-function render(rows,emptyText){
+function setSource(s){
+  searchSource=(s==='local'||s==='online')?s:'all'
+  document.querySelectorAll('#srcSeg [data-src]').forEach(function(b){
+    b.classList.toggle('on',b.getAttribute('data-src')===searchSource)
+  })
+}
+function sourceQuery(){return '&source='+encodeURIComponent(searchSource)}
+function searchStat(local,online){
+  if(searchSource==='local')return '（本地 '+local+' 条）'
+  if(searchSource==='online')return '（在线 '+online+' 条）'
+  return '（本地 '+local+' · 在线 '+online+'）'
+}
+function emptyText(){
+  if(searchSource==='local')return '本地曲库没有搜到结果，请换个关键词。'
+  if(searchSource==='online')return '在线音源没有搜到结果，请换个关键词或到设置页检查在线音源。'
+  return '没有搜到结果，请换个关键词或到设置页检查在线音源。'
+}
+function render(rows,fallback){
   var box=el('results')
-  if(!rows.length){box.innerHTML='<div class="empty">'+esc(emptyText||'没有搜到结果，请换个关键词或到设置页检查在线音源。')+'</div>';return}
+  if(!rows.length){box.innerHTML='<div class="empty">'+esc(fallback||emptyText())+'</div>';return}
   box.innerHTML=rows.map(function(t,i){
     var src=t.source==='local'?'本地':(t.platform||t.source||'在线')
     var meta=[src,t.artist,t.album].filter(Boolean).join(' · ')+(t.duration_s?(' · '+dur(t.duration_s)):'')
@@ -110,10 +136,10 @@ function render(rows,emptyText){
 }
 async function legacySearch(q){
   try{
-    var d=await getJSON('/api/search?q='+encodeURIComponent(q)+'&limit=20')
+    var d=await getJSON('/api/search?q='+encodeURIComponent(q)+'&limit=20'+sourceQuery())
     lastRows=d.tracks||[];render(lastRows)
     var stat=''
-    if(typeof d.local_count==='number')stat='（本地 '+d.local_count+' · 在线 '+(d.online_count||0)+'）'
+    if(typeof d.local_count==='number')stat=searchStat(d.local_count,d.online_count||0)
     if(d.local_error)stat+='，本地搜索失败：'+d.local_error
     say('共 '+d.count+' 条'+stat+(d.corrected?'（已按别名纠正为「'+d.corrected+'」）':''))
   }catch(e){say('搜索失败：'+e.message)}finally{el('go').disabled=false}
@@ -124,21 +150,21 @@ async function search(){
   el('go').disabled=true;say('搜索中…结果会陆续出现，出现即可播放')
   if(!window.EventSource){return legacySearch(q)}
   var got=false,finished=false
-  var es=new EventSource('/api/search/stream?q='+encodeURIComponent(q)+'&limit=20')
+  var es=new EventSource('/api/search/stream?q='+encodeURIComponent(q)+'&limit=20'+sourceQuery())
   searchES=es
   es.onmessage=function(ev){
     var d=null;try{d=JSON.parse(ev.data)}catch(e){return}
     if(d.type==='track'&&d.track){
-      got=true;lastRows.push(d.track);render(lastRows,'没有搜到结果')
+      got=true;lastRows.push(d.track);render(lastRows)
       say('搜索中…已出现 '+lastRows.length+' 条，可直接播放')
     }else if(d.type==='done'){
       finished=true;es.close();if(searchES===es)searchES=null;el('go').disabled=false
       var stat=''
-      if(typeof d.local_count==='number')stat='（本地 '+d.local_count+' · 在线 '+(d.online_count||0)+'）'
+      if(typeof d.local_count==='number')stat=searchStat(d.local_count,d.online_count||0)
       if(d.local_error)stat+=',本地搜索失败：'+d.local_error
       if(d.online_error)stat+=',在线搜索异常：'+d.online_error
       say('共 '+d.count+' 条'+stat)
-      if(!lastRows.length)render([], '没有搜到结果，请换个关键词或到设置页检查在线音源。')
+      if(!lastRows.length)render([])
     }else if(d.type==='error'){
       finished=true;es.close();if(searchES===es)searchES=null;el('go').disabled=false
       say('搜索失败：'+(d.error||'未知错误'))
@@ -189,7 +215,12 @@ async function download(t){
     say('已保存：'+d.path+'（音质 '+(d.quality_label||d.quality||q)+'，'+fmtSize(d.bytes)+'）')}catch(e){say('下载失败：'+e.message)}
 }
 el('go').onclick=search;el('q').addEventListener('keydown',function(e){if(e.key==='Enter')search()})
-var initialQ=new URLSearchParams(location.search).get('q');if(initialQ){el('q').value=initialQ;search()}
+document.querySelectorAll('#srcSeg [data-src]').forEach(function(b){
+  b.onclick=function(){var s=b.getAttribute('data-src');if(s===searchSource)return;setSource(s);if(el('q').value.trim())search()}
+})
+var params=new URLSearchParams(location.search)
+var initialSrc=params.get('source');if(initialSrc)setSource(initialSrc)
+var initialQ=params.get('q');if(initialQ){el('q').value=initialQ;search()}
 loadStatus();loadQuality()
 </script>
 </body>

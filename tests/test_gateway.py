@@ -516,6 +516,17 @@ class TestHome(Base):
         self.assertIn(("v" + app.VERSION).encode("utf-8"), body)
         self.assertIn("/api/settings/online".encode("utf-8"), body)
 
+    def test_settings_page_quality_default_is_dropdown(self):
+        from gwlib import settings_page
+        text = settings_page.SETTINGS_HTML
+        self.assertIn("var QUALITY_OPTIONS=", text)
+        self.assertIn("k==='quality_default'", text)
+        self.assertIn("<select data-adv=", text)
+        for value in ("standard", "high", "exhigh", "lossless"):
+            self.assertIn('"value": "%s"' % value, text)
+        self.assertIn("标准（128k MP3）", text)
+        self.assertIn("无损（下载保原文件，播放 320k MP3）", text)
+
     def test_healthz_reports_online(self):
         r, body = self.req("GET", "/healthz")
         self.assertEqual(r.status, 200)
@@ -1080,10 +1091,11 @@ class TestFallback(unittest.TestCase):
         fp = app.FallbackProvider(local, ["musicdl@http://x:1"])
         fp.exts = [StreamExt()]
         rows = list(fp.search_stream("晴天", 5))
-        self.assertEqual([r["guid"] for r in rows], ["l1", "ext:musicdl:e4"])
+        # 本地已有可播放结果就短路，不再访问在线源。
+        self.assertEqual([r["guid"] for r in rows], ["l1"])
         meta = fp.last_search_meta()
         self.assertEqual(meta["local_count"], 1)
-        self.assertEqual(meta["online_count"], 1)
+        self.assertEqual(meta["online_count"], 0)
 
     def test_search_meta_counts_local_and_online(self):
         local = _FakeLocal([{"guid": "l1", "title": "晴天", "artist": "周杰伦"}])
@@ -1093,9 +1105,10 @@ class TestFallback(unittest.TestCase):
         fp.exts = [ext]
         rows = fp.search("晴天", 5)
         meta = fp.last_search_meta()
-        self.assertEqual(len(rows), 2)
+        # 本地命中即短路：在线结果不再补入。
+        self.assertEqual(len(rows), 1)
         self.assertEqual(meta["local_count"], 1)
-        self.assertEqual(meta["online_count"], 1)
+        self.assertEqual(meta["online_count"], 0)
         self.assertEqual(meta["local_error"], "")
 
     def test_search_meta_reports_local_error(self):
@@ -2094,12 +2107,151 @@ class TestPlaybackOptimizations(unittest.TestCase):
         self.assertIn("共 %d 首" % app.LIBRARY_PLAY_LIMIT, out)
 
 
+class TestLibraryStoreDownloadOnly(unittest.TestCase):
+    """仅飞牛库模式：LibraryStore 只负责落盘，不再维护本地搜索索引。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="gw-lib-", dir=DATA)
+        self.store = gw_storage.LibraryStore(lambda: self.dir, app.LOG, max_bytes=0)
+
+    def test_save_writes_file_without_local_index(self):
+        track = {"guid": "ext:musicdl:abc", "title": "晴天", "artist": "周杰伦"}
+        fp, size = self.store.save_bytes(track, "audio/wav", b"RIFF" + b"\x00" * 64)
+        self.assertTrue(os.path.isfile(fp))
+        self.assertGreater(size, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".library-index.json")))
+        self.assertFalse(hasattr(self.store, "search"))
+        self.assertFalse(hasattr(self.store, "list_all"))
+        self.assertFalse(hasattr(self.store, "iter_stream"))
+
+
+
+class TestLibraryScanAfterDownload(unittest.TestCase):
+    """可选：下载完成后触发飞牛扫描（命令 / HTTP 回调），留空时完全关闭。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="gw-lib-scan-", dir=DATA)
+
+    def test_scan_disabled_by_default(self):
+        store = gw_storage.LibraryStore(lambda: self.dir, app.LOG)
+        self.assertFalse(store.scan_configured())
+        fp, _ = store.save_bytes({"guid": "ext:x:1", "title": "t", "artist": "a"},
+                                 "audio/mpeg", b"ID3" + b"\x00" * 16)
+        self.assertTrue(os.path.isfile(fp))
+        self.assertIsNone(store._scan_job)
+
+    def test_download_triggers_scan_command_in_background(self):
+        from unittest import mock
+        done = threading.Event()
+
+        def fake_run(*args, **kwargs):
+            done.set()
+
+        store = gw_storage.LibraryStore(lambda: self.dir, app.LOG,
+                                        scan_cmd_getter=lambda: "echo scan")
+        with mock.patch.object(gw_storage.subprocess, "run", side_effect=fake_run) as run:
+            store.save_bytes({"guid": "ext:x:2", "title": "t", "artist": "a"},
+                             "audio/mpeg", b"ID3" + b"\x00" * 16)
+            job = store._scan_job
+            self.assertIsNotNone(job)
+            job.join(3.0)
+        self.assertTrue(done.is_set())
+        run.assert_called_once()
+
+    def test_scan_url_posts_when_configured(self):
+        from unittest import mock
+        store = gw_storage.LibraryStore(lambda: self.dir, app.LOG,
+                                        scan_url_getter=lambda: "http://fnos.local/scan")
+        with mock.patch.object(gw_storage.urllib.request, "urlopen") as urlopen:
+            self.assertTrue(store.run_scan())
+        urlopen.assert_called_once()
+        req = urlopen.call_args[0][0]
+        self.assertEqual(req.get_method(), "POST")
+
+
+class TestBuiltInLibraryScan(unittest.TestCase):
+    """下载后默认调用已配置的飞牛音乐接口扫库，不需要额外扫描地址。"""
+
+    def test_client_scans_first_shared_library_guid(self):
+        client = fnmusic_client.FnMusicClient(base="http://fnos.local:5666")
+        client.get = lambda path, **kwargs: {"list": [{"guid": "lib-1"}, {"guid": "lib-2"}]}
+        calls = []
+        client.post = lambda path, body=None, **kwargs: calls.append((path, body))
+        self.assertTrue(client.scan_library())
+        self.assertEqual(calls, [("/shared-library/scan", {"guid": "lib-1"})])
+
+    def test_client_falls_back_to_scan_all_without_guid(self):
+        client = fnmusic_client.FnMusicClient(base="http://fnos.local:5666")
+        client.get = lambda path, **kwargs: {"list": []}
+        calls = []
+        client.post = lambda path, body=None, **kwargs: calls.append((path, body))
+        self.assertTrue(client.scan_library())
+        self.assertEqual(calls, [("/shared-library/scan-all", None)])
+
+    def test_library_store_runs_provider_callback_first(self):
+        called = []
+        store = gw_storage.LibraryStore(
+            lambda: self.dir, app.LOG,
+            scan_callback_getter=lambda: lambda: called.append(1) or True)
+        self.assertTrue(store.scan_configured())
+        self.assertTrue(store.run_scan())
+        self.assertEqual(called, [1])
+
+    def test_app_callback_uses_configured_provider(self):
+        from unittest import mock
+        called = []
+
+        class FakeProvider:
+            def scan_library(self):
+                called.append(1)
+                return True
+
+        with mock.patch.object(app, "provider", return_value=FakeProvider()):
+            self.assertTrue(app._scan_library_via_provider())
+        self.assertEqual(called, [1])
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="gw-builtin-scan-", dir=DATA)
+
+
+class TestAutoDownload(unittest.TestCase):
+    """同一首在线歌曲第二次开播后，后台自动下载并写入飞牛曲库目录。"""
+
+    def test_second_play_triggers_background_download(self):
+        from unittest import mock
+        import gwlib.playcount as gw_playcount
+        stats = gw_playcount.PlayStats(os.path.join(tempfile.mkdtemp(dir=DATA), "p.json"))
+        stats.dedupe_seconds = 0.0
+        saved = []
+        done = threading.Event()
+
+        class FakeLibrary:
+            def enabled(self):
+                return True
+
+            def save_from_provider(self, provider, track, quality=None):
+                saved.append(dict(track))
+                done.set()
+                return "/tmp/x.mp3", 1
+
+        track = {"guid": "ext:musicdl:abc", "title": "晴天", "artist": "周杰伦"}
+        with mock.patch.object(app, "PLAY_STATS", stats), \
+                mock.patch.object(app, "LIBRARY", FakeLibrary()):
+            app._AUTO_DOWNLOADING.clear()
+            app._note_online_play(track["guid"], track, "standard", object())
+            self.assertFalse(saved)
+            app._note_online_play(track["guid"], track, "standard", object())
+            self.assertTrue(done.wait(3.0))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["title"], "晴天")
+
+
 class TestRelease201(unittest.TestCase):
     """2.0.1：流式落盘、弱引用锁、单版本常量、搜索总上限/总超时。"""
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.12")
+        self.assertEqual(app.VERSION, "2.13.13")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

@@ -294,6 +294,36 @@ class FnMusicClient:
     def search_playlist(self, keyword, page=1, page_size=20):
         return self.get("/search/playlist", {"q": keyword, "page": page, "pageSize": page_size})
 
+    # ---------- 曲库扫描 ----------
+    def shared_library_list(self):
+        """当前账号可访问的飞牛音乐文件夹列表（用于拿 scan 所需的 guid）。"""
+        data = self.get("/shared-library/list")
+        rows = data.get("list") if isinstance(data, dict) else data
+        return rows if isinstance(rows, list) else []
+
+    def scan_library(self, guid=None):
+        """触发飞牛官方扫库；优先扫指定文件夹，拿不到 guid 时退化为全量扫描。
+
+        扫库接口必须带 App 登录态（Cookie + authx），这里复用客户端现有鉴权。
+        返回 True 表示请求已被飞牛接受（异步扫描任务由飞牛执行）。
+        """
+        if not guid:
+            try:
+                for row in self.shared_library_list():
+                    if not isinstance(row, dict):
+                        continue
+                    value = str(row.get("guid") or "").strip()
+                    if value:
+                        guid = value
+                        break
+            except FnMusicError:
+                guid = None
+        if guid:
+            self.post("/shared-library/scan", body={"guid": guid})
+        else:
+            self.post("/shared-library/scan-all", body=None)
+        return True
+
     # ---------- 收藏 ----------
     def favorite_list(self, page=1, page_size=50):
         return self.get("/favorite-track/list", {"page": page, "pageSize": page_size})

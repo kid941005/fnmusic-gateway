@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 import weakref
 
@@ -17,6 +18,7 @@ from .errors import BadRequest, StorageError
 from .quality import get_profile
 
 LOG = logging.getLogger("fnmusic-gw.storage")
+
 
 # 预取调度：固定 worker 数，失败短 TTL 内不再重试；预取转码只占用剩余槽。
 PREFETCH_WORKERS = 2
@@ -543,12 +545,27 @@ class MediaCache:
 class LibraryStore:
     """把在线音源原始文件落到本地下载目录。保存原始文件而不是转码 MP3。"""
 
-    def __init__(self, directory_getter, logger=None, max_bytes=0):
+    AUDIO_EXTS = (".mp3", ".flac", ".wav", ".m4a", ".ogg", ".ape")
+
+    def __init__(self, directory_getter, logger=None, max_bytes=0,
+                 scan_cmd_getter=None, scan_url_getter=None,
+                 scan_callback_getter=None,
+                 scan_debounce=5.0, scan_timeout=60.0):
         self._dir_getter = directory_getter or (lambda: "")
         self.max_bytes = max(0, int(max_bytes or 0))
         self.log = logger or LOG
         self._jobs = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        # 下载完成后的飞牛扫描是可选功能：默认走已配置的飞牛音乐接口，
+        # 也保留命令/HTTP 回调作为其他部署方式的高级覆盖。
+        self._scan_cmd_getter = scan_cmd_getter or (lambda: "")
+        self._scan_url_getter = scan_url_getter or (lambda: "")
+        self._scan_callback_getter = scan_callback_getter or (lambda: None)
+        self.scan_debounce = max(0.0, float(scan_debounce or 0))
+        self.scan_timeout = max(1.0, float(scan_timeout or 60))
+        self._scan_job = None
+        self._scan_last = 0.0
+        self._scan_lock = threading.Lock()
 
     def enabled(self):
         return bool(str(self._dir_getter() or "").strip())
@@ -597,6 +614,7 @@ class LibraryStore:
             except OSError:
                 pass
             raise
+        self.trigger_scan()
         return fp, len(raw)
 
     def save_from_provider(self, provider, track, quality=None):
@@ -623,6 +641,7 @@ class LibraryStore:
                     os.remove(tmp)
                 except OSError:
                     pass
+        self.trigger_scan()
         return fp, size
 
     def save_async(self, provider, track, quality=None):
@@ -649,6 +668,70 @@ class LibraryStore:
             with self._lock:
                 self._jobs.pop(track.get("guid"), None)
 
+    def scan_configured(self):
+        try:
+            callback = self._scan_callback_getter()
+        except Exception:
+            callback = None
+        return bool(callable(callback)
+                    or str(self._scan_cmd_getter() or "").strip()
+                    or str(self._scan_url_getter() or "").strip())
+
+    def trigger_scan(self):
+        """下载完成后异步触发飞牛扫描，失败只记日志；同一时间只跑一个。"""
+        if not self.scan_configured():
+            return False
+        with self._scan_lock:
+            now = time.monotonic()
+            if self._scan_job is not None and self._scan_job.is_alive():
+                return False
+            if self.scan_debounce and now - self._scan_last < self.scan_debounce:
+                return False
+            self._scan_last = now
+            job = threading.Thread(target=self._run_scan, name="library-scan", daemon=True)
+            self._scan_job = job
+            job.start()
+            return True
+
+    def _run_scan(self):
+        try:
+            self.run_scan()
+        finally:
+            with self._scan_lock:
+                self._scan_job = None
+
+    def run_scan(self):
+        try:
+            callback = self._scan_callback_getter()
+        except Exception:
+            callback = None
+        if callable(callback):
+            try:
+                if callback():
+                    self.log.info("library scan via configured music service ok")
+                    return True
+            except Exception as exc:
+                self.log.warning("library scan via configured music service failed: %s", exc)
+        cmd = str(self._scan_cmd_getter() or "").strip()
+        url = str(self._scan_url_getter() or "").strip()
+        if not cmd and not url:
+            return False
+        self.log.info("library scan triggered (cmd=%s, url=%s)", bool(cmd), bool(url))
+        if cmd:
+            try:
+                subprocess.run(cmd, shell=True, check=False, timeout=self.scan_timeout,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as exc:
+                self.log.warning("library scan command failed: %s", exc)
+        if url:
+            try:
+                req = urllib.request.Request(url, data=b"", method="POST")
+                with urllib.request.urlopen(req, timeout=min(self.scan_timeout, 15)) as resp:
+                    resp.read(1024)
+            except Exception as exc:
+                self.log.warning("library scan url failed: %s", exc)
+        return True
+
     def stats(self):
         directory = str(self._dir_getter() or "").strip()
         files = 0
@@ -656,7 +739,7 @@ class LibraryStore:
         if directory and os.path.isdir(directory):
             try:
                 for name in os.listdir(directory):
-                    if os.path.splitext(name)[1].lower() not in (".mp3", ".flac", ".wav", ".m4a", ".ogg", ".ape"):
+                    if os.path.splitext(name)[1].lower() not in self.AUDIO_EXTS:
                         continue
                     fp = os.path.join(directory, name)
                     if os.path.isfile(fp):
@@ -665,4 +748,4 @@ class LibraryStore:
             except Exception:
                 pass
         return {"dir": directory, "enabled": bool(directory), "files": files, "bytes": total,
-                "limit_bytes": self.max_bytes}
+                "limit_bytes": self.max_bytes, "scan_configured": self.scan_configured()}

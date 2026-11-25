@@ -29,7 +29,7 @@ def _stream_ext(ext, q, per, deadline_s=None):
     """兼容老外部音源 search_stream(q, limit) 与新签名 deadline_s。"""
     fn = getattr(ext, "search_stream", None)
     if not callable(fn):
-        return [ext.search(q, per)]
+        return list(ext.search(q, per) or [])
     if deadline_s is None:
         return fn(q, per)
     try:
@@ -289,7 +289,9 @@ class FallbackProvider:
 
     def __init__(self, base, urls=None, timeout=8, search_limit=10,
                  download_dir_getter=None, parallel=True,
-                 max_bytes=0, total_limit=50, total_timeout=15, exts=None):
+                 max_bytes=0, total_limit=50, total_timeout=15, exts=None,
+                 scan_cmd_getter=None, scan_url_getter=None,
+                 scan_callback_getter=None):
         self.base = base
         if exts is not None:
             self.exts = list(exts)
@@ -310,6 +312,9 @@ class FallbackProvider:
             download_dir_getter or (lambda: os.environ.get("GW_DOWNLOAD_DIR", "")),
             LOG,
             max_bytes=max_bytes,
+            scan_cmd_getter=scan_cmd_getter,
+            scan_url_getter=scan_url_getter,
+            scan_callback_getter=scan_callback_getter,
         )
 
     def _local(self):
@@ -372,6 +377,45 @@ class FallbackProvider:
     def remove_favorite(self, guid):
         return self._local().remove_favorite(guid)
 
+    @staticmethod
+    def _is_local_playable(track):
+        if not track:
+            return False
+        if track.get("playable") is False:
+            return False
+        src = str(track.get("source") or "").strip().lower()
+        return src in ("local", "download")
+
+    def local_search(self, q, limit=10):
+        """检索飞牛音乐本地曲库；结果统一标记为可播放的 local。"""
+        try:
+            cap = max(1, int(limit or 1))
+        except (TypeError, ValueError):
+            cap = 10
+        if self.base is None:
+            return []
+        out = []
+        seen = set()
+        try:
+            for track in (self.base.search(q, cap) or []):
+                item = dict(track)
+                item.setdefault("source", "local")
+                item["playable"] = True
+                key = (_norm_text(item.get("title")), _norm_text(item.get("artist")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+                if len(out) >= cap:
+                    break
+        except Exception as exc:
+            LOG.warning("local search failed: %s", exc)
+            try:
+                self._search_meta.value["local_error"] = str(exc)
+            except Exception:
+                pass
+        return out
+
     def search(self, q, limit=10):
         # 总结果上限：所有源加起来最多 total_limit 条
         cap = min(max(1, int(limit or 1)), self.total_limit)
@@ -380,13 +424,11 @@ class FallbackProvider:
         self._search_meta.value = meta
         rows = []
         if self.base is not None:
-            try:
-                rows = list(self.base.search(q, cap) or [])[:cap]
-            except Exception as exc:
-                LOG.warning("local search failed: %s", exc)
-                meta["local_error"] = str(exc)
-                rows = []
+            rows = self.local_search(q, cap)
         meta["local_count"] = len(rows)
+        # 本地有任何可播放结果就不再访问在线源：本地起播远快于在线。
+        if rows and any(self._is_local_playable(t) for t in rows):
+            return rows[:cap]
         if len(rows) >= cap or not self.exts:
             return rows
         have = set((_norm_text(t.get("title")), _norm_text(t.get("artist"))) for t in rows)
@@ -455,19 +497,23 @@ class FallbackProvider:
             rows.append(track)
             return True
 
+        local_playable = False
         if self.base is not None:
             try:
-                local = list(self.base.search(q, cap) or [])[:cap]
+                local = self.local_search(q, cap)
             except Exception as exc:
                 LOG.warning("local search failed: %s", exc)
                 meta["local_error"] = str(exc)
                 local = []
             for track in local:
+                if self._is_local_playable(track):
+                    local_playable = True
                 if add(track):
                     yield track
             meta["local_count"] = len(rows)
 
-        if len(rows) >= cap or not self.exts:
+        # 本地已有可播放结果时直接结束，不等待在线源。
+        if local_playable or len(rows) >= cap or not self.exts:
             meta["online_count"] = 0
             return
         budget = min(self.total_timeout, float(deadline_s)) if deadline_s else self.total_timeout
@@ -528,6 +574,16 @@ class FallbackProvider:
             return fn(guid, quality=quality)
         ctype, raw = _call_stream(target, guid, quality)
         return ctype, iter((raw,))
+
+    def scan_library(self):
+        """触发飞牛官方扫库；未配置飞牛音乐时返回 False。"""
+        if self.base is None:
+            return False
+        fn = getattr(self.base, "scan_library", None)
+        if not callable(fn):
+            return False
+        fn()
+        return True
 
     def stream_to_path(self, guid, path, quality=None):
         if is_ext_guid(guid):

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """网关设置页：飞牛音乐、内置在线音源、高级设置。"""
 
+import json
+
 from . import __version__ as VERSION
+from .quality import describe as describe_quality
 
 SETTINGS_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -20,7 +23,7 @@ a{color:#8db4ff;text-decoration:none}.btn{border:1px solid var(--line);backgroun
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
 .card h2{font-size:16px;margin:0 0 4px}.hint{color:var(--mut);font-size:12.5px;margin:0 0 14px}
 .field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}.field label{font-size:12.5px;color:var(--mut)}
-input[type=text],input[type=password],input[type=number]{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radius:9px;padding:10px 12px;font:inherit;width:100%}
+input[type=text],input[type=password],input[type=number],select{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radius:9px;padding:10px 12px;font:inherit;width:100%}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.row3{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 .check{display:flex;align-items:center;gap:8px;color:#e8eefc}.check input{width:16px;height:16px}
 .plat{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
@@ -89,6 +92,7 @@ input[type=text],input[type=password],input[type=number]{background:#0e1526;bord
 </div>
 <script>
 var PLATFORMS=['NeteaseMusicClient','KuwoMusicClient','KugouMusicClient','MiguMusicClient','QQMusicClient','QianqianMusicClient','BilibiliMusicClient','SodaMusicClient']
+var QUALITY_OPTIONS=__QUALITY_OPTIONS__
 var LABELS={quality_default:'默认音质',max_limit:'搜索返回上限',preview_min_seconds:'试听判定阈值（秒）',url_ttl:'直链有效期（秒）',cache_max_mb:'播放缓存上限（MB）',library_max_mb:'本地曲库上限（MB）',transcode_concurrency:'同时转码数',smart_search:'智能搜索（别名纠错）',tee_save:'边播边存',lyrics_enabled:'启用歌词',lrclib_url:'LRCLIB 地址',lyrics_retry:'歌词重试间隔（秒）',fnos_timeout:'飞牛请求超时（秒）',mcp_timeout:'MCP 上游超时（秒）'}
 function el(id){return document.getElementById(id)}
 function out(id,t){el(id).textContent=t||''}
@@ -178,7 +182,8 @@ async function loadAdvanced(){
   try{var d=await api('/api/settings/advanced');var html=''
     Object.keys(d).forEach(function(k){
       var v=d[k];var label=LABELS[k]||k;var ctl=''
-      if(typeof v==='boolean')ctl='<label class="check"><input type="checkbox" data-adv="'+k+'" data-kind="bool"'+(v?' checked':'')+'> 启用</label>'
+      if(k==='quality_default')ctl='<select data-adv="'+k+'" data-kind="str">'+QUALITY_OPTIONS.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===String(v)?' selected':'')+'>'+esc(o.label)+'</option>'}).join('')+'</select>'
+      else if(typeof v==='boolean')ctl='<label class="check"><input type="checkbox" data-adv="'+k+'" data-kind="bool"'+(v?' checked':'')+'> 启用</label>'
       else if(typeof v==='number')ctl='<input type="number" data-adv="'+k+'" data-kind="number" value="'+v+'">'
       else ctl='<input type="text" data-adv="'+k+'" data-kind="str" value="'+esc(v)+'">'
       html+='<div class="field"><label>'+esc(label)+'</label>'+ctl+'</div>'
@@ -204,4 +209,16 @@ loadFnos();loadOnline();loadAdvanced()
 </html>
 """
 
+_QUALITY_CHOICES = [
+    {
+        "value": p["name"],
+        "label": (
+            "无损（下载保原文件，播放 %s MP3）" % p["bitrate"]
+            if p.get("download_original")
+            else "%s（%s MP3）" % (p["label"], p["bitrate"])
+        ),
+    }
+    for p in describe_quality()
+]
+SETTINGS_HTML = SETTINGS_HTML.replace("__QUALITY_OPTIONS__", json.dumps(_QUALITY_CHOICES, ensure_ascii=False))
 SETTINGS_HTML = SETTINGS_HTML.replace("__VERSION__", VERSION)

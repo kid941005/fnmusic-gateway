@@ -60,6 +60,7 @@ from gwlib.native_source import (NativeMusicDLProvider,
 from gwlib.playback import PlaybackService
 from gwlib.playlist import PlaylistRegistry, iter_clean_mp3, iter_clean_mp3_stream
 from gwlib.resume import ResumeStore
+from gwlib.playcount import PlayStats
 from gwlib.mcp_tools import build_tools
 from gwlib.mcp_server import McpHttpBridge, McpService
 from gwlib.config import ConfigStore
@@ -179,6 +180,9 @@ ONLINE_TIMEOUT = max(3, _env_int("GW_ONLINE_TIMEOUT", 25))
 ONLINE_TOTAL_LIMIT = max(1, _env_int("GW_ONLINE_TOTAL_LIMIT", MAX_LIMIT))
 ONLINE_TOTAL_TIMEOUT = max(1, _env_int("GW_ONLINE_TOTAL_TIMEOUT", 40))
 DOWNLOAD_DIR = _env("GW_DOWNLOAD_DIR", "")
+# 下载完成后可选触发飞牛扫描：命令与 HTTP 回调可二选一或同时配置；留空即关闭。
+LIBRARY_SCAN_CMD = _env("GW_LIBRARY_SCAN_CMD", "")
+LIBRARY_SCAN_URL = _env("GW_LIBRARY_SCAN_URL", "")
 # 飞牛音乐（可选，优先级最高的音源）。地址/账号/密码优先读 data/config.json（网页「网关设置」写入），
 # 环境变量只作为首次启动的默认值。
 FNOS_TOKEN_FILE = os.path.join(DATA_DIR, "fnmusic_token.json")
@@ -724,6 +728,105 @@ def fast_search_tracks(p, query, limit=10, budget=None):
     return rows, fixed
 
 
+def resolve_play_tracks(p, query, limit=10, budget=None):
+    """点播解析：飞牛本地库有任何结果就直接播本地；本地为空时只等在线首个结果。
+
+    与 music_search 的快速搜索不同，这里不需要凑满 limit：在线源只要返回第一首
+    就能立即开播，避免为了补齐列表把本地点播拖到几十秒。
+    """
+    t0 = time.monotonic()
+    q = (query or "").strip()
+    if not q:
+        return [], ""
+    fixed, changed = apply_aliases(q)
+    local_fn = getattr(p, "local_search", None)
+    if not callable(local_fn):
+        # Mock/旧 provider 没有飞牛本地检索：沿用多结果快速搜索，保持既有行为。
+        return fast_search_tracks(p, q, limit, budget=budget)
+    try:
+        local_rows = list(local_fn(fixed, max(1, limit)) or [])
+    except Exception as exc:
+        LOG.warning("local play search %r failed: %s", fixed, exc)
+        local_rows = []
+    if local_rows:
+        rows = rank_tracks(fixed, dedupe(local_rows), limit)
+        LOG.info("play search %r: 飞牛本地命中 %d 首，用时 %.0fms",
+                 fixed, len(rows), (time.monotonic() - t0) * 1000.0)
+        return rows, fixed
+
+    deadline = time.monotonic() + max(1.0, float(budget or PLAY_SEARCH_BUDGET))
+    raw = []
+    stream = getattr(p, "search_stream", None)
+    try:
+        if callable(stream):
+            try:
+                iterator = stream(fixed, max(1, limit),
+                                  deadline_s=max(0.2, deadline - time.monotonic()))
+            except TypeError:
+                iterator = stream(fixed, max(1, limit))
+            for track in iterator:
+                if track:
+                    raw.append(track)
+                    break
+        else:
+            raw.extend((p.search(fixed, max(1, limit)) or [])[:1])
+    except Exception as exc:
+        LOG.warning("play search %r failed: %s", fixed, exc)
+        raw = []
+    if not raw and changed:
+        try:
+            raw.extend((p.search(q, max(1, limit)) or [])[:1])
+        except Exception as exc:
+            LOG.warning("play search fallback %r failed: %s", q, exc)
+    rows = rank_tracks(fixed, dedupe(raw), limit)
+    LOG.info("play search %r: 在线首个结果 %d 条，用时 %.0fms",
+             fixed, len(rows), (time.monotonic() - t0) * 1000.0)
+    return rows, fixed
+
+def _note_online_play(guid, track=None, quality=None, p=None):
+    """在线曲目真正开播时计数；同一首第 2 次开播则后台自动补进本地曲库。"""
+    try:
+        guid = str(guid or "").strip()
+        if not guid or not is_ext_guid(guid):
+            return
+        track = dict(track or {})
+        if not track.get("title") or not track.get("artist"):
+            info_fn = getattr(p or provider(), "track_info", None)
+            if callable(info_fn):
+                try:
+                    found = info_fn(guid) or {}
+                    for key in ("title", "artist", "album", "duration"):
+                        if found.get(key) and not track.get(key):
+                            track[key] = found[key]
+                except Exception:
+                    pass
+        track.setdefault("guid", guid)
+        count = PLAY_STATS.note(guid, track.get("title") or guid, track.get("artist") or "")
+        if count < 2 or not LIBRARY.enabled() or not PLAY_STATS.should_download(guid):
+            return
+        with _AUTO_DOWNLOAD_LOCK:
+            if guid in _AUTO_DOWNLOADING:
+                return
+            _AUTO_DOWNLOADING.add(guid)
+
+        def worker():
+            try:
+                prov = p or provider()
+                LIBRARY.save_from_provider(prov, track, quality=quality)
+                PLAY_STATS.mark_downloaded(guid)
+                LOG.info("auto saved online track to library: %s %s", guid, track.get("title") or "")
+            except Exception as exc:
+                PLAY_STATS.mark_failed(guid)
+                LOG.warning("auto save %s failed: %s", guid, exc)
+            finally:
+                with _AUTO_DOWNLOAD_LOCK:
+                    _AUTO_DOWNLOADING.discard(guid)
+
+        threading.Thread(target=worker, name="gw-autosave", daemon=True).start()
+    except Exception as exc:
+        LOG.debug("note online play failed: %s", exc)
+
+
 # ---------------------------------------------------------------- 状态
 _state_lock = threading.Lock()
 # 最近一次通过 music_play 启动的连续流 token；music_next/previous/status 以它为游标。
@@ -883,6 +986,26 @@ def _current_playback_track(session_key):
     return None
 
 
+def _scan_library_via_provider():
+    """下载完成后用已配置的飞牛音乐账号触发官方扫库。
+
+    不要求用户额外填写 GW_LIBRARY_SCAN_*：地址/账号/令牌都复用「设置 → 飞牛音乐」。
+    """
+    try:
+        p = provider()
+    except Exception as exc:
+        LOG.info("library scan skipped: %s", exc)
+        return False
+    fn = getattr(p, "scan_library", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception as exc:
+        LOG.warning("library scan via fnOS failed: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------- 转码缓存
 _ADV_BOOT = advanced_settings()
 CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
@@ -890,7 +1013,14 @@ CACHE = MediaCache(CACHE_DIR, _ADV_BOOT["cache_max_mb"] * _MIB, LOG,
 PLAYLISTS = PlaylistRegistry(ttl=URL_TTL, max_items=LIBRARY_PLAY_LIMIT)
 RESUMES = ResumeStore(RESUME_FILE)
 LIBRARY = LibraryStore(lambda: DOWNLOAD_DIR, LOG,
-                       max_bytes=_ADV_BOOT["library_max_mb"] * _MIB)
+                       max_bytes=_ADV_BOOT["library_max_mb"] * _MIB,
+                       scan_cmd_getter=lambda: LIBRARY_SCAN_CMD,
+                       scan_url_getter=lambda: LIBRARY_SCAN_URL,
+                       scan_callback_getter=lambda: (_scan_library_via_provider
+                                                    if fnos_configured() else None))
+PLAY_STATS = PlayStats(os.path.join(DATA_DIR, "play_stats.json"), threshold=2, logger=LOG)
+_AUTO_DOWNLOAD_LOCK = threading.Lock()
+_AUTO_DOWNLOADING = set()
 
 
 # ---------------------------------------------------------------- provider
@@ -1107,6 +1237,11 @@ class FnProvider:
 
     def iter_stream(self, guid, quality=None):
         return self.client.iter_stream(guid)
+
+    def scan_library(self):
+        """用已登录的飞牛音乐账号触发官方扫库，不需要额外配置扫描地址。"""
+        self.client.scan_library()
+        return True
 
     def add_favorite(self, guid):
         self.client.favorite_add(guid)
@@ -1393,7 +1528,11 @@ def provider():
                             download_dir_getter=lambda: DOWNLOAD_DIR,
                             max_bytes=LIBRARY_MAX_BYTES,
                             total_limit=settings["total_limit"],
-                            total_timeout=settings["total_timeout"])
+                            total_timeout=settings["total_timeout"],
+                            scan_cmd_getter=lambda: LIBRARY_SCAN_CMD,
+                            scan_url_getter=lambda: LIBRARY_SCAN_URL,
+                            scan_callback_getter=lambda: (_scan_library_via_provider
+                                                         if fnos_configured() else None))
                     elif base is not None:
                         _PROVIDER = base
                     else:
@@ -1547,8 +1686,8 @@ def pick_tracks(p, query="", playlist="", limit=10, budget=None):
         return p.playlist_tracks(pl["guid"], 200)[:limit], "歌单「%s」" % pl["name"]
     if query:
         if SMART_SEARCH:
-            # 播放走快速搜索：本地/在线边搜边回，最多等 budget 秒；本地有歌就先播本地。
-            rows, fixed = fast_search_tracks(p, query, limit, budget=budget)
+            # 点播严格本地优先；本地为空时在线只取首个结果就开播。
+            rows, fixed = resolve_play_tracks(p, query, limit, budget=budget)
         else:
             rows, fixed = p.search(query, limit), ""
         if not rows:
@@ -1968,7 +2107,7 @@ def build_list_playback(p, base, quality=None, playlist="", artist="", album="",
                        library=False, loop=False):
     """把歌单/收藏/歌手/专辑解析成连续播放流，MCP 与 REST 共用。"""
     if library:
-        rows = p.list_tracks(LIBRARY_PLAY_LIMIT)
+        rows = dedupe(p.list_tracks(LIBRARY_PLAY_LIMIT) or [])[:LIBRARY_PLAY_LIMIT]
         label = "音乐库"
     elif artist:
         item = resolve_artist(p, artist)
@@ -3566,6 +3705,7 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 for offset, track in enumerate(tracks[start_index:]):
                     _prefetch_playlist_next(tracks, start_index + offset, p, quality, loop)
+                    _note_online_play(track.get("guid"), track, quality, p)
                     path_start = start_position if (first_cycle and offset == 0) else 0
                     if offset == 0 and first_stream is not None:
                         CURRENT_PLAYLISTS.set(session_key, token, start_index + offset,
@@ -3640,6 +3780,7 @@ class Handler(BaseHTTPRequestHandler):
         if not verify(guid, exp, sig, quality, start=start):
             LOG.warning("bad signature for %s", guid)
             return self._json({"error": "invalid or expired signature"}, 403)
+        _note_online_play(guid, None, quality)
         cached = CACHE.path(guid, quality)
         try:
             cached_ok = os.path.exists(cached) and os.path.getsize(cached) > 1024

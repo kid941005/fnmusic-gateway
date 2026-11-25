@@ -1,5 +1,5 @@
 # ============================================================================
-# fnmusic-gateway 2.13.12 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
+# fnmusic-gateway 2.13.13 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
 #
 # 只发布 1 个宿主机端口 8766：
 #   浏览器 → http://NAS_IP:8766/          原生首页与设置页
@@ -28,6 +28,9 @@ services:
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"   # 管理接口/MCP/WebUI 的令牌
       GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-}"   # 返回给设备的直链前缀，必须是设备可访问的宿主机地址
       GW_DOWNLOAD_DIR: "/music"          # 下载/边播边存的容器内目录，必须与下面的挂载右侧一致
+      # 下载完成后默认调用「设置 → 飞牛音乐」自动扫库；以下仅自定义兜底，留空即可
+      GW_LIBRARY_SCAN_CMD: "${GW_LIBRARY_SCAN_CMD:-}"
+      GW_LIBRARY_SCAN_URL: "${GW_LIBRARY_SCAN_URL:-}"
 
       # 在线音源（musicdl）首次启动默认值；启动后可在网页「设置 → 在线音源」修改
       GW_ONLINE_ENABLED: "${GW_ONLINE_ENABLED:-true}"

@@ -192,6 +192,8 @@ PREVIEW_MIN_SECONDS = max(1, _env_int("GW_PREVIEW_MIN_SECONDS", 35))
 
 # 音质与存储策略
 QUALITY_DEFAULT = normalize_quality(_env("GW_QUALITY_DEFAULT", DEFAULT_QUALITY))
+# 下载音质与在线试听音质分开：试听默认 standard 保证起播快，下载默认 lossless 保留原始文件。
+DOWNLOAD_QUALITY = normalize_quality(_env("GW_DOWNLOAD_QUALITY", "lossless"))
 TEE_SAVE = _env_bool("GW_TEE_SAVE", True)
 LIBRARY_MAX_BYTES = _env_int("GW_LIBRARY_MAX_BYTES", 0)
 
@@ -211,9 +213,14 @@ _MIB = 1024 * 1024
 # 注意：端口、路径、GW_ADMIN_TOKEN 等启动参数不在此列，仍需在 .env 里设置。
 ADVANCED_SPEC = {
     "quality_default": {
-        "label": "默认音质", "kind": "enum",
+        "label": "在线试听音质", "kind": "enum",
         "values": ["standard", "high", "exhigh", "lossless"],
         "default": QUALITY_DEFAULT, "help": "standard/high/exhigh/lossless",
+    },
+    "download_quality": {
+        "label": "下载音质", "kind": "enum",
+        "values": ["standard", "high", "exhigh", "lossless"],
+        "default": DOWNLOAD_QUALITY, "help": "下载/自动补齐/边播边存使用；lossless 保留原始文件",
     },
     "max_limit": {"label": "搜索返回上限", "kind": "int", "default": MAX_LIMIT,
                   "min": 1, "max": 500, "unit": "首"},
@@ -300,7 +307,7 @@ def advanced_settings():
 def apply_advanced_settings():
     """把高级设置同步到模块全局与已创建的服务对象，做到保存即生效。"""
     global URL_TTL, MAX_LIMIT, TRANSCODE_CONCURRENCY, LYRICS_ENABLED, LRCLIB_URL
-    global LYRICS_RETRY, FNOS_TIMEOUT, PREVIEW_MIN_SECONDS, QUALITY_DEFAULT
+    global LYRICS_RETRY, FNOS_TIMEOUT, PREVIEW_MIN_SECONDS, QUALITY_DEFAULT, DOWNLOAD_QUALITY
     global TEE_SAVE, SMART_SEARCH
     vals = advanced_settings()
     URL_TTL = vals["url_ttl"]
@@ -312,6 +319,7 @@ def apply_advanced_settings():
     FNOS_TIMEOUT = vals["fnos_timeout"]
     PREVIEW_MIN_SECONDS = vals["preview_min_seconds"]
     QUALITY_DEFAULT = vals["quality_default"]
+    DOWNLOAD_QUALITY = vals["download_quality"]
     TEE_SAVE = vals["tee_save"]
     SMART_SEARCH = vals["smart_search"]
     cache = globals().get("CACHE")
@@ -324,6 +332,7 @@ def apply_advanced_settings():
     playback = globals().get("PLAYBACK")
     if playback is not None:
         playback.default_quality = QUALITY_DEFAULT
+        playback.download_quality = DOWNLOAD_QUALITY
         playback.ttl = URL_TTL
         playback.preview_min_seconds = PREVIEW_MIN_SECONDS
         playback.tee_save = TEE_SAVE
@@ -563,6 +572,17 @@ def resolve_download_track(p, guid, title="", artist=""):
             out.setdefault("source", "ext")
             return out
     return {"guid": guid, "title": title or guid, "artist": artist, "source": "ext"}
+
+
+def download_quality_info(quality=None):
+    """下载音质：规范名称 + 展示标签（无损说明保留原始文件）。"""
+    name = normalize_quality(quality or DOWNLOAD_QUALITY)
+    profile = get_profile(name)
+    if profile.get("download_original"):
+        label = "无损（保留原始文件）"
+    else:
+        label = "%s（%s MP3）" % (profile.get("label") or name, profile.get("bitrate") or "")
+    return name, label
 
 
 # ---------------------------------------------------------------- 搜索排序
@@ -812,7 +832,8 @@ def _note_online_play(guid, track=None, quality=None, p=None):
         def worker():
             try:
                 prov = p or provider()
-                LIBRARY.save_from_provider(prov, track, quality=quality)
+                # 自动补齐固定使用下载音质，不受在线试听音质影响。
+                LIBRARY.save_from_provider(prov, track, quality=DOWNLOAD_QUALITY)
                 PLAY_STATS.mark_downloaded(guid)
                 LOG.info("auto saved online track to library: %s %s", guid, track.get("title") or "")
             except Exception as exc:
@@ -2010,6 +2031,7 @@ def _lrc_line_at(track, elapsed_s):
 
 PLAYBACK = PlaybackService(CACHE, LIBRARY, make_url, lyric_url_for, audio_seconds,
                            save_state, default_quality=_ADV_BOOT["quality_default"],
+                           download_quality=_ADV_BOOT["download_quality"],
                            ttl=_ADV_BOOT["url_ttl"],
                            preview_min_seconds=_ADV_BOOT["preview_min_seconds"],
                            tee_save=_ADV_BOOT["tee_save"])
@@ -2405,9 +2427,10 @@ def _tool_music_favorite(args, p, base, limit, quality):
         raise BadRequest("需要 query、guid 或 current=true 之一")
     if action == "add":
         if is_ext_guid(t["guid"]) and hasattr(p, "download_ext"):
-            fp, n = p.download_ext(t, quality or "lossless")
-            return "已收藏并下载到本地曲库：%s（%s，%.1f MB）" % (
-                t.get("title") or t["guid"], fp, n / 1048576.0)
+            qname, qlabel = download_quality_info(quality)
+            fp, n = p.download_ext(t, qname)
+            return "已收藏并下载到本地曲库：%s（%s，音质 %s，%.1f MB）" % (
+                t.get("title") or t["guid"], fp, qlabel, n / 1048576.0)
         p.add_favorite(t["guid"])
         return "已收藏：%s" % (t.get("title") or t["guid"])
     p.remove_favorite(t["guid"])
@@ -2429,8 +2452,10 @@ def _tool_music_download(args, p, base, limit, quality):
         track = rows[0]
     else:
         raise BadRequest("guid 或 query 至少给一个")
-    fp, n = LIBRARY.save_from_provider(p, track, quality or DEFAULT_QUALITY)
-    return "已保存到本地曲库：%s（%s，%.1f MB）" % (track.get("title") or track["guid"], fp, n / 1048576.0)
+    qname, qlabel = download_quality_info(quality)
+    fp, n = LIBRARY.save_from_provider(p, track, qname)
+    return "已保存到本地曲库：%s（%s，音质 %s，%.1f MB）" % (
+        track.get("title") or track["guid"], fp, qlabel, n / 1048576.0)
 
 
 def _tool_music_sources(args, p, base, limit, quality):
@@ -3279,6 +3304,7 @@ class Handler(BaseHTTPRequestHandler):
                                               "deps": online_deps_available(),
                                               "error": online_deps_error()},
                                    "quality_default": QUALITY_DEFAULT,
+                                   "download_quality": DOWNLOAD_QUALITY,
                                    "quality_profiles": describe_quality(),
                                    "mcp_server": {"available": MCP_SERVICE.available,
                                                   "engine": "mcp>=2.3",
@@ -3348,7 +3374,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/storage":
                 return self._json({"cache": CACHE.stats(), "library": LIBRARY.stats()})
             if path == "/api/quality":
-                return self._json({"default": QUALITY_DEFAULT, "profiles": describe_quality()})
+                return self._json({"default": QUALITY_DEFAULT,
+                                   "download": DOWNLOAD_QUALITY,
+                                   "profiles": describe_quality()})
             if path == "/mcp":
                 return self._json({"error": "use POST /mcp (streamable-http)"}, 405,
                                   [("Allow", "POST, OPTIONS")])
@@ -3406,7 +3434,7 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "add":
                     if is_ext_guid(guid) and hasattr(p, "download_ext"):
                         track = resolve_download_track(p, guid)
-                        fp, n = p.download_ext(track, DEFAULT_QUALITY)
+                        fp, n = p.download_ext(track, DOWNLOAD_QUALITY)
                         return self._json({"ok": True, "guid": guid, "action": action,
                                            "saved": fp, "bytes": n})
                     p.add_favorite(guid)
@@ -3440,8 +3468,10 @@ class Handler(BaseHTTPRequestHandler):
                     track = rows[0]
                 else:
                     raise BadRequest("guid 或 query 至少给一个")
-                fp, n = LIBRARY.save_from_provider(p, track, quality or DEFAULT_QUALITY)
-                return self._json({"ok": True, "guid": track["guid"], "path": fp, "bytes": n})
+                qname, qlabel = download_quality_info(quality)
+                fp, n = LIBRARY.save_from_provider(p, track, qname)
+                return self._json({"ok": True, "guid": track["guid"], "path": fp,
+                                   "bytes": n, "quality": qname, "quality_label": qlabel})
             return self._json({"error": "not found", "path": u.path}, 404)
         except GatewayError as e:
             body, code = as_payload(e)

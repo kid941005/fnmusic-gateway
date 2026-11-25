@@ -2,6 +2,7 @@
 """网关首页：搜索 / 播放 / 下载 / 状态，同端口原生页面。"""
 
 from . import __version__ as VERSION
+from .theme import THEME_CONTROL, THEME_SCRIPT, THEME_STYLE
 
 HOME_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -31,13 +32,15 @@ input{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radiu
 .kv{background:#0e1526;border:1px solid var(--line);border-radius:10px;padding:12px}.kv b{display:block;font-size:12px;color:var(--mut);font-weight:500;margin-bottom:3px}
 .empty{color:var(--mut);padding:16px 0}
 @media(max-width:620px){.track{align-items:flex-start;flex-direction:column}.actions{width:100%}}
+__THEME_STYLE__
 </style>
+__THEME_SCRIPT__
 </head>
 <body>
 <div class="wrap">
 <header>
   <div><h1>fnmusic-gateway <span class="pill">v__VERSION__</span></h1><div class="sub">飞牛音乐优先 · 内置在线音源补足</div></div>
-  <div><a class="btn" href="/settings">设置</a> <a class="btn" href="/logout">退出</a></div>
+  <div>__THEME_CONTROL__ <a class="btn" href="/settings">设置</a> <a class="btn" href="/logout">退出</a></div>
 </header>
 
 <div class="card">
@@ -64,6 +67,7 @@ input{background:#0e1526;border:1px solid var(--line);color:#e8eefc;border-radiu
   <div class="row">
     <input id="q" placeholder="输入歌名 / 歌手，例如 周杰伦 晴天" autocomplete="off">
     <button class="btn primary" id="go">搜索</button>
+    <span id="dlq" class="pill">下载音质：-</span>
   </div>
   <div id="msg"></div>
   <div id="results"><div class="empty">输入关键词开始搜索；本地曲库优先，在线音源补足。</div></div>
@@ -167,17 +171,32 @@ async function play(t,i){
     }else{say('已就绪：'+(d.title||t.title))}
   }catch(e){clearInterval(timer);say('播放失败：'+errText(e))}
 }
+function fmtSize(n){var b=Number(n||0);if(b>=1048576)return (b/1048576).toFixed(1)+' MB';if(b>=1024)return Math.round(b/1024)+' KB';return b+' B'}
+var dlqLabel=''
+async function loadQuality(){
+  try{
+    var d=await getJSON('/api/quality')
+    var name=d.download||''
+    var p=(d.profiles||[]).filter(function(x){return x.name===name})[0]||{}
+    dlqLabel=p.download_original?'无损（保留原始文件）':((p.label||name||'按设置')+'（'+(p.bitrate||'')+' MP3）')
+    el('dlq').textContent='下载音质：'+dlqLabel
+  }catch(e){el('dlq').textContent='下载音质：按设置'}
+}
 async function download(t){
-  if(!t)return;say('正在保存 '+t.title+'…')
+  if(!t)return;var q=dlqLabel||'按设置';say('正在保存 '+t.title+'…（下载音质：'+q+'）')
   try{var r=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:t.guid,title:t.title||'',artist:t.artist||''})})
-    var d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status));say('已保存：'+d.path+'（'+Math.round(d.bytes/1024)+' KB）')}catch(e){say('下载失败：'+e.message)}
+    var d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status))
+    say('已保存：'+d.path+'（音质 '+(d.quality_label||d.quality||q)+'，'+fmtSize(d.bytes)+'）')}catch(e){say('下载失败：'+e.message)}
 }
 el('go').onclick=search;el('q').addEventListener('keydown',function(e){if(e.key==='Enter')search()})
 var initialQ=new URLSearchParams(location.search).get('q');if(initialQ){el('q').value=initialQ;search()}
-loadStatus()
+loadStatus();loadQuality()
 </script>
 </body>
 </html>
 """
 
-HOME_HTML = HOME_HTML.replace("__VERSION__", VERSION)
+HOME_HTML = (HOME_HTML.replace("__VERSION__", VERSION)
+             .replace("__THEME_STYLE__", THEME_STYLE)
+             .replace("__THEME_SCRIPT__", THEME_SCRIPT)
+             .replace("__THEME_CONTROL__", THEME_CONTROL))

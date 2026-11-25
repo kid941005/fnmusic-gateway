@@ -4,7 +4,7 @@ from .quality import describe
 
 QUALITY_ENUM = ["standard", "high", "exhigh", "lossless"]
 QUALITY_PROP = {"type": "string", "enum": QUALITY_ENUM,
-                "description": "音质：standard 128k / high 192k / exhigh 320k / lossless 下载保原文件"}
+                "description": "音质：standard 128k / high 192k / exhigh 320k / lossless（下载保留原始文件）；下载类未指定时用设置里的下载音质"}
 
 
 def build_tools():
@@ -99,7 +99,7 @@ def build_tools():
         {
             "name": "music_favorite",
             "description": ("收藏或取消收藏一首歌。action=add|remove；可以传 query=歌名，或 guid=精确曲目，或 current=true 表示当前正在播放的歌。"
-                            "配了飞牛音乐时直接写飞牛收藏；在线音源曲目 add 会按最高音质下载到本地下载目录（需配置 GW_DOWNLOAD_DIR）。"),
+                            "配了飞牛音乐时直接写飞牛收藏；在线音源曲目 add 会按下载音质下载到本地下载目录（需配置 GW_DOWNLOAD_DIR）。"),
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["add", "remove"]},
                 "query": {"type": "string", "description": "歌名（与 guid/current 三选一）"},
@@ -117,7 +117,7 @@ def build_tools():
         },
         {
             "name": "music_download",
-            "description": "把在线歌曲下载/保存到本地下载目录（GW_DOWNLOAD_DIR）。guid 或 query 二选一；quality=lossless 时保存原始文件。",
+            "description": "把在线歌曲下载/保存到本地下载目录（GW_DOWNLOAD_DIR）。guid 或 query 二选一；未指定 quality 时使用下载音质（默认 lossless，保存原始文件）。",
             "inputSchema": {"type": "object", "properties": {
                 "guid": {"type": "string"}, "query": {"type": "string"},
                 "title": {"type": "string", "description": "可选：显式指定保存文件名里的歌名"},

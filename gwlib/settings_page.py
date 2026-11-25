@@ -5,6 +5,7 @@ import json
 
 from . import __version__ as VERSION
 from .quality import describe as describe_quality
+from .theme import THEME_CONTROL, THEME_SCRIPT, THEME_STYLE
 
 SETTINGS_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -28,18 +29,25 @@ input[type=text],input[type=password],input[type=number],select{background:#0e15
 .check{display:flex;align-items:center;gap:8px;color:#e8eefc}.check input{width:16px;height:16px}
 .plat{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
 .plat:first-child{border-top:0}.plat .l{display:flex;align-items:center;gap:9px}
+.plat .r{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.test-out{font-size:12px;color:var(--mut);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.test-out.ok{color:var(--ok)}.test-out.bad{color:var(--bad)}
+.qr-panel{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;background:var(--input);border:1px solid var(--line);border-radius:10px;padding:10px;margin:2px 0 12px}
+.qr-panel .out{margin-top:6px}
 .out{min-height:20px;color:var(--mut);font-size:12.5px;white-space:pre-wrap;margin-top:8px}
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1b2540;color:var(--mut);font-size:11.5px}
 .pill.ok{background:rgba(55,201,138,.15);color:var(--ok)}.pill.bad{background:rgba(255,107,107,.15);color:var(--bad)}
 .adv{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
-@media(max-width:680px){.row,.row3{grid-template-columns:1fr}header{flex-direction:column;align-items:flex-start}}
+@media(max-width:680px){.row,.row3{grid-template-columns:1fr}header{flex-direction:column;align-items:flex-start}.plat{flex-wrap:wrap}.plat .r{width:100%;justify-content:flex-end}}
+__THEME_STYLE__
 </style>
+__THEME_SCRIPT__
 </head>
 <body>
 <div class="wrap">
 <header>
   <div><h1>网关设置</h1><div class="sub">v__VERSION__ · 配置会写入 data/config.json，保存后立即生效</div></div>
-  <div><a class="btn" href="/">返回首页</a> <a class="btn" href="/logout">退出</a></div>
+  <div>__THEME_CONTROL__ <a class="btn" href="/">返回首页</a> <a class="btn" href="/logout">退出</a></div>
 </header>
 
 <div class="card">
@@ -63,15 +71,13 @@ input[type=text],input[type=password],input[type=number],select{background:#0e15
   <p class="hint">无需额外容器。勾选平台后网关会自行搜索、解析直链、播放与下载；平台越多越慢，建议保留 1~3 个。</p>
   <label class="check" style="margin-bottom:10px"><input id="online_enabled" type="checkbox"> 启用在线音源</label>
   <div id="platList"></div>
+  <div id="qrPanel" class="qr-panel" style="display:none">
+    <div id="qrBox" style="display:none;background:#fff;padding:6px;border-radius:10px"><img id="qrImg" alt="网易云登录二维码" style="width:180px;height:180px;display:block"></div>
+    <div style="flex:1;min-width:220px"><div class="sub">网易云扫码登录（推荐）</div><button class="btn" id="qrStart" type="button">生成登录二维码</button><div class="out" id="qrOut"></div></div>
+  </div>
   <div class="field" style="margin-top:12px"><label>附加平台（可选，逗号分隔的 musicdl MusicClient 类名）</label><input id="extra_platforms" type="text" placeholder="例如 QQMusicClient,BilibiliMusicClient"></div>
   <div class="field"><label>网易云 MUSIC_U Cookie（可选，留空不修改）</label><input id="netease_cookie" type="password" autocomplete="off" placeholder="粘贴 MUSIC_U=... 或整段 Cookie"></div>
   <label class="check" style="margin-bottom:12px"><input id="clear_netease_cookie" type="checkbox"> 清除已保存的网易云 Cookie</label>
-  <div class="field"><label>网易云扫码登录（推荐）</label>
-    <div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
-      <div id="qrBox" style="display:none;background:#fff;padding:6px;border-radius:10px"><img id="qrImg" alt="网易云登录二维码" style="width:180px;height:180px;display:block"></div>
-      <div style="flex:1;min-width:220px"><button class="btn" id="qrStart" type="button">生成登录二维码</button><div class="out" id="qrOut"></div></div>
-    </div>
-  </div>
   <div class="row3">
     <div class="field"><label>单平台搜索条数（≤10）</label><input id="search_limit" type="number" min="1" max="10"></div>
     <div class="field"><label>单平台超时（秒）</label><input id="timeout" type="number" min="3" max="120"></div>
@@ -93,7 +99,8 @@ input[type=text],input[type=password],input[type=number],select{background:#0e15
 <script>
 var PLATFORMS=['NeteaseMusicClient','KuwoMusicClient','KugouMusicClient','MiguMusicClient','QQMusicClient','QianqianMusicClient','BilibiliMusicClient','SodaMusicClient']
 var QUALITY_OPTIONS=__QUALITY_OPTIONS__
-var LABELS={quality_default:'默认音质',max_limit:'搜索返回上限',preview_min_seconds:'试听判定阈值（秒）',url_ttl:'直链有效期（秒）',cache_max_mb:'播放缓存上限（MB）',library_max_mb:'本地曲库上限（MB）',transcode_concurrency:'同时转码数',smart_search:'智能搜索（别名纠错）',tee_save:'边播边存',lyrics_enabled:'启用歌词',lrclib_url:'LRCLIB 地址',lyrics_retry:'歌词重试间隔（秒）',fnos_timeout:'飞牛请求超时（秒）',mcp_timeout:'MCP 上游超时（秒）'}
+var DOWNLOAD_QUALITY_OPTIONS=__DOWNLOAD_QUALITY_OPTIONS__
+var LABELS={quality_default:'在线试听音质',download_quality:'下载音质',max_limit:'搜索返回上限',preview_min_seconds:'试听判定阈值（秒）',url_ttl:'直链有效期（秒）',cache_max_mb:'播放缓存上限（MB）',library_max_mb:'本地曲库上限（MB）',transcode_concurrency:'同时转码数',smart_search:'智能搜索（别名纠错）',tee_save:'边播边存',lyrics_enabled:'启用歌词',lrclib_url:'LRCLIB 地址',lyrics_retry:'歌词重试间隔（秒）',fnos_timeout:'飞牛请求超时（秒）',mcp_timeout:'MCP 上游超时（秒）'}
 function el(id){return document.getElementById(id)}
 function out(id,t){el(id).textContent=t||''}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -118,11 +125,18 @@ async function saveFnos(){
 var onlineData=null
 function renderPlatforms(chosen,extra){
   var all=PLATFORMS.slice();(chosen||[]).forEach(function(p){if(all.indexOf(p)<0)all.push(p)});(extra||[]).forEach(function(p){if(all.indexOf(p)<0)all.push(p)})
+  var panel=el('qrPanel')
+  var qrOpen=!!panel&&panel.style.display!=='none'
+  if(panel&&panel.parentNode)panel.parentNode.removeChild(panel)
   el('platList').innerHTML=all.map(function(p){
     var on=(chosen||[]).indexOf(p)>=0
-    return '<div class="plat"><label class="l"><input type="checkbox" data-plat="'+esc(p)+'"'+(on?' checked':'')+'>'+esc(p)+'</label><button class="btn small" data-test="'+esc(p)+'">测试</button></div>'
+    var qr=p==='NeteaseMusicClient'?'<button class="btn small" data-qr="1" type="button">'+(qrOpen?'收起扫码':'扫码登录（推荐）')+'</button>':''
+    return '<div class="plat" data-plat-row="'+esc(p)+'"><label class="l"><input type="checkbox" data-plat="'+esc(p)+'"'+(on?' checked':'')+'>'+esc(p)+'</label><div class="r"><span class="test-out" data-out="'+esc(p)+'"></span>'+qr+'<button class="btn small" data-test="'+esc(p)+'" type="button">测试</button></div></div>'
   }).join('')
   el('platList').querySelectorAll('[data-test]').forEach(function(b){b.onclick=function(){testOne(b.getAttribute('data-test'))}})
+  el('platList').querySelectorAll('[data-qr]').forEach(function(b){b.onclick=toggleQr})
+  var net=el('platList').querySelector('[data-plat-row="NeteaseMusicClient"]')
+  if(panel&&net)net.parentNode.insertBefore(panel,net.nextSibling)
 }
 async function loadOnline(){
   try{var d=await api('/api/settings/online');onlineData=d
@@ -144,18 +158,41 @@ async function saveOnline(){
     onlineData=d;el('netease_cookie').value='';el('netease_cookie').placeholder=d.netease_cookie_set?'已设置；留空不修改':'未设置；粘贴 MUSIC_U=... 或整段 Cookie';el('clear_netease_cookie').checked=false;renderPlatforms(d.platforms||[],d.extra_platforms||[]);out('onlineOut','已保存，音源已按新配置重建'+(d.netease_cookie_set?'（网易云 Cookie 已设置）':''))
   }catch(e){out('onlineOut','保存失败：'+e.message)}
 }
+function testSlot(p){
+  var nodes=el('platList').querySelectorAll('[data-out]')
+  for(var i=0;i<nodes.length;i++){if(nodes[i].getAttribute('data-out')===p)return nodes[i]}
+  return null
+}
+function showTestResult(p,r){
+  var s=testSlot(p);if(!s)return
+  if(!r){s.textContent='测试中…';s.className='test-out';s.title='';return}
+  s.textContent=r.ok?('可用 '+(r.ms||0)+' ms'+(r.count!=null?' · '+r.count+' 条':'')):('失败'+(r.ms?(' '+r.ms+' ms'):''))
+  s.className='test-out '+(r.ok?'ok':'bad')
+  s.title=r.error||''
+}
 async function testOne(p){
-  out('onlineOut','测试 '+p+' 中…（首次启动服务端进程会慢一些）')
-  try{var d=await post('/api/settings/online/test',{platform:p});var r=(d.results||[])[0]||{}
-    out('onlineOut',p+'：'+(r.ok?'可用':'失败')+'，'+r.ms+' ms'+(r.error?'，'+r.error:'')+(r.ok?'，返回 '+r.count+' 条':''))
-  }catch(e){out('onlineOut','测试失败：'+e.message)}
+  showTestResult(p,null)
+  try{var d=await post('/api/settings/online/test',{platform:p});showTestResult(p,(d.results||[])[0]||{ok:false,ms:0,error:'没有返回结果'})}
+  catch(e){showTestResult(p,{ok:false,ms:0,error:e.message})}
 }
 async function testAll(){
   out('onlineOut','测试全部平台中…')
-  try{var d=await post('/api/settings/online/test',{});var lines=(d.results||[]).map(function(r){return r.platform+'：'+(r.ok?'可用':'失败')+'，'+r.ms+' ms'+(r.error?'，'+r.error:'')+(r.ok?'，返回 '+r.count+' 条':'')});out('onlineOut',lines.join('\\n')||'没有可测试平台')
-  }catch(e){out('onlineOut','测试失败：'+e.message)}
+  el('platList').querySelectorAll('[data-out]').forEach(function(s){s.textContent='测试中…';s.className='test-out';s.title=''})
+  try{var d=await post('/api/settings/online/test',{});var rs=d.results||[];rs.forEach(function(r){showTestResult(r.platform,r)});out('onlineOut',rs.length?'全部测试完成':'没有可测试平台')}
+  catch(e){out('onlineOut','测试失败：'+e.message)}
 }
 
+function setQrOpen(open){
+  var panel=el('qrPanel');if(!panel)return
+  panel.style.display=open?'flex':'none'
+  el('platList').querySelectorAll('[data-qr]').forEach(function(b){b.textContent=open?'收起扫码':'扫码登录（推荐）'})
+}
+function toggleQr(){
+  var panel=el('qrPanel');if(!panel)return
+  var open=panel.style.display==='none'
+  setQrOpen(open)
+  if(open)startQr();else stopQr()
+}
 var qrTimer=null
 function stopQr(){if(qrTimer){clearInterval(qrTimer);qrTimer=null}}
 async function startQr(){
@@ -182,7 +219,7 @@ async function loadAdvanced(){
   try{var d=await api('/api/settings/advanced');var html=''
     Object.keys(d).forEach(function(k){
       var v=d[k];var label=LABELS[k]||k;var ctl=''
-      if(k==='quality_default')ctl='<select data-adv="'+k+'" data-kind="str">'+QUALITY_OPTIONS.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===String(v)?' selected':'')+'>'+esc(o.label)+'</option>'}).join('')+'</select>'
+      if(k==='quality_default'||k==='download_quality'){var opts=k==='download_quality'?DOWNLOAD_QUALITY_OPTIONS:QUALITY_OPTIONS;ctl='<select data-adv="'+k+'" data-kind="str">'+opts.map(function(o){return '<option value="'+esc(o.value)+'"'+(o.value===String(v)?' selected':'')+'>'+esc(o.label)+'</option>'}).join('')+'</select>'}
       else if(typeof v==='boolean')ctl='<label class="check"><input type="checkbox" data-adv="'+k+'" data-kind="bool"'+(v?' checked':'')+'> 启用</label>'
       else if(typeof v==='number')ctl='<input type="number" data-adv="'+k+'" data-kind="number" value="'+v+'">'
       else ctl='<input type="text" data-adv="'+k+'" data-kind="str" value="'+esc(v)+'">'
@@ -213,7 +250,18 @@ _QUALITY_CHOICES = [
     {
         "value": p["name"],
         "label": (
-            "无损（下载保原文件，播放 %s MP3）" % p["bitrate"]
+            "无损（播放 %s MP3）" % p["bitrate"]
+            if p.get("download_original")
+            else "%s（%s MP3）" % (p["label"], p["bitrate"])
+        ),
+    }
+    for p in describe_quality()
+]
+_DOWNLOAD_QUALITY_CHOICES = [
+    {
+        "value": p["name"],
+        "label": (
+            "无损（保留原始文件）"
             if p.get("download_original")
             else "%s（%s MP3）" % (p["label"], p["bitrate"])
         ),
@@ -221,4 +269,8 @@ _QUALITY_CHOICES = [
     for p in describe_quality()
 ]
 SETTINGS_HTML = SETTINGS_HTML.replace("__QUALITY_OPTIONS__", json.dumps(_QUALITY_CHOICES, ensure_ascii=False))
-SETTINGS_HTML = SETTINGS_HTML.replace("__VERSION__", VERSION)
+SETTINGS_HTML = SETTINGS_HTML.replace("__DOWNLOAD_QUALITY_OPTIONS__", json.dumps(_DOWNLOAD_QUALITY_CHOICES, ensure_ascii=False))
+SETTINGS_HTML = (SETTINGS_HTML.replace("__VERSION__", VERSION)
+                 .replace("__THEME_STYLE__", THEME_STYLE)
+                 .replace("__THEME_SCRIPT__", THEME_SCRIPT)
+                 .replace("__THEME_CONTROL__", THEME_CONTROL))

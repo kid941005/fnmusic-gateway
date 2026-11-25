@@ -4,6 +4,7 @@
 import html
 
 from . import __version__ as VERSION
+from .theme import THEME_CONTROL, THEME_SCRIPT, THEME_STYLE
 
 _TEMPLATE = """<!doctype html>
 <html lang="zh-CN">
@@ -21,9 +22,12 @@ input[type=password]{width:100%;background:#0e1526;border:1px solid var(--line);
 button{width:100%;margin-top:14px;border:0;border-radius:9px;background:var(--acc);color:#fff;padding:11px 12px;font:inherit;cursor:pointer}
 .err{background:rgba(255,107,107,.12);border:1px solid rgba(255,107,107,.35);color:var(--bad);border-radius:9px;padding:9px 11px;font-size:13px;margin-bottom:14px}
 .hint{color:var(--mut);font-size:12px;margin-top:14px;line-height:1.5}
+__THEME_STYLE__
 </style>
+__THEME_SCRIPT__
 </head>
 <body>
+<div class="theme-fixed">__THEME_CONTROL__</div>
 <div class="card">
   <h1>fnmusic-gateway</h1>
   <div class="sub">v__VERSION__ · 输入管理密码进入 WebUI</div>
@@ -40,7 +44,10 @@ button{width:100%;margin-top:14px;border:0;border-radius:9px;background:var(--ac
 </html>
 """
 
-_TEMPLATE = _TEMPLATE.replace("__VERSION__", VERSION)
+_TEMPLATE = (_TEMPLATE.replace("__VERSION__", VERSION)
+             .replace("__THEME_STYLE__", THEME_STYLE)
+             .replace("__THEME_SCRIPT__", THEME_SCRIPT)
+             .replace("__THEME_CONTROL__", THEME_CONTROL))
 
 
 def login_html(next_path="/", error=""):

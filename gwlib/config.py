@@ -15,7 +15,7 @@ FIELDS = {
                "timeout", "total_limit", "total_timeout", "netease_cookie"),
     # 网页「高级设置」写入的运行参数（值统一按字符串保存）
     "advanced": (
-        "quality_default", "max_limit", "preview_min_seconds", "url_ttl",
+        "quality_default", "download_quality", "max_limit", "preview_min_seconds", "url_ttl",
         "cache_max_mb", "library_max_mb", "transcode_concurrency",
         "smart_search", "tee_save", "lyrics_enabled", "lrclib_url",
         "lyrics_retry", "fnos_timeout", "mcp_timeout",

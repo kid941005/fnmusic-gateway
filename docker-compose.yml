@@ -1,5 +1,5 @@
 # ============================================================================
-# fnmusic-gateway 2.13.13 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
+# fnmusic-gateway 2.13.14 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
 #
 # 只发布 1 个宿主机端口 8766：
 #   浏览器 → http://NAS_IP:8766/          原生首页与设置页
@@ -39,6 +39,10 @@ services:
       GW_ONLINE_TIMEOUT: "${GW_ONLINE_TIMEOUT:-25}"
       GW_ONLINE_TOTAL_LIMIT: "${GW_ONLINE_TOTAL_LIMIT:-50}"
       GW_ONLINE_TOTAL_TIMEOUT: "${GW_ONLINE_TOTAL_TIMEOUT:-40}"
+
+      # 音质默认值（首次启动；之后可在网页「设置」改）
+      GW_QUALITY_DEFAULT: "${GW_QUALITY_DEFAULT:-standard}"     # 在线试听/播放音质
+      GW_DOWNLOAD_QUALITY: "${GW_DOWNLOAD_QUALITY:-lossless}"   # 下载/自动补齐/边播边存音质
 
       # 2.13.0+ 快速返回预算：MCP 搜索最多等几秒、本地库搜索超时几秒
       GW_MCP_SEARCH_BUDGET: "${GW_MCP_SEARCH_BUDGET:-8}"

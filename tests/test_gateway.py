@@ -507,6 +507,10 @@ class TestHome(Base):
         self.assertIn(("v" + app.VERSION).encode("utf-8"), body)
         self.assertIn("在线音源".encode("utf-8"), body)
         self.assertIn(b'id="player"', body)
+        self.assertIn(b'id="dlq"', body)
+        self.assertIn(b"loadQuality", body)
+        self.assertIn(b"fmtSize", body)
+        self.assertIn("下载音质".encode("utf-8"), body)
 
     def test_settings_page_has_online_card(self):
         cookie = self._cookie()
@@ -520,12 +524,44 @@ class TestHome(Base):
         from gwlib import settings_page
         text = settings_page.SETTINGS_HTML
         self.assertIn("var QUALITY_OPTIONS=", text)
+        self.assertIn("var DOWNLOAD_QUALITY_OPTIONS=", text)
         self.assertIn("k==='quality_default'", text)
+        self.assertIn("k==='download_quality'", text)
         self.assertIn("<select data-adv=", text)
+        self.assertIn("无损（保留原始文件）", text)
         for value in ("standard", "high", "exhigh", "lossless"):
             self.assertIn('"value": "%s"' % value, text)
         self.assertIn("标准（128k MP3）", text)
-        self.assertIn("无损（下载保原文件，播放 320k MP3）", text)
+        self.assertIn("无损（播放 320k MP3）", text)
+
+    def test_pages_offer_theme_with_system_default(self):
+        from gwlib import home_page, login_page, settings_page, theme
+        pages = (home_page.HOME_HTML, settings_page.SETTINGS_HTML,
+                 login_page.login_html())
+        for text in pages:
+            self.assertIn('id="themeSel"', text)
+            self.assertIn('<option value="system">跟随系统</option>', text)
+            self.assertIn('<option value="light">浅色</option>', text)
+            self.assertIn('data-theme', text)
+            self.assertNotIn("__THEME_", text)
+        self.assertIn(':root[data-theme="light"]', theme.THEME_STYLE)
+        self.assertIn("color-scheme:light", theme.THEME_STYLE)
+        self.assertIn("prefers-color-scheme", theme.THEME_SCRIPT)
+        self.assertIn(":'system'", theme.THEME_SCRIPT)
+        self.assertIn("fnmusic-theme", theme.THEME_SCRIPT)
+
+    def test_settings_platform_test_results_inline_and_qr_entry(self):
+        from gwlib import settings_page
+        text = settings_page.SETTINGS_HTML
+        self.assertIn('data-out="', text)
+        self.assertIn('data-qr="1"', text)
+        self.assertIn("扫码登录（推荐）", text)
+        self.assertIn('class="test-out"', text)
+        self.assertIn('id="qrPanel"', text)
+        self.assertIn("function showTestResult", text)
+        self.assertIn("showTestResult(p,", text)
+        self.assertIn("net.parentNode.insertBefore(panel,net.nextSibling)", text)
+        self.assertNotIn("out('onlineOut','测试 '+p+' 中", text)
 
     def test_healthz_reports_online(self):
         r, body = self.req("GET", "/healthz")
@@ -906,7 +942,8 @@ class TestAdvancedSettings(Base):
         self.assertEqual(r.status, 401)
 
     def test_advanced_roundtrip_applies_hot(self):
-        body = {"quality_default": "high", "max_limit": 30, "url_ttl": 600,
+        body = {"quality_default": "high", "download_quality": "lossless",
+                "max_limit": 30, "url_ttl": 600,
                 "cache_max_mb": 32, "library_max_mb": 64,
                 "transcode_concurrency": 3, "smart_search": False,
                 "tee_save": False, "lyrics_enabled": False,
@@ -915,15 +952,18 @@ class TestAdvancedSettings(Base):
         r, resp = self.req("PUT", "/api/settings/advanced", body=body, headers=self._h())
         self.assertEqual(r.status, 200)
         self.assertEqual(resp["quality_default"], "high")
+        self.assertEqual(resp["download_quality"], "lossless")
         self.assertEqual(resp["max_limit"], 30)
         # 全局与服务对象都已生效
         self.assertEqual(app.QUALITY_DEFAULT, "high")
+        self.assertEqual(app.DOWNLOAD_QUALITY, "lossless")
         self.assertEqual(app.MAX_LIMIT, 30)
         self.assertEqual(app.URL_TTL, 600)
         self.assertEqual(app.CACHE.max, 32 * 1024 ** 2)
         self.assertEqual(app.LIBRARY.max_bytes, 64 * 1024 ** 2)
         self.assertEqual(app.TRANSCODE_CONCURRENCY, 3)
         self.assertEqual(app.PLAYBACK.default_quality, "high")
+        self.assertEqual(app.PLAYBACK.download_quality, "lossless")
         self.assertEqual(app.PLAYBACK.ttl, 600)
         self.assertFalse(app.SMART_SEARCH)
         self.assertFalse(app.TEE_SAVE)
@@ -937,7 +977,8 @@ class TestAdvancedSettings(Base):
         self.assertEqual(got["lrclib_url"], "")
 
     def test_advanced_rejects_bad_values(self):
-        for body in ({"quality_default": "bogus"}, {"max_limit": 0},
+        for body in ({"quality_default": "bogus"}, {"download_quality": "bogus"},
+                     {"max_limit": 0},
                      {"mcp_timeout": 5}, {"lrclib_url": "ftp://x"},
                      {"transcode_concurrency": "abc"}):
             r, _ = self.req("PUT", "/api/settings/advanced", body=body, headers=self._h())
@@ -1494,7 +1535,8 @@ class TestV2Playback(unittest.TestCase):
             make_url=lambda b, g, ttl=None, quality=None: "http://x/play/%s?q=%s" % (g, quality),
             lyric_url_for=lambda b, t, ttl=None: "",
             audio_seconds=lambda p: 100.0, save_state=lambda s: None,
-            default_quality="standard", tee_save=True)
+            default_quality="standard", download_quality="lossless",
+            tee_save=True)
 
     def test_tee_save_only_for_online_source(self):
         lib = self._Library()
@@ -1502,7 +1544,8 @@ class TestV2Playback(unittest.TestCase):
             {"guid": "ext:musicdl:e1", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
             self._Provider(), "http://h")
         self.assertTrue(info["saving"])
-        self.assertEqual(lib.saved, [("ext:musicdl:e1", "standard")])
+        # 边播边存走下载音质，不跟随在线试听音质。
+        self.assertEqual(lib.saved, [("ext:musicdl:e1", "lossless")])
         info2 = self._svc(library=lib).prepare(
             {"guid": "mock-1", "title": "晴天", "artist": "周杰伦"}, self._Provider(), "http://h")
         self.assertFalse(info2["saving"])
@@ -1543,6 +1586,7 @@ class TestV2Api(Base):
         r, d = self.req("GET", "/api/quality")
         self.assertEqual(r.status, 200)
         self.assertEqual(d["default"], "standard")
+        self.assertEqual(d["download"], "lossless")
         self.assertEqual(len(d["profiles"]), 4)
         r, d = self.req("GET", "/api/storage")
         self.assertEqual(r.status, 200)
@@ -1568,12 +1612,28 @@ class TestV2Api(Base):
             r, d = self.req("POST", "/api/download", {"query": "晴天", "quality": "standard"})
             self.assertEqual(r.status, 200, d)
             self.assertTrue(os.path.exists(d["path"]))
+            self.assertEqual(d["quality"], "standard")
+            self.assertEqual(d["quality_label"], "标准（128k MP3）")
+            self.assertGreater(d["bytes"], 0)
             out = app.call_tool("music_download", {"query": "晴天"}, "http://h")
             self.assertIn("已保存到本地曲库", out)
             st = app.call_tool("music_storage", {}, "http://h")
             self.assertIn("本地曲库", st)
         finally:
             app.DOWNLOAD_DIR = old
+
+    def test_api_download_defaults_to_download_quality(self):
+        old_dir, old_q = app.DOWNLOAD_DIR, app.DOWNLOAD_QUALITY
+        app.DOWNLOAD_DIR = os.path.join(DATA, "dl-default-q")
+        app.DOWNLOAD_QUALITY = "exhigh"
+        try:
+            r, d = self.req("POST", "/api/download", {"guid": "mock-1"})
+            self.assertEqual(r.status, 200, d)
+            self.assertEqual(d["quality"], "exhigh")
+            self.assertEqual(d["quality_label"], "极高（320k MP3）")
+        finally:
+            app.DOWNLOAD_DIR = old_dir
+            app.DOWNLOAD_QUALITY = old_q
 
     def test_api_download_by_guid_uses_track_title(self):
         old = app.DOWNLOAD_DIR
@@ -2223,6 +2283,7 @@ class TestAutoDownload(unittest.TestCase):
         stats = gw_playcount.PlayStats(os.path.join(tempfile.mkdtemp(dir=DATA), "p.json"))
         stats.dedupe_seconds = 0.0
         saved = []
+        qualities = []
         done = threading.Event()
 
         class FakeLibrary:
@@ -2231,12 +2292,14 @@ class TestAutoDownload(unittest.TestCase):
 
             def save_from_provider(self, provider, track, quality=None):
                 saved.append(dict(track))
+                qualities.append(quality)
                 done.set()
                 return "/tmp/x.mp3", 1
 
         track = {"guid": "ext:musicdl:abc", "title": "晴天", "artist": "周杰伦"}
         with mock.patch.object(app, "PLAY_STATS", stats), \
-                mock.patch.object(app, "LIBRARY", FakeLibrary()):
+                mock.patch.object(app, "LIBRARY", FakeLibrary()), \
+                mock.patch.object(app, "DOWNLOAD_QUALITY", "exhigh"):
             app._AUTO_DOWNLOADING.clear()
             app._note_online_play(track["guid"], track, "standard", object())
             self.assertFalse(saved)
@@ -2244,6 +2307,68 @@ class TestAutoDownload(unittest.TestCase):
             self.assertTrue(done.wait(3.0))
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["title"], "晴天")
+        # 在线试听传的是 standard，自动补齐必须用下载音质 exhigh。
+        self.assertEqual(qualities, ["exhigh"])
+
+
+class TestDownloadQuality(unittest.TestCase):
+    """下载音质与在线试听音质分离：未显式指定时统一走下载音质。"""
+
+    class _Provider:
+        def search(self, q, limit=10):
+            return [{"guid": "ext:musicdl:dq", "title": "晴天", "artist": "周杰伦",
+                     "source": "musicdl"}]
+
+    class _Library:
+        def __init__(self):
+            self.qualities = []
+
+        def enabled(self):
+            return True
+
+        def save_from_provider(self, provider, track, quality=None):
+            self.qualities.append(quality)
+            return "/tmp/x.mp3", 1
+
+    def test_download_quality_labels(self):
+        from unittest import mock
+        with mock.patch.object(app, "DOWNLOAD_QUALITY", "lossless"):
+            self.assertEqual(app.download_quality_info(),
+                             ("lossless", "无损（保留原始文件）"))
+            self.assertEqual(app.download_quality_info("standard"),
+                             ("standard", "标准（128k MP3）"))
+
+    def test_music_download_defaults_to_download_quality(self):
+        from unittest import mock
+        lib = self._Library()
+        with mock.patch.object(app, "LIBRARY", lib), \
+                mock.patch.object(app, "DOWNLOAD_QUALITY", "lossless"):
+            out = app._tool_music_download({"query": "晴天"}, self._Provider(), "", 10, None)
+        self.assertEqual(lib.qualities, ["lossless"])
+        self.assertIn("已保存到本地曲库", out)
+
+    def test_music_download_explicit_quality_wins(self):
+        from unittest import mock
+        lib = self._Library()
+        with mock.patch.object(app, "LIBRARY", lib), \
+                mock.patch.object(app, "DOWNLOAD_QUALITY", "lossless"):
+            app._tool_music_download({"query": "晴天"}, self._Provider(), "", 10, "high")
+        self.assertEqual(lib.qualities, ["high"])
+
+    def test_favorite_add_uses_download_quality(self):
+        from unittest import mock
+        seen = []
+
+        class Provider(self._Provider):
+            def download_ext(self, track, quality=None):
+                seen.append(quality)
+                return "/tmp/x.mp3", 1
+
+        with mock.patch.object(app, "DOWNLOAD_QUALITY", "exhigh"):
+            out = app._tool_music_favorite(
+                {"action": "add", "query": "晴天"}, Provider(), "", 10, None)
+        self.assertEqual(seen, ["exhigh"])
+        self.assertIn("已收藏并下载", out)
 
 
 class TestRelease201(unittest.TestCase):
@@ -2251,7 +2376,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.13")
+        self.assertEqual(app.VERSION, "2.13.14")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

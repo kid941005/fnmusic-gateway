@@ -13,8 +13,8 @@ LOG = logging.getLogger("fnmusic-gw.playback")
 
 class PlaybackService:
     def __init__(self, cache, library, make_url, lyric_url_for, audio_seconds,
-                 save_state, default_quality="standard", ttl=900,
-                 preview_min_seconds=35, tee_save=True):
+                 save_state, default_quality="standard", download_quality="lossless",
+                 ttl=900, preview_min_seconds=35, tee_save=True):
         self.cache = cache
         self.library = library
         self.make_url = make_url
@@ -22,6 +22,7 @@ class PlaybackService:
         self.audio_seconds = audio_seconds
         self.save_state = save_state
         self.default_quality = normalize_quality(default_quality)
+        self.download_quality = normalize_quality(download_quality)
         self.ttl = ttl
         self.preview_min_seconds = preview_min_seconds
         self.tee_save = tee_save
@@ -116,7 +117,8 @@ class PlaybackService:
             lyric_url = ""
         saving = False
         if path and save and self.tee_save and is_ext_guid(current.get("guid")) and self.library.enabled():
-            saving = self.library.save_async(provider, current, profile["name"])
+            # 边播边存属于下载链路，使用独立的下载音质。
+            saving = self.library.save_async(provider, current, self.download_quality)
         state = {"guid": current["guid"], "title": current["title"], "artist": current["artist"],
                  "source": current.get("source") or "local", "preview": preview,
                  "duration": duration, "quality": profile["name"], "at": int(time.time()),

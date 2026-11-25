@@ -562,6 +562,12 @@ class TestHome(Base):
         self.assertIn("showTestResult(p,", text)
         self.assertIn("net.parentNode.insertBefore(panel,net.nextSibling)", text)
         self.assertNotIn("out('onlineOut','测试 '+p+' 中", text)
+        self.assertIn('id="qrBrowser"', text)
+        self.assertIn("8821", text)
+        self.assertIn("MUSIC_U Cookie", text)
+        self.assertIn("s.status==='risk'", text)
+        self.assertIn("&proto=", text)
+        self.assertIn("browser_login_url", text)
 
     def test_healthz_reports_online(self):
         r, body = self.req("GET", "/healthz")
@@ -843,8 +849,9 @@ class TestFnSettings(Base):
             return {"key": "abc123", "qr_content": "https://music.163.com/login?codekey=abc123",
                     "qr_svg": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", "expires_in": 300}
 
-        def fake_poll(key):
+        def fake_poll(key, proto="desktop"):
             self.assertEqual(key, "abc123")
+            self.assertEqual(proto, "desktop")
             return {"status": "success", "code": 803, "message": "登录成功",
                     "cookie": "MUSIC_U=qr-cookie; __csrf=csrf-x"}
 
@@ -869,6 +876,99 @@ class TestFnSettings(Base):
     def test_settings_online_qr_requires_key(self):
         r, _ = self.req("GET", "/api/settings/online/qr", headers=self._h())
         self.assertEqual(r.status, 400)
+
+
+class TestNeteaseQrProtocol(unittest.TestCase):
+    """网易云扫码：新版桌面端 type=3 优先，风控码降级为 risk 并引导 Cookie 登录。"""
+
+    def setUp(self):
+        import gwlib.netease_login as nl
+        self.nl = nl
+        self._old_req = nl._request_json
+        self._old_svg = nl.qr_svg
+        self.calls = []
+        nl.qr_svg = lambda content: "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
+
+    def tearDown(self):
+        self.nl._request_json = self._old_req
+        self.nl.qr_svg = self._old_svg
+
+    def test_start_qr_uses_desktop_type3_first(self):
+        def fake(url, data=None, timeout=None):
+            self.calls.append((url, dict(data or {})))
+            return {"code": 200, "unikey": "uk-new"}, {}
+        self.nl._request_json = fake
+        info = self.nl.start_qr()
+        self.assertEqual(info["proto"], "desktop")
+        self.assertEqual(info["key"], "uk-new")
+        self.assertEqual(self.calls[0][0], self.nl.QR_UNIKEY_URL)
+        self.assertEqual(self.calls[0][1], {"type": 3})
+        self.assertIn("codekey=uk-new", info["qr_content"])
+        self.assertEqual(info["browser_login_url"], self.nl.QR_BROWSER_LOGIN_URL)
+
+    def test_start_qr_falls_back_to_legacy(self):
+        def fake(url, data=None, timeout=None):
+            self.calls.append((url, dict(data or {})))
+            if url == self.nl.QR_UNIKEY_URL:
+                raise self.nl.NeteaseLoginError("new api down")
+            return {"code": 200, "unikey": "uk-old"}, {}
+        self.nl._request_json = fake
+        info = self.nl.start_qr()
+        self.assertEqual(info["proto"], "legacy")
+        self.assertEqual(info["key"], "uk-old")
+        self.assertEqual(self.calls[1][0],
+                         self.nl.QR_LEGACY_UNIKEY_URL + "?type=1")
+        self.assertEqual(self.calls[1][1], {})
+
+    def test_poll_qr_uses_desktop_post_type3(self):
+        def fake(url, data=None, timeout=None):
+            self.calls.append((url, dict(data or {})))
+            return {"code": 801, "message": "等待扫码"}, {}
+        self.nl._request_json = fake
+        result = self.nl.poll_qr("abc123")
+        self.assertEqual(result["status"], "waiting")
+        self.assertEqual(self.calls[0][0], self.nl.QR_POLL_URL)
+        self.assertEqual(self.calls[0][1], {"key": "abc123", "type": 3})
+
+    def test_poll_qr_risk_code_returns_risk_hint(self):
+        def fake(url, data=None, timeout=None):
+            return {"code": 8821, "message": "状态异常"}, {}
+        self.nl._request_json = fake
+        result = self.nl.poll_qr("abc123")
+        self.assertEqual(result["status"], "risk")
+        self.assertEqual(result["hint"], "cookie")
+        self.assertIn("MUSIC_U", result["message"])
+        self.assertIn("8821", result["message"])
+
+    def test_poll_qr_legacy_uses_get_type1(self):
+        def fake(url, data=None, timeout=None):
+            self.calls.append((url, data))
+            return {"code": 801, "message": "等待扫码"}, {}
+        self.nl._request_json = fake
+        self.nl.poll_qr("abc123", proto="legacy")
+        self.assertEqual(self.calls[0][0],
+                         self.nl.QR_LEGACY_POLL_URL + "?key=abc123&type=1")
+        self.assertIsNone(self.calls[0][1])
+
+    def test_poll_qr_falls_back_to_legacy_when_desktop_fails(self):
+        def fake(url, data=None, timeout=None):
+            self.calls.append((url, data))
+            if url == self.nl.QR_POLL_URL:
+                raise self.nl.NeteaseLoginError("desktop failed")
+            return {"code": 802, "message": "已扫码"}, {}
+        self.nl._request_json = fake
+        result = self.nl.poll_qr("abc123")
+        self.assertEqual(result["status"], "scanned")
+        self.assertIn("type=1", self.calls[1][0])
+
+    def test_poll_qr_success_reads_payload_cookie(self):
+        def fake(url, data=None, timeout=None):
+            return {"code": 803, "cookie": "MUSIC_U=u-1; __csrf=c-1"}, {}
+        self.nl._request_json = fake
+        result = self.nl.poll_qr("abc123")
+        self.assertEqual(result["status"], "success")
+        self.assertIn("MUSIC_U=u-1", result["cookie"])
+        self.assertIn("__csrf=c-1", result["cookie"])
 
 
 class TestNeteaseCookie(unittest.TestCase):
@@ -2376,7 +2476,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.14")
+        self.assertEqual(app.VERSION, "2.13.15")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

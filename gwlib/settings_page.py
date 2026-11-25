@@ -73,7 +73,15 @@ __THEME_SCRIPT__
   <div id="platList"></div>
   <div id="qrPanel" class="qr-panel" style="display:none">
     <div id="qrBox" style="display:none;background:#fff;padding:6px;border-radius:10px"><img id="qrImg" alt="网易云登录二维码" style="width:180px;height:180px;display:block"></div>
-    <div style="flex:1;min-width:220px"><div class="sub">网易云扫码登录（推荐）</div><button class="btn" id="qrStart" type="button">生成登录二维码</button><div class="out" id="qrOut"></div></div>
+    <div style="flex:1;min-width:240px">
+      <div class="sub">网易云扫码登录（推荐）</div>
+      <div class="hint" style="margin:6px 0">若提示风控 8821 / -462，扫码无法完成：请用网页版登录后，把 MUSIC_U Cookie 粘贴到下方输入框并保存。</div>
+      <div class="row" style="gap:8px;margin:8px 0">
+        <button class="btn" id="qrStart" type="button">生成登录二维码</button>
+        <a class="btn small" id="qrBrowser" href="https://music.163.com/#/login" target="_blank" rel="noopener" style="text-decoration:none;display:inline-flex;align-items:center">打开网易云网页登录</a>
+      </div>
+      <div class="out" id="qrOut"></div>
+    </div>
   </div>
   <div class="field" style="margin-top:12px"><label>附加平台（可选，逗号分隔的 musicdl MusicClient 类名）</label><input id="extra_platforms" type="text" placeholder="例如 QQMusicClient,BilibiliMusicClient"></div>
   <div class="field"><label>网易云 MUSIC_U Cookie（可选，留空不修改）</label><input id="netease_cookie" type="password" autocomplete="off" placeholder="粘贴 MUSIC_U=... 或整段 Cookie"></div>
@@ -200,14 +208,16 @@ async function startQr(){
   try{
     var d=await post('/api/settings/online/qr',{})
     if(!d.qr_svg)throw new Error('二维码为空')
+    if(d.browser_login_url)el('qrBrowser').href=d.browser_login_url
     el('qrImg').src=d.qr_svg;el('qrBox').style.display='block'
     out('qrOut','请用网易云音乐 App 扫码（二维码约 5 分钟内有效）')
     var deadline=Date.now()+((d.expires_in||300)*1000)
     qrTimer=setInterval(async function(){
       if(Date.now()>deadline){stopQr();out('qrOut','二维码已过期，请重新生成');return}
-      try{var s=await api('/api/settings/online/qr?key='+encodeURIComponent(d.key))
+      try{var s=await api('/api/settings/online/qr?key='+encodeURIComponent(d.key)+(d.proto?'&proto='+encodeURIComponent(d.proto):''))
         if(s.status==='success'){stopQr();el('qrBox').style.display='none';await loadOnline();out('qrOut','登录成功，网易云 Cookie 已保存')}
         else if(s.status==='expired'){stopQr();out('qrOut','二维码已过期，请重新生成')}
+        else if(s.status==='risk'){stopQr();out('qrOut',s.message||'网易云扫码登录被风控，请改用网页版登录后粘贴 MUSIC_U Cookie');var c=el('netease_cookie');if(c){c.focus();try{c.scrollIntoView({block:'center',behavior:'smooth'})}catch(_){c.scrollIntoView()}}}
         else out('qrOut',s.message||'等待扫码…')
       }catch(e){out('qrOut','查询失败：'+e.message)}
     },2000)

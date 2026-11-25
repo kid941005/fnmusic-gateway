@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""网易云扫码登录：生成二维码、轮询扫码状态、提取 MUSIC_U。"""
+"""网易云扫码登录：生成二维码、轮询扫码状态、提取 MUSIC_U。
+
+2026 年起网易云对第三方扫码登录增加了行为验证风控（8821 / -462 / 8810）。
+这里优先使用新版桌面端接口（interface.music.163.com + type=3），失败时回退旧接口；
+遇到风控码不抛 500，而是返回 status=risk，让 WebUI 引导用户改用网页版 Cookie 登录。
+"""
 import base64
 import io
 import json
@@ -13,11 +18,16 @@ from http.cookies import SimpleCookie
 
 from .errors import BadRequest, UpstreamError
 
-QR_UNIKEY_URL = "https://music.163.com/api/login/qrcode/unikey?type=1"
-QR_POLL_URL = "https://music.163.com/api/login/qrcode/client/login"
+QR_UNIKEY_URL = "https://interface.music.163.com/api/login/qrcode/unikey"
+QR_POLL_URL = "https://interface.music.163.com/api/login/qrcode/client/login"
+QR_LEGACY_UNIKEY_URL = "https://music.163.com/api/login/qrcode/unikey"
+QR_LEGACY_POLL_URL = "https://music.163.com/api/login/qrcode/client/login"
 QR_LOGIN_PREFIX = "https://music.163.com/login?codekey="
+QR_BROWSER_LOGIN_URL = "https://music.163.com/#/login"
 QR_TIMEOUT = 10
 QR_EXPIRES_IN = 300
+QR_TYPE = 3
+QR_LEGACY_TYPE = 1
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -25,6 +35,13 @@ _HEADERS = {
     ),
     "Referer": "https://music.163.com/",
     "Accept": "application/json, text/plain, */*",
+}
+# 网易云登录风控码：扫码接口无法完成时，引导用户改用网页版 Cookie。
+_RISK_HINTS = {
+    8821: "网易云触发登录风控（8821：需要行为验证码），扫码登录已被限制。请点「打开网易云网页登录」登录后，把 MUSIC_U Cookie 粘贴到下方输入框并保存。",
+    -462: "网易云要求完成人机验证（-462），请稍后再试，或改用网页版登录后粘贴 MUSIC_U Cookie。",
+    -460: "网易云检测到网络环境存在风险（-460），请更换网络后重试，或改用网页版登录后粘贴 MUSIC_U Cookie。",
+    8810: "网易云检测到网络环境安全风险（8810），请更换网络后重试，或改用网页版登录后粘贴 MUSIC_U Cookie。",
 }
 
 
@@ -52,6 +69,34 @@ def _cookies_from_response(jar, headers):
             if morsel.value:
                 cookies[name] = morsel.value
     return cookies
+
+
+def _payload_cookies(payload):
+    """部分新版接口把 Cookie 放在响应体里，这里兼容字符串/列表/嵌套 data。"""
+    raw = payload.get("cookie")
+    if raw is None and isinstance(payload.get("data"), dict):
+        raw = payload["data"].get("cookie")
+    if not raw:
+        return {}
+    if isinstance(raw, (list, tuple)):
+        raw = "; ".join(str(x) for x in raw)
+    out = {}
+    for part in str(raw).split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if name and value:
+            out[name] = value
+    return out
+
+
+def _risk_message(code, message):
+    hint = _RISK_HINTS.get(code) or "网易云登录触发风控，扫码登录暂不可用。请改用网页版登录后粘贴 MUSIC_U Cookie。"
+    detail = str(message or "").strip()
+    if detail and detail not in hint:
+        return "%s（%s）" % (hint, detail)
+    return hint
 
 
 _LOCK = threading.RLock()
@@ -83,10 +128,17 @@ def _warm_session(opener, timeout=QR_TIMEOUT):
         pass
 
 
-def _request_json(url, timeout=QR_TIMEOUT):
-    """GET 一个 JSON 接口，返回 (payload, cookies)。"""
+def _request_json(url, data=None, timeout=QR_TIMEOUT):
+    """请求一个 JSON 接口，返回 (payload, cookies)；data 非空时用 POST 表单。"""
     opener = _opener()
-    req = urllib.request.Request(url, headers=_HEADERS)
+    headers = dict(_HEADERS)
+    body = None
+    if data is not None:
+        body = urllib.parse.urlencode(data).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+    req = urllib.request.Request(
+        url, data=body, headers=headers, method="POST" if body is not None else "GET"
+    )
     with _LOCK:
         _warm_session(opener, timeout=timeout)
         try:
@@ -129,39 +181,76 @@ def qr_svg(content):
 
 
 def start_qr(timeout=QR_TIMEOUT):
-    """获取扫码登录 key 和二维码。"""
-    payload, _ = _request_json(QR_UNIKEY_URL, timeout=timeout)
-    key = str(payload.get("unikey") or payload.get("key") or "").strip()
-    if not key:
-        message = str(payload.get("message") or payload.get("msg") or "未返回二维码 key")
-        raise NeteaseLoginError("获取网易云二维码失败：%s" % message)
-    content = QR_LOGIN_PREFIX + urllib.parse.quote(key, safe="")
-    return {
-        "key": key,
-        "qr_content": content,
-        "qr_svg": qr_svg(content),
-        "expires_in": QR_EXPIRES_IN,
-    }
+    """获取扫码登录 key 和二维码；优先新版桌面端 type=3，失败回退旧接口。"""
+    errors = []
+    attempts = (
+        ("desktop", QR_UNIKEY_URL, {"type": QR_TYPE}),
+        ("legacy", QR_LEGACY_UNIKEY_URL + "?type=%d" % QR_LEGACY_TYPE, None),
+    )
+    for proto, url, data in attempts:
+        try:
+            payload, _ = _request_json(url, data=data, timeout=timeout)
+        except NeteaseLoginError as exc:
+            errors.append(str(exc))
+            continue
+        key = str(payload.get("unikey") or payload.get("key") or "").strip()
+        if not key:
+            message = str(payload.get("message") or payload.get("msg") or "未返回二维码 key")
+            errors.append("获取网易云二维码失败：%s" % message)
+            continue
+        content = QR_LOGIN_PREFIX + urllib.parse.quote(key, safe="")
+        return {
+            "key": key,
+            "proto": proto,
+            "qr_content": content,
+            "qr_svg": qr_svg(content),
+            "expires_in": QR_EXPIRES_IN,
+            "browser_login_url": QR_BROWSER_LOGIN_URL,
+        }
+    raise NeteaseLoginError("；".join(errors) or "获取网易云二维码失败")
 
 
-def poll_qr(key, timeout=QR_TIMEOUT):
-    """查询扫码状态；成功时返回待保存的 MUSIC_U Cookie。"""
+def _poll_once(key, proto, timeout):
+    if proto == "legacy":
+        url = QR_LEGACY_POLL_URL + "?key=" + urllib.parse.quote(key, safe="") + "&type=%d" % QR_LEGACY_TYPE
+        return _request_json(url, timeout=timeout)
+    return _request_json(QR_POLL_URL, data={"key": key, "type": QR_TYPE}, timeout=timeout)
+
+
+def poll_qr(key, timeout=QR_TIMEOUT, proto="desktop"):
+    """查询扫码状态；成功时返回待保存的 MUSIC_U Cookie，风控时返回 status=risk。"""
     key = str(key or "").strip()
     if not key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
         raise BadRequest("二维码 key 非法")
-    url = QR_POLL_URL + "?key=" + urllib.parse.quote(key, safe="") + "&type=1"
-    payload, cookies = _request_json(url, timeout=timeout)
+    proto = "legacy" if str(proto or "").strip() == "legacy" else "desktop"
+    try:
+        payload, cookies = _poll_once(key, proto, timeout)
+    except NeteaseLoginError:
+        if proto == "legacy":
+            raise
+        # 新版接口不可用时回退旧接口，保证老部署仍能轮询。
+        payload, cookies = _poll_once(key, "legacy", timeout)
     try:
         code = int(payload.get("code") or 0)
     except (TypeError, ValueError):
         code = 0
     message = str(payload.get("message") or payload.get("msg") or "")
+    if code in _RISK_HINTS:
+        return {
+            "status": "risk",
+            "code": code,
+            "message": _risk_message(code, message),
+            "hint": "cookie",
+        }
     if code == 803:
-        music_u = cookies.get("MUSIC_U") or ""
+        merged = dict(cookies)
+        for name, value in _payload_cookies(payload).items():
+            merged.setdefault(name, value)
+        music_u = merged.get("MUSIC_U") or ""
         if not music_u:
             raise NeteaseLoginError("网易云登录成功，但未返回 MUSIC_U")
         parts = ["MUSIC_U=" + music_u]
-        csrf = cookies.get("__csrf") or cookies.get("__csrf__") or ""
+        csrf = merged.get("__csrf") or merged.get("__csrf__") or ""
         if csrf:
             parts.append("__csrf=" + csrf)
         return {

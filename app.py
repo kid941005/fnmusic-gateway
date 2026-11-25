@@ -3181,7 +3181,10 @@ class Handler(BaseHTTPRequestHandler):
         key = (qs.get("key") or [""])[0].strip()
         if not key:
             raise BadRequest("缺少二维码 key")
-        result = netease_login.poll_qr(key)
+        proto = (qs.get("proto") or ["desktop"])[0].strip().lower()
+        if proto not in ("desktop", "legacy"):
+            proto = "desktop"
+        result = netease_login.poll_qr(key, proto=proto)
         if result.get("status") == "success":
             cookie = result.pop("cookie", "")
             save_netease_cookie(cookie)

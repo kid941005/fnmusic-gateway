@@ -88,8 +88,10 @@ def build_tools():
         },
         {
             "name": "music_resume",
-            "description": ("从上次停止的位置继续播放。用户说“继续播放”“接着放”“续播”“刚才那首接着放”时调用。单曲会从记录的秒数继续，歌单/收藏会恢复到原列表的对应曲目。"),
-            "inputSchema": {"type": "object", "properties": {}},
+            "description": ("从上次停止的位置继续播放。用户说“继续播放”“接着放”“续播”“刚才那首接着放”时调用。单曲会从记录的秒数继续，歌单/收藏会恢复到原列表的对应曲目。设备唤醒打断时可传 position（秒）覆盖本地精确进度。"),
+            "inputSchema": {"type": "object", "properties": {
+                "position": {"type": "integer", "minimum": 0,
+                             "description": "可选：从第几秒继续（设备本地播放进度，覆盖保存记录）"}}},
         },
         {
             "name": "music_stop",

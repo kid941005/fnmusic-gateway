@@ -4,7 +4,7 @@
 [![ghcr](https://img.shields.io/badge/ghcr.io-fnmusic--gateway-blue)](https://github.com/kid941005/fnmusic-gateway/pkgs/container/fnmusic-gateway)
 [![release](https://img.shields.io/github/v/release/kid941005/fnmusic-gateway)](https://github.com/kid941005/fnmusic-gateway/releases)
 
-> 当前版本 **2.13.16**（2026-11-25） · [CHANGELOG](CHANGELOG.md)
+> 当前版本 **2.13.17**（2026-11-26） · [CHANGELOG](CHANGELOG.md)
 
 飞牛音乐优先、内置在线音源兜底的播放网关。一个镜像、一个进程、一个端口，WebUI 与设置页同端口；音源与飞牛账号都在网页里配，不用改环境变量：
 
@@ -473,7 +473,7 @@ NAT 回环（hairpin），表现是“设备说正在播放，但没有声音”
 | `music_next` | 在连续播放的收藏/歌单中切到下一首，返回新的直链与 device_args |
 | `music_previous` | 在连续播放的收藏/歌单中切到上一首，返回新的直链与 device_args |
 | `music_loop` | 切换循环模式：`mode=one` 单曲循环 / `all` 列表循环 / `off` 顺序播放 |
-| `music_resume` | 从上次停止的位置继续播放；单曲按秒切片，歌单恢复到对应曲目与进度 |
+| `music_resume` | 从上次停止的位置继续播放；单曲按秒切片，歌单恢复到对应曲目与进度；可选 `position`（秒）让设备唤醒后按本地精确进度续播 |
 | `music_stop` | 停止当前播放并记录进度，之后可用 `music_resume` 接着放 |
 | `music_favorite` | 收藏/取消收藏：可传 `query`、`guid` 或 `current=true`（当前曲目）；配了飞牛时直接写飞牛收藏，在线曲目 add 时按下载音质下载到本地下载目录 |
 | `music_status` | 连续流返回当前曲目/歌词/已播放秒数；否则返回上一次播放（含音质） |
@@ -507,7 +507,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "<把 sig 改一位的 url>"
 
 ~~~bash
 python -m py_compile app.py
-python tests/test_gateway.py -v   # 212 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
+python tests/test_gateway.py -v   # 213 个用例：签名/直链/Range/MCP/REST/参数校验/缓存/歌词/搜索排序与别名/在线音源设置/网易云 Cookie/扫码登录/飞牛设置持久化与测试连接/自签证书开关/登录页/流式落盘/guid 播放/快速搜索/歌单与收藏连续播放/随机播放与多歌单匹配/按歌手与专辑播放/provider 生命周期/缓存保护/容量预检/签名绑定音质/chunked（含 413 超限），全离线（mock）
 python tests/bridge_selftest.py   # 桥接器：假接入点跑 initialize/tools/list/ping/tools/call
 ~~~
 

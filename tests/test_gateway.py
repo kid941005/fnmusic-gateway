@@ -2126,6 +2126,15 @@ class TestOptim213(unittest.TestCase):
         self.assertIn("从约 12 秒继续", out)
         self.assertIn("start=12", out)
 
+    def test_music_resume_single_position_override(self):
+        track = dict(app.MockProvider.TRACKS[0])
+        app._resume_save("single-override", "single", track=track,
+                         quality="standard", position=12)
+        out = app.call_tool("music_resume", {"_session_id": "single-override",
+                                             "position": 99}, "http://h")
+        self.assertIn("从约 99 秒继续", out)
+        self.assertIn("start=99", out)
+
     def test_music_favorite_current_and_by_guid(self):
         app.call_tool("music_play", {"favorites": True, "_session_id": "fav-x"}, "http://h")
         added = app.call_tool("music_favorite", {"action": "add", "current": True,
@@ -2554,7 +2563,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.16")
+        self.assertEqual(app.VERSION, "2.13.17")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 

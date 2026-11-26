@@ -2576,6 +2576,14 @@ def _tool_music_resume(args, p, base, limit, quality):
     session_key = _session_key(args)
     st = _resume_get(session_key) or {}
     kind = str(st.get("kind") or "")
+    # 设备唤醒打断时会把本地精确进度带上来；歌单仍按服务端游标恢复，
+    # 单曲则优先使用设备上报的秒数（旧客户端不传时保持原记录）。
+    req_position = None
+    if args.get("position") is not None:
+        try:
+            req_position = max(0, int(float(args.get("position"))))
+        except (TypeError, ValueError):
+            req_position = None
     if kind == "playlist" and st.get("tracks"):
         return _saved_list_response(st, p, base, quality, session_key,
                                      action="继续播放", loop=bool(st.get("loop")))
@@ -2591,6 +2599,8 @@ def _tool_music_resume(args, p, base, limit, quality):
         track = _current_playback_track(session_key)
     if not track:
         return "没有找到可继续播放的记录。请先播放歌曲或歌单，再让我继续播放。"
+    if req_position is not None:
+        position = req_position
     q = quality or st.get("quality")
     info = PLAYBACK.prepare(track, p, base, quality=q, wait=False, start=position)
     _resume_save(session_key, "single", track=track, quality=q, position=position)

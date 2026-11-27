@@ -106,6 +106,7 @@ class FnMusicClient:
         self.token = token
         self.token_file = token_file
         self.timeout = timeout
+        self._cred_version = self._credential_version()
         self._lock = threading.Lock()
         self._ssl = ssl.create_default_context()
         # 默认校验证书；内网自签 HTTPS 才显式关闭。insecure_tls 显式传参优先于环境变量，
@@ -120,20 +121,39 @@ class FnMusicClient:
             self._load_token()
 
     # ---------- token 持久化 ----------
+    def _credential_version(self):
+        """密码变化时使旧 token 失效；密码为空时返回空（无法校验，仅校验账号/设备）。"""
+        if not self.password:
+            return ""
+        raw = "%s|%s" % (self.username or "", self.password)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     def _load_token(self):
+        """token 必须绑定 base + 账号 + 设备（+ 密码版本），避免同 base 换账号复用旧 token。"""
         try:
             with open(self.token_file, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if normalize_base(d.get("base", "")) == self.base and d.get("token"):
-                self.token = d["token"]
         except Exception:
-            pass
+            return
+        if normalize_base(d.get("base", "")) != self.base or not d.get("token"):
+            return
+        if str(d.get("username") or "") != str(self.username or ""):
+            return
+        saved_dev = str(d.get("deviceId") or "")
+        if saved_dev and self.device_id and saved_dev != str(self.device_id):
+            return
+        saved_ver = str(d.get("credVersion") or "")
+        if saved_ver and self._cred_version and saved_ver != self._cred_version:
+            return
+        self.token = d["token"]
 
     def _save_token(self):
         if not self.token_file:
             return
         try:
-            d = {"base": self.base, "token": self.token, "deviceId": self.device_id, "at": int(time.time())}
+            d = {"base": self.base, "username": self.username, "token": self.token,
+                 "deviceId": self.device_id, "credVersion": self._cred_version,
+                 "at": int(time.time())}
             tmp = self.token_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(d, f)
@@ -307,19 +327,27 @@ class FnMusicClient:
         扫库接口必须带 App 登录态（Cookie + authx），这里复用客户端现有鉴权。
         返回 True 表示请求已被飞牛接受（异步扫描任务由飞牛执行）。
         """
-        if not guid:
-            try:
-                for row in self.shared_library_list():
-                    if not isinstance(row, dict):
-                        continue
-                    value = str(row.get("guid") or "").strip()
-                    if value:
-                        guid = value
-                        break
-            except FnMusicError:
-                guid = None
         if guid:
             self.post("/shared-library/scan", body={"guid": guid})
+            return True
+        guids = []
+        try:
+            for row in self.shared_library_list():
+                if not isinstance(row, dict):
+                    continue
+                value = str(row.get("guid") or "").strip()
+                if value and value not in guids:
+                    guids.append(value)
+        except FnMusicError:
+            guids = []
+        if guids:
+            # 有多个共享库时全部扫描，避免只扫第一个却漏掉下载目录所在的库；
+            # 单个库失败不应阻断其余库。
+            for value in guids:
+                try:
+                    self.post("/shared-library/scan", body={"guid": value})
+                except FnMusicError:
+                    continue
         else:
             self.post("/shared-library/scan-all", body=None)
         return True

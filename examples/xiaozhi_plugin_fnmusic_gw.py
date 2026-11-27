@@ -28,6 +28,7 @@ import urllib.request
 from plugins_func.register import Action, ActionResponse, ToolType, register_function
 
 GW_BASE = os.environ.get("FNMUSIC_GW_BASE", "http://192.168.50.100:8766").rstrip("/")
+GW_TOKEN = os.environ.get("FNMUSIC_GW_TOKEN", "").strip()  # 网关设置了 GW_ADMIN_TOKEN 时必须填
 DEVICE_PLAY = os.environ.get("FNMUSIC_GW_DEVICE_PLAY", "self.music.play_url")
 DEVICE_STOP = os.environ.get("FNMUSIC_GW_DEVICE_STOP", "self.music.stop")
 # 换成你在智控台勾选过的任意插件模块名，否则函数不会被下发
@@ -55,7 +56,10 @@ def _reg(name, description, parameters):
 
 def _gw(path, timeout=20):
     """GET 网关接口；把网关的 {"error": ...} 转成可读异常。"""
-    req = urllib.request.Request(GW_BASE + path, headers={"Accept": "application/json"})
+    headers = {"Accept": "application/json"}
+    if GW_TOKEN:
+        headers["X-Admin-Token"] = GW_TOKEN
+    req = urllib.request.Request(GW_BASE + path, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -75,7 +79,12 @@ def _device(conn, tool, args, timeout=15):
     fut = asyncio.run_coroutine_threadsafe(
         call_mcp_tool(conn, getattr(conn, "mcp_client", None), tool, payload), conn.loop
     )
-    return fut.result(timeout=timeout)
+    try:
+        return fut.result(timeout=timeout)
+    except Exception:
+        # 超时后必须取消，否则协程继续执行，会出现“提示失败随后却开始播放”。
+        fut.cancel()
+        raise
 
 
 @_reg(

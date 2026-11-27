@@ -17,6 +17,10 @@ ENV PYTHONUNBUFFERED=1 \
     GW_DATA=/data \
     GW_PORT=8766
 
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser \
+ && mkdir -p /data && chown -R 1000:1000 /data
+USER 1000:1000
+
 VOLUME ["/data"]
 EXPOSE 8766
 

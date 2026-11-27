@@ -1,5 +1,5 @@
 # ============================================================================
-# fnmusic-gateway 2.13.16 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
+# fnmusic-gateway 2.13.18 单镜像单端口 compose（原生在线音源，无需 fnmusic-ext 容器）
 #
 # 只发布 1 个宿主机端口 8766：
 #   浏览器 → http://NAS_IP:8766/          原生首页与设置页
@@ -18,11 +18,11 @@
 services:
   # ---- 网关：REST / MCP / 原生 WebUI / 播放直链 / 内置在线音源，全部走 8766 ----
   fnmusic-gateway:
-    image: ghcr.io/kid941005/fnmusic-gateway:latest   # 始终跟随最新发布
+    image: "${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:2.13.18}"   # 固定版本可复现；升级时改这里
     container_name: fnmusic-gateway
     restart: unless-stopped
     ports:
-      - "8766:8766"                      # 唯一对外端口；不要加别的映射
+      - "${GW_PORT:-8766}:8766"          # 唯一对外端口；不要加别的映射
     networks: [fnmusic]
     environment:
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"   # 管理接口/MCP/WebUI 的令牌
@@ -67,7 +67,7 @@ services:
 
   # ---- 桥接器：仅在用「小智 MCP 接入点(wss)」时需要；不用可整段删掉 ----
   fnmusic-bridge:
-    image: ghcr.io/kid941005/fnmusic-gateway:latest
+    image: "${GW_IMAGE:-ghcr.io/kid941005/fnmusic-gateway:2.13.18}"
     container_name: fnmusic-bridge
     restart: unless-stopped
     networks: [fnmusic]
@@ -77,7 +77,7 @@ services:
     healthcheck:
       disable: true                      # 它只是长连接客户端，没有可探的端口
     environment:
-      MCP_ENDPOINT: "${MCP_ENDPOINT:-}"                           # 小智接入点地址；留空会一直重连（不影响网关）
+      MCP_ENDPOINT: "${MCP_ENDPOINT:-}"                           # 小智接入点地址；留空时桥接器空闲（不影响网关）
       GW_MCP_URL: "http://fnmusic-gateway:8766/mcp"                # 容器内直连网关
       GW_PUBLIC_BASE: "${GW_PUBLIC_BASE:-}"                      # 设备可访问的网关地址前缀；桥接模式必填
       GW_ADMIN_TOKEN: "${GW_ADMIN_TOKEN:?请先在 .env 设置 GW_ADMIN_TOKEN}"

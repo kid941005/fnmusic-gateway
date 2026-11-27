@@ -38,6 +38,7 @@ import os
 import random
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -52,7 +53,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from gwlib import __version__ as VERSION
 from gwlib.errors import BadRequest, GatewayError, as_payload
 from gwlib.quality import DEFAULT_QUALITY, describe as describe_quality, get_profile, normalize_quality
-from gwlib.storage import LibraryStore, MediaCache, TranscodeSlots, audio_seconds
+from gwlib.storage import (LibraryStore, MediaCache, TranscodeSlots, audio_seconds,
+                           _looks_like_audio_file)
 from gwlib.sources import (FallbackProvider, filter_search_source, is_ext_guid,
                            normalize_search_source)
 from gwlib.native_source import (NativeMusicDLProvider,
@@ -141,6 +143,14 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 HOST = _env("GW_HOST", "0.0.0.0")
 PORT = _env_int("GW_PORT", 8766)
+
+
+def _host_is_loopback(host):
+    """仅本机回环地址才允许在未设置管理令牌时启动。"""
+    h = str(host or "").strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    return h in ("127.0.0.1", "localhost", "::1")
 # 单端口：只监听 GW_PORT。PUBLIC_BASE 只影响返回给设备的直链前缀，不再额外开监听端口。
 PUBLIC_BASE = _device_base(_env("GW_PUBLIC_BASE", "") or "")
 URL_TTL = _env_int("GW_URL_TTL", 900)
@@ -151,6 +161,24 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 RESUME_FILE = os.path.join(DATA_DIR, "resume.json")
 MAX_LIMIT = _env_int("GW_MAX_LIMIT", 50)
 HTTP_BODY_CAP = 1024 * 1024
+HTTP_TIMEOUT = max(5, _env_int("GW_HTTP_TIMEOUT", 60))
+HTTP_MAX_CONNECTIONS = max(8, _env_int("GW_MAX_CONNECTIONS", 200))
+HTTP_TRAILER_CAP = 8 * 1024
+# 请求级兜底：slowloris 可以每 0.2 秒发 1 字节绕过单次 socket 读超时，必须有总 deadline。
+HTTP_REQUEST_DEADLINE = max(5, _env_int("GW_HTTP_REQUEST_TIMEOUT", 30))
+HTTP_HEADER_CAP = max(16 * 1024, _env_int("GW_HTTP_HEADER_CAP", 64 * 1024))
+_LOG_SECRET_QS = re.compile(r"(?i)(token|key|sig|password|passwd|pwd|secret)=([^&\s]+)")
+
+
+def _redact_log_text(text):
+    """访问日志里隐藏管理令牌、二维码 key、签名等 query 值（含百分号编码键）。"""
+    raw = str(text or "")
+    redacted = _LOG_SECRET_QS.sub(lambda m: m.group(1) + "=***", raw)
+    try:
+        decoded = urllib.parse.unquote_plus(redacted)
+    except Exception:
+        decoded = redacted
+    return _LOG_SECRET_QS.sub(lambda m: m.group(1) + "=***", decoded)
 MCP_BODY_CAP = 4 * 1024 * 1024
 MCP_TIMEOUT = max(30, _env_int("GW_MCP_TIMEOUT", 300))
 # 管理令牌：为空时不鉴权（兼容旧部署）。单端口模式下强烈建议设置。
@@ -1305,8 +1333,12 @@ def fnos_settings():
     pwd = cfg.get("password") or (_env("GW_FNOS_PASS", "") or "")
     dev = (cfg.get("device_id") or (_env("GW_FNOS_DEVICE_ID", "") or "")).strip()
     tls_cfg = cfg.get("insecure_tls")
-    insecure_tls = _env_bool("GW_FNOS_INSECURE_TLS", False) if tls_cfg in (None, "") \
-        else _truthy(tls_cfg)
+    # 配置里显式保存的空字符串表示“取消勾选”，不能再回落到环境变量，
+    # 否则用户取消自签证书开关会被 GW_FNOS_INSECURE_TLS=1 重新打开。
+    if "insecure_tls" in cfg:
+        insecure_tls = _truthy(tls_cfg)
+    else:
+        insecure_tls = _env_bool("GW_FNOS_INSECURE_TLS", False)
     if cfg:
         source = "config"
     elif base or user or pwd:
@@ -2786,12 +2818,79 @@ def _prefetch_playlist_next(tracks, index, p, quality=None, loop=False):
 
 
 # ---------------------------------------------------------------- HTTP
+class _RequestTooSlow(Exception):
+    """请求头读取超过总时限或总字节上限（slowloris / 超大 header）。"""
+
+
+class _LimitedRequestReader:
+    """包住 rfile：只对请求头阶段做总 deadline 与总字节/总行数限制。
+
+    请求体读取（read）不在这里限时，仍由 _raw_body 的 Content-Length/chunked
+    上限保护，避免把大文件上传误判为慢请求。
+    """
+
+    def __init__(self, raw, deadline, header_cap):
+        self.raw = raw
+        self.deadline = deadline
+        self.header_cap = header_cap
+        self.header_bytes = 0
+        self.header_lines = 0
+        self.headers_done = False
+
+    def _check(self):
+        if self.headers_done:
+            return
+        if time.monotonic() > self.deadline:
+            raise _RequestTooSlow("request header deadline exceeded")
+        if self.header_bytes > self.header_cap or self.header_lines > 100:
+            raise _RequestTooSlow("request header too large")
+
+    def readline(self, limit=-1):
+        self._check()
+        line = self.raw.readline(limit)
+        if not self.headers_done:
+            self.header_bytes += len(line)
+            self.header_lines += 1
+            if line in (b"\r\n", b"\n") or not line:
+                self.headers_done = True
+            self._check()
+        return line
+
+    def read(self, n=-1):
+        return self.raw.read(n)
+
+    def readinto(self, b):
+        return self.raw.readinto(b)
+
+    def close(self):
+        close = getattr(self.raw, "close", None)
+        if callable(close):
+            close()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "fnmusic-gateway/" + VERSION
     protocol_version = "HTTP/1.1"
+    timeout = HTTP_TIMEOUT  # 防止慢连接/半开连接长期占用线程
+
+    def handle_one_request(self):
+        # 单次 socket read 超时挡不住 slowloris；这里给整个请求头阶段加总 deadline。
+        raw = self.rfile
+        self.rfile = _LimitedRequestReader(raw, time.monotonic() + HTTP_REQUEST_DEADLINE,
+                                           HTTP_HEADER_CAP)
+        try:
+            return super().handle_one_request()
+        except _RequestTooSlow:
+            try:
+                self.send_error(408, "Request Timeout")
+            except Exception:
+                pass
+            self.close_connection = True
+        finally:
+            self.rfile = raw
 
     def log_message(self, fmt, *args):
-        LOG.info("%s %s", self.address_string(), fmt % args)
+        LOG.info("%s %s", self.address_string(), _redact_log_text(fmt % args))
 
     def _json(self, obj, code=200, headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -3099,6 +3198,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_settings_put(self):
         body = self._body()
+        old_cfg = fnos_settings()
         patch = {}
         for key in ("base", "username", "password", "device_id"):
             if key not in body:
@@ -3109,11 +3209,22 @@ class Handler(BaseHTTPRequestHandler):
         if "base" in patch:
             patch["base"] = normalize_base(patch["base"])
         if "insecure_tls" in body:
-            patch["insecure_tls"] = "1" if _truthy(body.get("insecure_tls")) else ""
+            # 显式关闭要落成 "0"，不能删除键，否则会被 GW_FNOS_INSECURE_TLS=1 重新打开。
+            patch["insecure_tls"] = "1" if _truthy(body.get("insecure_tls")) else "0"
         base = str(patch.get("base", fnos_settings()["base"]) or "").strip()
         if base and not re.match(r"^https?://[^\s]+$", base):
             raise BadRequest("地址必须以 http:// 或 https:// 开头")
+        identity_changed = any(
+            str(patch.get(k, old_cfg.get(k, "")) or "") != str(old_cfg.get(k, "") or "")
+            for k in ("base", "username", "password", "device_id") if k in patch)
         FNOS_CONFIG.update("fnos", patch)
+        if identity_changed:
+            try:
+                os.remove(FNOS_TOKEN_FILE)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                LOG.warning("切换飞牛账号时清理旧令牌失败：%s", exc)
         apply_fnos_tls()
         reset_provider()
         s = fnos_settings()
@@ -3269,10 +3380,14 @@ class Handler(BaseHTTPRequestHandler):
                 if size < 0:
                     raise BadRequest("chunked 长度非法")
                 if size == 0:
+                    trailer_bytes = 0
                     while True:
                         trailer = self.rfile.readline(1024)
                         if not trailer or trailer in (b"\r\n", b"\n"):
                             break
+                        trailer_bytes += len(trailer)
+                        if trailer_bytes > HTTP_TRAILER_CAP:
+                            raise BadRequest("chunked trailer 过大")
                     break
                 total += size
                 if total > cap:
@@ -3349,7 +3464,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "download_quality": DOWNLOAD_QUALITY,
                                    "quality_profiles": describe_quality(),
                                    "mcp_server": {"available": MCP_SERVICE.available,
-                                                  "engine": "mcp>=2.3",
+                                                  "engine": ("mcp>=2.3" if MCP_SERVICE.available
+                                                             else "json-rpc-fallback"),
                                                   "error": str(MCP_SERVICE.import_error) if MCP_SERVICE.import_error else None},
                                    "auth_required": bool(ADMIN_TOKEN),
                                    "cache_mb": round(self._cache_mb(), 1)})
@@ -3435,7 +3551,7 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:
-            LOG.exception("GET %s failed", self.path)
+            LOG.exception("GET %s failed", _redact_log_text(self.path))
             try:
                 self._json({"error": str(e)}, 500)
             except Exception:
@@ -3527,7 +3643,7 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:
-            LOG.exception("POST %s failed", self.path)
+            LOG.exception("POST %s failed", _redact_log_text(self.path))
             try:
                 self._json({"error": str(e)}, 500)
             except Exception:
@@ -3548,7 +3664,7 @@ class Handler(BaseHTTPRequestHandler):
                 body, code = as_payload(e)
                 return self._json(body, code)
             except Exception as e:
-                LOG.exception("PUT %s failed", self.path)
+                LOG.exception("PUT %s failed", _redact_log_text(self.path))
                 return self._json({"error": str(e)}, 500)
         return self._json({"error": "not found", "path": u.path}, 404)
 
@@ -3699,6 +3815,22 @@ class Handler(BaseHTTPRequestHandler):
             except BrokenPipeError:
                 pass
 
+    def _prepare_playlist_track_path(self, p, track, quality):
+        """播放列表按单曲同样的换源策略取缓存路径，返回 (path, served_track)。"""
+        last = None
+        for candidate in PLAYBACK.stream_candidates(p, dict(track)):
+            candidate = dict(candidate)
+            candidate.setdefault("guid", track.get("guid"))
+            try:
+                path = CACHE.ensure(candidate["guid"], p, quality=quality)
+                return path, candidate
+            except Exception as exc:
+                last = exc
+                LOG.warning("playlist track %s prepare failed: %s", candidate.get("guid"), exc)
+        if last is not None:
+            raise last
+        raise RuntimeError("playlist track unavailable: %s" % track.get("guid"))
+
     def _handle_playlist(self, u, qs):
         token = ""
         if u.path.startswith("/playlist/"):
@@ -3716,6 +3848,16 @@ class Handler(BaseHTTPRequestHandler):
         item = PLAYLISTS.get(token)
         if not item or not item.get("tracks"):
             return self._json({"error": "playlist expired"}, 404)
+        if self.command == "HEAD":
+            # HEAD 只探测歌单可用性，不触发首曲下载/转码。
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
         t_playlist_start = time.monotonic()
         quality = quality or item.get("quality") or "standard"
         p = provider()
@@ -3727,9 +3869,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             start_hint = int(item.get("index", 0) or 0)
         start_index = max(0, min(start_hint, len(tracks) - 1))
+        requested_start_index = start_index
         first_path = None
         first_stream = None
         first_chunk = b""
+        first_served = None
         can_stream = (start_position == 0 and self._allow_stream() and
                       callable(getattr(p, "iter_stream", None)))
         for i in range(start_index, len(tracks)):
@@ -3738,13 +3882,29 @@ class Handler(BaseHTTPRequestHandler):
             stream = None
             try:
                 if can_stream:
-                    raw_gen = CACHE.stream(track["guid"], p, quality=quality)
-                    first_raw = next(raw_gen)
-                    stream = iter_clean_mp3_stream(itertools.chain((first_raw,), raw_gen))
-                    first_chunk = next(stream)
-                    first_stream = stream
+                    for candidate in PLAYBACK.stream_candidates(p, dict(track)):
+                        candidate = dict(candidate)
+                        candidate.setdefault("guid", track.get("guid"))
+                        raw_gen = CACHE.stream(candidate["guid"], p, quality=quality)
+                        try:
+                            first_raw = next(raw_gen)
+                            stream = iter_clean_mp3_stream(itertools.chain((first_raw,), raw_gen))
+                            first_chunk = next(stream)
+                        except Exception:
+                            try:
+                                raw_gen.close()
+                            except Exception:
+                                pass
+                            raw_gen = None
+                            stream = None
+                            continue
+                        first_stream = stream
+                        first_served = candidate
+                        break
+                    if first_stream is None:
+                        raise RuntimeError("no stream candidate")
                 else:
-                    first_path = CACHE.ensure(track["guid"], p, quality=quality)
+                    first_path, first_served = self._prepare_playlist_track_path(p, track, quality)
                 start_index = i
                 break
             except Exception as exc:
@@ -3761,8 +3921,12 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 first_stream = None
                 first_chunk = b""
+                first_served = None
         if not first_path and first_stream is None:
             return self._json({"error": "playlist tracks are unavailable"}, 502)
+        if start_index != requested_start_index:
+            # 起点曲目不可用被跳过时，旧的 start 位置属于上一首，必须从新曲目开头播放。
+            start_position = 0
         CURRENT_PLAYLISTS.set(session_key, token, start_index,
                                time.time() - start_position)
         PLAYLISTS.set_index(token, start_index, time.time() - start_position)
@@ -3777,6 +3941,9 @@ class Handler(BaseHTTPRequestHandler):
                  start_index, first_stream is not None)
         if self.command == "HEAD":
             return
+        if first_served is not None:
+            # 首播成功发送响应后，按下载音质后台补存本地库。
+            PLAYBACK.save_after_start(first_served, p)
         loop = bool(item.get("loop"))
         first_cycle = True
         try:
@@ -3817,7 +3984,9 @@ class Handler(BaseHTTPRequestHandler):
                         path = None
                     if path is None:
                         try:
-                            path = CACHE.ensure(track["guid"], p, quality=quality)
+                            path, served = self._prepare_playlist_track_path(p, track, quality)
+                            if served is not None:
+                                PLAYBACK.save_after_start(served, p)
                         except Exception as exc:
                             LOG.warning("playlist track %s skipped: %s", track.get("guid"), exc)
                             continue
@@ -3858,12 +4027,26 @@ class Handler(BaseHTTPRequestHandler):
         if not verify(guid, exp, sig, quality, start=start):
             LOG.warning("bad signature for %s", guid)
             return self._json({"error": "invalid or expired signature"}, 403)
-        _note_online_play(guid, None, quality)
+        if self.command != "HEAD":
+            # HEAD 只探测，不算一次播放；否则探测请求会触发自动下载。
+            _note_online_play(guid, None, quality)
         cached = CACHE.path(guid, quality)
         try:
-            cached_ok = os.path.exists(cached) and os.path.getsize(cached) > 1024
+            cached_ok = os.path.exists(cached) and _looks_like_audio_file(cached)
         except OSError:
             cached_ok = False
+        if self.command == "HEAD":
+            # HEAD 只做探测：缓存命中只回头，不生成/下载/转码整首。
+            if cached_ok:
+                return self._serve_file(cached)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
         if not start and not cached_ok and self._allow_stream():
             if self._serve_stream(guid, quality):
                 return
@@ -3906,21 +4089,45 @@ class Handler(BaseHTTPRequestHandler):
         p = provider()
         if not callable(getattr(p, "iter_stream", None)):
             return False
-        gen = CACHE.stream(guid, p, quality=quality)
+        track = {"guid": guid}
         try:
-            first = next(gen)
-        except StopIteration:
-            try:
-                gen.close()
-            except Exception:
-                pass
-            return False
+            info = p.track_info(guid)
+            if isinstance(info, dict):
+                track.update(info)
+            track["guid"] = guid
         except Exception as exc:
+            LOG.info("stream track_info %s failed: %s", guid, exc)
+        gen = None
+        first = None
+        served = None
+        for candidate in PLAYBACK.stream_candidates(p, track):
+            candidate = dict(candidate)
+            candidate.setdefault("guid", guid)
+            g = CACHE.stream(candidate["guid"], p, quality=quality)
             try:
-                gen.close()
-            except Exception:
-                pass
-            LOG.warning("stream prepare %s failed: %s", guid, exc)
+                chunk = next(g)
+            except StopIteration:
+                try:
+                    g.close()
+                except Exception:
+                    pass
+                continue
+            except Exception as exc:
+                try:
+                    g.close()
+                except Exception:
+                    pass
+                LOG.warning("stream prepare %s failed: %s", candidate.get("guid"), exc)
+                continue
+            if not chunk:
+                try:
+                    g.close()
+                except Exception:
+                    pass
+                continue
+            gen, first, served = g, chunk, candidate
+            break
+        if gen is None:
             return False
         try:
             self.send_response(200)
@@ -3933,7 +4140,9 @@ class Handler(BaseHTTPRequestHandler):
                 return True
             self.wfile.write(first)
             self.wfile.flush()
-            LOG.info("stream first byte %s in %.0fms", guid, (time.monotonic() - t0) * 1000.0)
+            LOG.info("stream first byte %s in %.0fms", served.get("guid"), (time.monotonic() - t0) * 1000.0)
+            # 首次播放即补存本地库（走下载音质），与边播边存语义一致。
+            PLAYBACK.save_after_start(served, p)
             for chunk in gen:
                 self.wfile.write(chunk)
                 self.wfile.flush()
@@ -4121,17 +4330,81 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class GatewayServer(ThreadingHTTPServer):
-    """默认 request_queue_size=5，多台设备同时拉流容易被拒；这里放宽到 64。"""
+    """默认 request_queue_size=5，多台设备同时拉流容易被拒；这里放宽到 64。
+
+    GW_MAX_CONNECTIONS 是活动连接硬上限，避免慢连接无限堆线程。
+    """
 
     daemon_threads = True
     request_queue_size = 64
     allow_reuse_address = True
 
 
+    max_connections = HTTP_MAX_CONNECTIONS
+
+    def __init__(self, *args, **kwargs):
+        self._conn_lock = threading.Lock()
+        self._active_connections = 0
+        self._tracked_connections = set()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        with self._conn_lock:
+            reject = self._active_connections >= self.max_connections
+            if not reject:
+                self._active_connections += 1
+                self._tracked_connections.add(id(request))
+        if reject:
+            # 注意：不能在持锁时调用 shutdown_request（其 finally 也要拿同一把锁）。
+            try:
+                request.settimeout(1.0)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._conn_lock:
+                rid = id(request)
+                if rid in self._tracked_connections:
+                    self._tracked_connections.discard(rid)
+                    self._active_connections = max(0, self._active_connections - 1)
+            raise
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            rid = id(request)
+            with self._conn_lock:
+                if rid in self._tracked_connections:
+                    self._tracked_connections.discard(rid)
+                    self._active_connections = max(0, self._active_connections - 1)
+
+
+class GatewayServerV6(GatewayServer):
+    """GW_HOST=::1 时使用 IPv6 socket；否则鉴权判定允许但绑定会失败。"""
+
+    address_family = socket.AF_INET6
+
+
 def main():
-    srv = GatewayServer((HOST, PORT), Handler)
+    bind_host = HOST
+    if MOCK and not ADMIN_TOKEN and not _host_is_loopback(bind_host):
+        # Mock 只影响 provider，不能绕过鉴权；无令牌时强制仅本机可达。
+        bind_host = "127.0.0.1"
+        LOG.warning("GW_MOCK 且未设置 GW_ADMIN_TOKEN：强制监听 127.0.0.1，避免无鉴权管理面暴露")
+    if not ADMIN_TOKEN and not _host_is_loopback(bind_host):
+        LOG.error("未设置 GW_ADMIN_TOKEN 且监听 %s：管理接口、MCP 与 WebUI 将无鉴权，拒绝启动。\n"
+                  "请设置 GW_ADMIN_TOKEN，或设置 GW_HOST=127.0.0.1 仅本机访问。", bind_host)
+        sys.exit(2)
+    server_cls = GatewayServerV6 if ":" in bind_host else GatewayServer
+    srv = server_cls((bind_host, PORT), Handler)
     LOG.info("fnmusic-gateway %s on %s:%d (mock=%s, public_base=%s, ttl=%ds, cache=%dMiB)",
-             VERSION, HOST, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
+             VERSION, bind_host, PORT, MOCK, PUBLIC_BASE or "auto", URL_TTL, CACHE_MAX // 1048576)
     if not PUBLIC_BASE:
         LOG.warning("未设置 GW_PUBLIC_BASE：直连设备会按请求 Host 推导直链；使用 MCP 接入点(wss)桥接时设备会收到容器内地址，请设置 GW_PUBLIC_BASE 为设备可访问地址")
     if not ADMIN_TOKEN:

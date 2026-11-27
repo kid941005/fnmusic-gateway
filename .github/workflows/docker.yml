@@ -20,7 +20,22 @@ env:
   DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/fnmusic-gateway
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Gateway tests
+        run: python tests/test_gateway.py -q
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -31,6 +46,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          ver=$(python -c "import gwlib; print(gwlib.__version__)")
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            want="$INPUT_TAG"
+            if [ -z "$want" ]; then
+              case "${GITHUB_REF}" in
+                refs/tags/v*) want="${GITHUB_REF_NAME}" ;;
+                *) echo "workflow_dispatch 构建必须填写 tag，或选择 v* tag"; exit 1 ;;
+              esac
+            fi
+            case "$want" in v*) ;; *) want="v$want" ;; esac
+          else
+            want="${GITHUB_REF_NAME}"
+          fi
+          test "$want" = "v$ver" || { echo "tag $want != package version $ver"; exit 1; }
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -71,7 +106,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

@@ -5,8 +5,10 @@
 
 覆盖：签名/直链、纯函数、MCP JSON-RPC、REST、Range 下载、参数校验。
 """
+import asyncio
 import gc
 import http.client
+import io
 import json
 import os
 import shutil
@@ -16,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 import weakref
@@ -33,6 +36,7 @@ import app  # noqa: E402
 import fnmusic_client  # noqa: E402
 import gwlib.sources as gw_sources  # noqa: E402
 import gwlib.storage as gw_storage  # noqa: E402
+import gwlib.resume as gwlib_resume  # noqa: E402
 import gwlib.config as gw_config  # noqa: E402
 try:
     import gwlib.musicdl_core as gw_musicdl_core  # noqa: E402
@@ -73,6 +77,123 @@ class Base(unittest.TestCase):
             return r, json.loads(data.decode("utf-8")) if data else {}
         except Exception:
             return r, data
+
+
+class TestStartupSecurity(unittest.TestCase):
+    def test_loopback_detection(self):
+        self.assertTrue(app._host_is_loopback("127.0.0.1"))
+        self.assertTrue(app._host_is_loopback("localhost"))
+        self.assertTrue(app._host_is_loopback("[::1]"))
+        self.assertFalse(app._host_is_loopback("0.0.0.0"))
+        self.assertFalse(app._host_is_loopback("192.168.1.10"))
+
+    def test_access_log_redacts_sensitive_query(self):
+        text = app._redact_log_text('GET /?token=abc&q=1&key=k1&sig=s1&password=pw HTTP/1.1')
+        self.assertIn("token=***", text)
+        self.assertIn("key=***", text)
+        self.assertIn("sig=***", text)
+        self.assertIn("password=***", text)
+        self.assertIn("q=1", text)
+        self.assertNotIn("abc", text)
+        encoded = app._redact_log_text('GET /?%74oken=TOP-SECRET HTTP/1.1')
+        self.assertNotIn("TOP-SECRET", encoded)
+        self.assertIn("token=***", encoded)
+
+    def test_docker_workflow_requires_tests_and_version_match(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, ".github", "workflows", "docker.yml"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("needs: test", text)
+        self.assertIn("Verify tag matches package version", text)
+        self.assertIn("gwlib.__version__", text)
+        self.assertIn("!contains(github.ref_name, '-')", text)
+
+    def test_bridge_session_namespace_uses_serial_number(self):
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "gw_bridge_pipe", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                             "bridge", "mcp_pipe_http.py"))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "music_next", "arguments": {}, "serialNumber": "AA:BB:CC"}}
+        self.assertEqual(mod._session_hint(msg), "AA:BB:CC")
+        self.assertEqual(mod.device_session("bridge-x", msg), "bridge-x:AA:BB:CC")
+        self.assertEqual(mod.device_session("bridge-x", {"jsonrpc": "2.0", "id": 2}), "bridge-x")
+        self.assertEqual(mod.device_session("bridge-x", {"jsonrpc": "2.0", "id": 3,
+                                                       "params": {"serialNumber": "AA:BB:CC"}}),
+                         "bridge-x:AA:BB:CC")
+        mixed = {"jsonrpc": "2.0", "id": 4, "session_id": "shared-conn",
+                 "params": {"serialNumber": "AA:BB:CC"}}
+        self.assertEqual(mod._session_hint(mixed), "AA:BB:CC")
+
+    def test_examples_and_client_carry_admin_token(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "examples", "xiaozhi_plugin_fnmusic_gw.py"), encoding="utf-8") as fh:
+            plugin = fh.read()
+        self.assertIn("FNMUSIC_GW_TOKEN", plugin)
+        self.assertIn("X-Admin-Token", plugin)
+        with open(os.path.join(root, "examples", "mcp_server_settings.snippet.json"), encoding="utf-8") as fh:
+            snippet = fh.read()
+        self.assertIn("X-Admin-Token", snippet)
+        with open(os.path.join(root, "tests", "mcp_client_check.py"), encoding="utf-8") as fh:
+            client = fh.read()
+        self.assertIn("GW_ADMIN_TOKEN", client)
+        self.assertIn("X-Admin-Token", client)
+
+    def test_server_has_timeout_and_connection_cap(self):
+        self.assertEqual(app.Handler.timeout, app.HTTP_TIMEOUT)
+        self.assertGreaterEqual(app.HTTP_TIMEOUT, 5)
+        self.assertEqual(app.GatewayServer.max_connections, app.HTTP_MAX_CONNECTIONS)
+        self.assertGreaterEqual(app.HTTP_MAX_CONNECTIONS, 8)
+
+    def test_connection_limit_reject_does_not_deadlock(self):
+        class FakeRequest:
+            def __init__(self):
+                self.timeout = None
+                self.sent = []
+                self.closed = False
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def sendall(self, data):
+                self.sent.append(bytes(data))
+
+            def shutdown(self, *_args):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        srv = app.GatewayServer(("127.0.0.1", 0), app.Handler)
+        srv.max_connections = 0
+        req = FakeRequest()
+        t = threading.Thread(target=srv.process_request, args=(req, ("127.0.0.1", 1)), daemon=True)
+        try:
+            t.start()
+            t.join(2.0)
+            self.assertFalse(t.is_alive(), "连接数拒绝路径发生死锁")
+            self.assertEqual(srv._active_connections, 0)
+            self.assertTrue(any(b"503" in chunk for chunk in req.sent))
+            self.assertTrue(req.closed)
+        finally:
+            srv.server_close()
+
+    def test_main_refuses_non_loopback_without_token(self):
+        with mock.patch.multiple(app, ADMIN_TOKEN="", MOCK=False, HOST="0.0.0.0"), \
+                mock.patch.object(app, "GatewayServer") as srv:
+            with self.assertRaises(SystemExit) as cm:
+                app.main()
+        self.assertEqual(cm.exception.code, 2)
+        srv.assert_not_called()
+
+    def test_mock_without_token_forced_to_loopback(self):
+        with mock.patch.multiple(app, ADMIN_TOKEN="", MOCK=True, HOST="0.0.0.0"), \
+                mock.patch.object(app, "GatewayServer") as srv:
+            app.main()
+        srv.assert_called_once()
+        self.assertEqual(srv.call_args[0][0][0], "127.0.0.1")
 
 
 class TestAdminToken(Base):
@@ -237,7 +358,8 @@ class TestHttp(Base):
         self.assertTrue(d["mock"])
         self.assertEqual(d["mode"], "mock")
         self.assertIn("mcp_server", d)
-        self.assertEqual(d["mcp_server"]["engine"], "mcp>=2.3")
+        expect_engine = "mcp>=2.3" if app.MCP_SERVICE.available else "json-rpc-fallback"
+        self.assertEqual(d["mcp_server"]["engine"], expect_engine)
 
     def test_readyz(self):
         r, d = self.req("GET", "/readyz")
@@ -266,6 +388,26 @@ class TestHttp(Base):
         r3, part = self.req("GET", "/" + path, headers={"Range": "bytes=0-99"}, raw=True)
         self.assertEqual(r3.status, 206)
         self.assertEqual(len(part), 100)
+
+    def test_head_play_does_not_download(self):
+        url = app.make_url("http://127.0.0.1:%d" % self.port,
+                           "mock-head-probe", quality="standard")
+        path = url.split("://", 1)[1].split("/", 1)[1]
+        with mock.patch.object(app.CACHE, "ensure", side_effect=AssertionError("HEAD must not download")):
+            r, body = self.req("HEAD", "/" + path, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.getheader("Content-Type"), "audio/mpeg")
+        self.assertEqual(body, b"")
+
+    def test_head_playlist_does_not_download(self):
+        out = app.call_tool("music_play", {"playlist": "睡前"}, "http://h")
+        url = [ln for ln in out.splitlines() if "http" in ln][0].split("：")[-1]
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path + ("?" + parsed.query if parsed.query else "")
+        with mock.patch.object(app.CACHE, "ensure", side_effect=AssertionError("HEAD must not download")):
+            r, body = self.req("HEAD", path, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body, b"")
 
     def test_playlist_stream(self):
         out = app.call_tool("music_play", {"playlist": "睡前"}, "http://h")
@@ -470,6 +612,84 @@ class TestCache(Base):
         left = [n for n in os.listdir(app.CACHE_DIR) if not n.endswith(".mp3")]
         self.assertEqual(left, [])
         self.assertEqual(app.CACHE.ensure("mock-1", p), path)  # 命中缓存
+
+    def test_cache_stream_hard_timeout(self):
+        import io
+        import wave
+        buf = io.BytesIO()
+        w = wave.open(buf, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(b"\x00\x00" * 8000)
+        w.close()
+        data = buf.getvalue()
+
+        class Slow:
+            def iter_stream(self, guid, quality=None):
+                def gen():
+                    yield data
+                    time.sleep(5)
+                return "audio/wav", gen()
+
+        d = tempfile.mkdtemp(prefix="gw-timeout-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        started = time.time()
+        with self.assertRaises(gw_storage.StorageError):
+            for _ in cache.stream("slow", Slow(), quality="high", timeout=0.2):
+                pass
+        self.assertLess(time.time() - started, 2.5)
+
+    def test_cache_stream_standard_passthrough_idle_timeout(self):
+        class Slow:
+            def iter_stream(self, guid, quality=None):
+                def gen():
+                    yield b"\xff\xfb" + b"x" * 4096
+                    time.sleep(5)
+                return "audio/mpeg", gen()
+
+        d = tempfile.mkdtemp(prefix="gw-timeout-std-", dir=DATA)
+        cache = gw_storage.MediaCache(d, 10 * 1024 * 1024)
+        started = time.time()
+        with self.assertRaises(gw_storage.StorageError):
+            for _ in cache.stream("slow-std", Slow(), quality="standard", timeout=0.2):
+                pass
+        self.assertLess(time.time() - started, 2.5)
+
+    def test_cache_rejects_non_audio_cache_entry(self):
+        d = tempfile.mkdtemp(prefix="gw-invalid-", dir=DATA)
+        bad = os.path.join(d, "bad.mp3")
+        with open(bad, "wb") as fh:
+            fh.write(b"<!DOCTYPE html>" + b"x" * 4096)
+        self.assertFalse(gw_storage._looks_like_audio_file(bad))
+        good = os.path.join(d, "good.mp3")
+        with open(good, "wb") as fh:
+            fh.write(b"ID3" + b"\x00" * 4096)
+        self.assertTrue(gw_storage._looks_like_audio_file(good))
+        self.assertFalse(gw_storage._looks_like_mp3_bytes(b"<html>" + b"x" * 64, "audio/mpeg"))
+        self.assertTrue(gw_storage._looks_like_mp3_bytes(b"ID3" + b"x" * 64, "text/html"))
+        self.assertFalse(gw_storage._mp3_header(b"ID3"))
+        short = os.path.join(d, "short.mp3")
+        with open(short, "wb") as fh:
+            fh.write(b"ID3")
+        self.assertFalse(gw_storage._looks_like_audio_file(short))
+
+    def test_timed_stream_iterator_closes_pump_thread(self):
+        class FastSource:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return b"x" * 1024
+
+            def close(self):
+                pass
+
+        it = gw_storage._TimedStreamIterator(FastSource(), 0.2, "fast")
+        self.assertEqual(next(it), b"x" * 1024)
+        it.close()
+        time.sleep(0.1)
+        self.assertFalse(it._thread.is_alive())
 
 
 class TestHome(Base):
@@ -776,7 +996,7 @@ class TestFnSettings(Base):
                            headers=self._h())
         self.assertEqual(r.status, 200)
         self.assertFalse(body["insecure_tls"])
-        self.assertNotIn("insecure_tls", app.FNOS_CONFIG.section("fnos"))
+        self.assertEqual(app.FNOS_CONFIG.section("fnos").get("insecure_tls"), "0")
 
     def test_settings_online_roundtrip(self):
         r, body = self.req("PUT", "/api/settings/online",
@@ -1523,6 +1743,34 @@ class TestExtProviderHttp(unittest.TestCase):
         self.assertGreater(n, 100)
 
 
+class TestFnTokenBinding(unittest.TestCase):
+    def test_token_bound_to_base_user_device_and_password(self):
+        d = tempfile.mkdtemp(prefix="gw-fntoken-", dir=DATA)
+        tf = os.path.join(d, "token.json")
+        base = "http://fnos.local:5666"
+        with open(tf, "w", encoding="utf-8") as fh:
+            json.dump({"base": base, "username": "A", "token": "tok",
+                       "deviceId": "dev1", "credVersion": ""}, fh)
+        same = fnmusic_client.FnMusicClient(base=base, username="A", device_id="dev1", token_file=tf)
+        self.assertEqual(same.token, "tok")
+        other_user = fnmusic_client.FnMusicClient(base=base, username="B", device_id="dev1", token_file=tf)
+        self.assertIsNone(other_user.token)
+        other_dev = fnmusic_client.FnMusicClient(base=base, username="A", device_id="dev2", token_file=tf)
+        self.assertIsNone(other_dev.token)
+
+    def test_password_change_invalidates_cached_token(self):
+        d = tempfile.mkdtemp(prefix="gw-fntoken-", dir=DATA)
+        tf = os.path.join(d, "token.json")
+        base = "http://fnos.local:5666"
+        c1 = fnmusic_client.FnMusicClient(base=base, username="KID", password="old", device_id="dev1", token_file=tf)
+        c1.token = "tok"
+        c1._save_token()
+        again = fnmusic_client.FnMusicClient(base=base, username="KID", password="old", device_id="dev1", token_file=tf)
+        self.assertEqual(again.token, "tok")
+        changed = fnmusic_client.FnMusicClient(base=base, username="KID", password="new", device_id="dev1", token_file=tf)
+        self.assertIsNone(changed.token)
+
+
 class TestFnMusicInvalidToken(unittest.TestCase):
     """飞牛 token 失效时 HTTP 200 + code=99999 也要自动重登录并重试。"""
 
@@ -1748,6 +1996,26 @@ class TestV2Playback(unittest.TestCase):
             self._Provider(), "http://h", wait=False)
         self.assertTrue(info["preparing"])
         self.assertTrue(info["url"].startswith("http://x/play/"))
+
+    def test_fast_prepare_failover_and_saves_first_play(self):
+        cache = self._Cache(fail_first=True)
+        lib = self._Library()
+        info = self._svc(cache=cache, library=lib).prepare(
+            {"guid": "ext:musicdl:bad", "title": "晴天", "artist": "周杰伦", "source": "musicdl"},
+            self._Provider(), "http://h", wait=False)
+        self.assertTrue(info["saving"])
+        deadline = time.time() + 2
+        while time.time() < deadline and not lib.saved:
+            time.sleep(0.02)
+        self.assertEqual(lib.saved, [("ext:musicdl:good", "lossless")])
+        self.assertEqual(cache.calls[0][0], "ext:musicdl:bad")
+        self.assertEqual(cache.calls[-1][0], "ext:musicdl:good")
+
+    def test_stream_candidates_switch_source(self):
+        svc = self._svc()
+        rows = svc.stream_candidates(self._Provider(),
+                                     {"guid": "ext:musicdl:bad", "title": "晴天", "artist": "周杰伦"})
+        self.assertEqual([r.get("guid") for r in rows], ["ext:musicdl:bad", "ext:musicdl:good"])
 
     def test_failover_reselects_source(self):
         cache = self._Cache(fail_first=True)
@@ -2232,8 +2500,8 @@ class TestOptim2135(unittest.TestCase):
     def test_evict_never_removes_protected_file(self):
         d = tempfile.mkdtemp(prefix="gw-protect-", dir=DATA)
         cache = gw_storage.MediaCache(d, 120)
-        keep = os.path.join(d, "keep.mp3")
-        drop = os.path.join(d, "drop.mp3")
+        keep = os.path.join(d, "a" * 40 + ".mp3")
+        drop = os.path.join(d, "b" * 40 + ".mp3")
         for fp in (keep, drop):
             with open(fp, "wb") as fh:
                 fh.write(b"x" * 100)
@@ -2371,6 +2639,45 @@ class TestLibraryStoreDownloadOnly(unittest.TestCase):
         self.assertFalse(hasattr(self.store, "list_all"))
         self.assertFalse(hasattr(self.store, "iter_stream"))
 
+    def test_save_from_provider_transcodes_non_lossless(self):
+        from unittest import mock
+
+        class P:
+            def stream_to_path(self, guid, path, quality=None):
+                with open(path, "wb") as fh:
+                    fh.write(b"RIFF" + b"\x00" * 100)
+                return "audio/wav", 104
+
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            with open(cmd[-1], "wb") as fh:
+                fh.write(b"ID3" + b"M" * 64)
+
+            class R:
+                returncode = 0
+                stderr = b""
+            return R()
+
+        with mock.patch.object(gw_storage.subprocess, "run", side_effect=fake_run):
+            fp, size = self.store.save_from_provider(
+                P(), {"guid": "ext:x:q", "title": "t", "artist": "a"}, quality="high")
+        self.assertTrue(fp.endswith(".mp3"))
+        self.assertEqual(size, 67)
+        self.assertIn("-b:a", seen[0])
+        self.assertIn("192k", seen[0])
+
+    def test_same_title_artist_different_guid_does_not_overwrite(self):
+        t1 = {"guid": "ext:a:1", "title": "晴天", "artist": "周杰伦"}
+        t2 = {"guid": "ext:b:2", "title": "晴天", "artist": "周杰伦"}
+        p1, _ = self.store.save_bytes(t1, "audio/mpeg", b"ID3" + b"A" * 64)
+        p2, _ = self.store.save_bytes(t2, "audio/mpeg", b"ID3" + b"B" * 64)
+        self.assertNotEqual(p1, p2)
+        with open(p1, "rb") as fh:
+            self.assertTrue(fh.read().endswith(b"A" * 64))
+        p1b, _ = self.store.save_bytes(t1, "audio/mpeg", b"ID3" + b"C" * 64)
+        self.assertEqual(p1, p1b)
 
 
 class TestLibraryScanAfterDownload(unittest.TestCase):
@@ -2419,13 +2726,14 @@ class TestLibraryScanAfterDownload(unittest.TestCase):
 class TestBuiltInLibraryScan(unittest.TestCase):
     """下载后默认调用已配置的飞牛音乐接口扫库，不需要额外扫描地址。"""
 
-    def test_client_scans_first_shared_library_guid(self):
+    def test_client_scans_all_shared_library_guids(self):
         client = fnmusic_client.FnMusicClient(base="http://fnos.local:5666")
         client.get = lambda path, **kwargs: {"list": [{"guid": "lib-1"}, {"guid": "lib-2"}]}
         calls = []
         client.post = lambda path, body=None, **kwargs: calls.append((path, body))
         self.assertTrue(client.scan_library())
-        self.assertEqual(calls, [("/shared-library/scan", {"guid": "lib-1"})])
+        self.assertEqual(calls, [("/shared-library/scan", {"guid": "lib-1"}),
+                                 ("/shared-library/scan", {"guid": "lib-2"})])
 
     def test_client_falls_back_to_scan_all_without_guid(self):
         client = fnmusic_client.FnMusicClient(base="http://fnos.local:5666")
@@ -2563,7 +2871,7 @@ class TestRelease201(unittest.TestCase):
 
     def test_single_version_constant(self):
         import gwlib
-        self.assertEqual(app.VERSION, "2.13.17")
+        self.assertEqual(app.VERSION, "2.13.18")
         self.assertEqual(gw_sources.VERSION, app.VERSION)
         self.assertEqual(gwlib.__version__, app.VERSION)
 
@@ -2871,6 +3179,35 @@ class TestStreamingPlayback(Base):
         self.assertIsNone(r.getheader("Content-Length"))
         self.assertEqual(data, b"".join(Fake.chunks))
 
+    def test_playlist_skips_unavailable_first_track_and_resets_start(self):
+        from unittest import mock
+        tracks = [
+            {"guid": "ext:test:skip-1", "title": "A", "artist": "a"},
+            {"guid": "ext:test:skip-2", "title": "B", "artist": "b"},
+        ]
+        token = app.PLAYLISTS.put(tracks, quality="standard")
+        url = app.make_playlist_url("", token, ttl=app.URL_TTL, quality="standard", start=180)
+
+        class Fake:
+            def iter_stream(self, guid, quality=None):
+                if guid == "ext:test:skip-1":
+                    raise RuntimeError("first unavailable")
+                return "audio/mpeg", iter([b"\xff\xfb" + b"q" * 2048])
+
+            def stream(self, guid, quality=None):
+                if guid == "ext:test:skip-1":
+                    raise RuntimeError("first unavailable")
+                return "audio/mpeg", b"\xff\xfb" + b"q" * 2048
+
+        started = time.time()
+        with mock.patch.object(app, "provider", return_value=Fake()):
+            r, data = self.req("GET", url, raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertTrue(data.startswith(b"\xff\xfb"))
+        item = app.PLAYLISTS.get(token)
+        self.assertEqual(item["index"], 1)
+        self.assertLess(abs(item["started_at"] - started), 30)
+
     def test_playlist_streams_first_track_without_content_length(self):
         from unittest import mock
         tracks = [
@@ -2889,6 +3226,86 @@ class TestStreamingPlayback(Base):
         self.assertEqual(r.status, 200)
         self.assertIsNone(r.getheader("Content-Length"))
         self.assertTrue(data.startswith(b"\xff\xfb"))
+
+
+class TestHardeningRegression(unittest.TestCase):
+    """P2/P3 加固回归：请求 deadline/header 上限、缓存文件识别、续播坏记录、桥接错误。"""
+
+    def test_limited_request_reader_header_deadline_and_cap(self):
+        reader = app._LimitedRequestReader(io.BytesIO(b"GET / HTTP/1.1\r\n"),
+                                           time.monotonic() - 1, 1024)
+        with self.assertRaises(app._RequestTooSlow):
+            reader.readline()
+
+        class Flood:
+            def readline(self, limit=-1):
+                return b"X-A: b\r\n"
+
+        reader = app._LimitedRequestReader(Flood(), time.monotonic() + 5, 10)
+        with self.assertRaises(app._RequestTooSlow):
+            for _ in range(3):
+                reader.readline()
+
+    def test_cache_file_filter_ignores_user_music(self):
+        self.assertFalse(gw_storage._is_cache_name("user-song.mp3"))
+        self.assertTrue(gw_storage._is_cache_name("a" * 40 + ".mp3"))
+        self.assertTrue(gw_storage._is_cache_aux("a" * 40 + ".mp3.src"))
+        self.assertTrue(gw_storage._is_cache_name("a" * 40 + ".resume-120.mp3"))
+        self.assertTrue(gw_storage._is_cache_aux("a" * 40 + ".resume-120.mp3.part"))
+        self.assertFalse(gw_storage._is_cache_aux("user.mp3.src"))
+
+    def test_download_ext_sniffs_octet_stream(self):
+        self.assertEqual(
+            gw_storage.LibraryStore._ext_for_bytes("application/octet-stream",
+                                                    b"\xff\xfb" + b"0" * 20), ".mp3")
+        self.assertEqual(
+            gw_storage.LibraryStore._ext_for_bytes("application/octet-stream",
+                                                    b"fLaC" + b"0" * 20), ".flac")
+
+    def test_library_has_track_skips_duplicate_async_save(self):
+        directory = tempfile.mkdtemp(prefix="gw-lib-has-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        lib = gw_storage.LibraryStore(lambda: directory)
+        track = {"guid": "ext:test:dedupe", "title": "晴天", "artist": "周杰伦"}
+        fp = lib.target_path(track, ".mp3")
+        with open(fp, "wb") as fh:
+            fh.write(b"\xff\xfb" + b"0" * 100)
+        self.assertTrue(lib.has_track(track))
+
+        class P:
+            def stream_to_path(self, guid, path, quality=None):
+                raise AssertionError("不应重复下载")
+
+        self.assertFalse(lib.save_async(P(), track, "standard"))
+
+    def test_resume_store_ignores_malformed_records(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="gw-resume-"), "resume.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"bad": 123, "good": {"updated_at": time.time(), "position": 7}}, fh)
+        store = gwlib_resume.ResumeStore(path)
+        self.assertIsNone(store.get("bad"))
+        self.assertEqual(store.get("good")["position"], 7)
+        store.set("new", {"position": 3})
+        self.assertEqual(store.get("new")["position"], 3)
+
+    def test_explicit_tls_off_beats_env_flag(self):
+        class FakeCfg:
+            def section(self, _name):
+                return {"base": "http://nas:5666", "username": "u", "密码": "p",
+                        "device_id": "", "insecure_tls": "0"}
+
+        with mock.patch.object(app, "FNOS_CONFIG", FakeCfg()), \
+                mock.patch.dict(os.environ, {"GW_FNOS_INSECURE_TLS": "1"}):
+            self.assertFalse(app.fnos_settings()["insecure_tls"])
+
+    def test_bridge_jsonrpc_error_and_invalid_json(self):
+        import bridge.mcp_pipe_http as bridge
+        err = bridge._jsonrpc_error_for(
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/call"}', "boom")
+        self.assertEqual(err["id"], 7)
+        self.assertEqual(err["error"]["code"], -32603)
+        reply = asyncio.run(bridge.forward("{not json"))
+        self.assertEqual(json.loads(reply)["error"]["code"], -32700)
 
 
 if __name__ == "__main__":

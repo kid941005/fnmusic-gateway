@@ -12,6 +12,7 @@ standard 音质 + MP3 源时 ensure 与 stream 都不会触发 ffmpeg，比较�
 import argparse
 import concurrent.futures
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -62,6 +63,7 @@ def one_run(chunks, delay):
         streamed += len(block)
     stream_full_ms = (time.monotonic() - t0) * 1000.0
     cached_bytes = os.path.getsize(cache.path("bench:stream", "standard"))
+    shutil.rmtree(root, ignore_errors=True)
     return {
         "chunks": chunks,
         "chunk_kb": len(CHUNK) // 1024,

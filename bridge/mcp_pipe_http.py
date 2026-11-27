@@ -70,9 +70,8 @@ def mask_url(url: str) -> str:
     """日志里隐藏 token。"""
     if "token=" not in url:
         return url
-    head, _, tail = url.partition("token=")
-    keep = tail[:4]
-    return head + "token=" + keep + "***"
+    head, _, _tail = url.partition("token=")
+    return head + "token=***"
 
 
 def _headers(session=""):
@@ -98,12 +97,37 @@ def _session_hint(msg):
             continue
         params = item.get("params") if isinstance(item.get("params"), dict) else {}
         meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-        for source in (item, meta, params):
-            for key in ("session_id", "sessionId", "device_id", "deviceId"):
+        sources = (item, meta, params)
+        # 设备序列号优先于共享 session_id（跨 item/meta/params 全局优先），避免多设备串游标。
+        for key in ("serialNumber", "serial_number", "serial"):
+            for source in sources:
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
-                    return value.strip()
+                    return value.strip()[:128]
+        for key in ("device_id", "deviceId", "session_id", "sessionId"):
+            for source in sources:
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:128]
     return ""
+
+
+def device_session(base, msg):
+    """把连接级会话与设备序列号拼成命名空间，避免同一 WS 下多设备串游标。"""
+    hint = _session_hint(msg)
+    return base + (":" + hint if hint else "")
+
+
+def _jsonrpc_error_for(payload, message):
+    """HTTP 4xx/5xx 不是 JSON-RPC 响应：按原请求 id 包装成标准错误，避免接入点等不到回包。"""
+    try:
+        msg = json.loads(payload.decode("utf-8", "replace"))
+    except Exception:
+        msg = None
+    items = msg if isinstance(msg, list) else [msg]
+    errs = [{"jsonrpc": "2.0", "id": item.get("id") if isinstance(item, dict) else None,
+             "error": {"code": -32603, "message": message}} for item in items]
+    return errs if isinstance(msg, list) else errs[0]
 
 
 def _post_sync(payload: bytes, session=""):
@@ -122,6 +146,10 @@ def _post_sync(payload: bytes, session=""):
     except urllib.error.HTTPError as e:          # 4xx/5xx 也要把 body 读出来
         ctype = (e.headers.get("Content-Type") or "").lower() if e.headers else ""
         body = e.read() or b""
+        if e.code >= 400:
+            detail = body.decode("utf-8", "replace")[:160]
+            LOG.warning("gateway HTTP %s: %s", e.code, detail)
+            return _jsonrpc_error_for(payload, "fnmusic-gateway HTTP %s" % e.code)
     except Exception as e:                        # 连不上 / 超时
         LOG.warning("gateway request failed: %s", e)
         return None
@@ -149,9 +177,12 @@ async def forward(raw: str, session: str = ""):
         msg = json.loads(raw)
     except Exception:
         LOG.warning("ignore non-json frame: %s", raw[:120])
-        return None
+        return json.dumps({"jsonrpc": "2.0", "id": None,
+                           "error": {"code": -32700, "message": "invalid JSON"}},
+                          ensure_ascii=False)
 
-    session = _session_hint(msg) or str(session or "").strip()
+    if not str(session or "").strip():
+        session = _session_hint(msg)
     batch = msg if isinstance(msg, list) else [msg]
     requests = [m for m in batch if isinstance(m, dict) and m.get("id") is not None]
     if not requests:
@@ -191,8 +222,10 @@ async def serve():
     import websockets
 
     if not ENDPOINT:
-        LOG.error("MCP_ENDPOINT 未设置，例如 wss://host:59826/mcp_endpoint/mcp/?token=xxx")
-        sys.exit(2)
+        # 没有配置接入点时保持容器存活，而不是 sys.exit(2) 让 Docker 无限重启。
+        LOG.warning("MCP_ENDPOINT 未设置，桥接器空闲；配置后重启即可连接")
+        while True:
+            await asyncio.sleep(3600)
     if not GW_PUBLIC_BASE:
         LOG.error("GW_PUBLIC_BASE 未设置：桥接模式下设备直链会指向容器内地址，请设置为设备可访问的公网/局域网地址后重启")
         sys.exit(2)
@@ -203,7 +236,8 @@ async def serve():
     while True:
         try:
             async with websockets.connect(
-                ENDPOINT, ping_interval=20, ping_timeout=20, max_size=None
+                ENDPOINT, ping_interval=20, ping_timeout=20,
+                max_size=4 * 1024 * 1024,
             ) as ws:
                 conn_session = "bridge-" + uuid.uuid4().hex
                 LOG.info("接入点已连接（并发上限 %d，会话 %s）", GW_CONCURRENCY, conn_session)
@@ -213,8 +247,13 @@ async def serve():
                 pending = set()
 
                 async def handle(raw_text):
+                    try:
+                        parsed = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
+                    except Exception:
+                        parsed = {}
+                    session = device_session(conn_session, parsed if isinstance(parsed, (dict, list)) else {})
                     async with slots:
-                        reply = await forward(raw_text, session=conn_session)
+                        reply = await forward(raw_text, session=session)
                     if reply:
                         async with send_lock:
                             await ws.send(reply)
@@ -225,9 +264,13 @@ async def serve():
                         LOG.warning("转发任务失败: %s", task.exception())
 
                 try:
+                    max_pending = max(8, GW_CONCURRENCY * 4)
                     async for raw in ws:
                         if isinstance(raw, (bytes, bytearray)):
                             raw = raw.decode("utf-8", "replace")
+                        # 帧潮涌时给 WS 读取施加背压，避免 create_task 无界堆积。
+                        while len(pending) >= max_pending:
+                            await asyncio.sleep(0.01)
                         task = asyncio.create_task(handle(raw))
                         pending.add(task)
                         task.add_done_callback(_done)

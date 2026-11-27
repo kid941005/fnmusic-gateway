@@ -56,26 +56,60 @@ def _call_stream_to_path(provider, guid, path, quality=None):
     return fn(guid, path, quality=quality) if _accepts_quality(fn) else fn(guid, path)
 
 
+def _mp3_header(head):
+    head = bytes(head or b"")
+    if head[:3] == b"ID3":
+        return len(head) >= 10  # 真正的 ID3 头至少 10 字节，拒绝 3 字节假标签
+    return len(head) >= 2 and head[0] == 0xFF and head[1] in (0xFB, 0xF3, 0xF2, 0xF1, 0xF9)
+
+
 def _looks_like_mp3(path, content_type=""):
-    """标准音质下，源本身就是 MP3 时直接复用，省掉一次 ffmpeg 转码。"""
-    ctype = (content_type or "").lower()
-    if "audio/mpeg" in ctype or "audio/mp3" in ctype or "mpeg" in ctype:
-        return True
+    """标准音质下，源本身就是 MP3 时直接复用；必须 sniff 字节，不能只信 Content-Type。"""
     try:
         with open(path, "rb") as fh:
-            head = fh.read(4)
+            head = fh.read(16)
     except OSError:
         return False
-    return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] in (0xFB, 0xF3, 0xF2))
+    return _mp3_header(head)
+
+
+def _looks_like_audio_file(path):
+    """缓存命中前的轻量完整性校验：拒绝 HTML/JSON/全零等假音频。"""
+    try:
+        if os.path.getsize(path) <= 1024:
+            return False
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return False
+    if not head or head[:1] in (b"<", b"{", b"["):
+        return False
+    # 缓存路径固定为 .mp3，必须真的是 MP3；不要接受 FLAC/Ogg/MP4 冒充。
+    if str(path).lower().endswith(".mp3"):
+        return _mp3_header(head)
+    if _mp3_header(head):
+        return True
+    if head[:4] == b"fLaC" or head[:4] == b"OggS" or head[:4] == b"MAC ":
+        return True
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return True
+    if head[4:8] == b"ftyp":
+        return True
+    return False
 
 
 def _looks_like_mp3_bytes(data, content_type=""):
-    """流式首块嗅探：Content-Type 或前几个字节是 MP3 时可直接透传。"""
-    ctype = (content_type or "").lower()
-    if "audio/mpeg" in ctype or "audio/mp3" in ctype or "mpeg" in ctype:
-        return True
-    head = bytes(data or b"")[:4]
-    return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] in (0xFB, 0xF3, 0xF2))
+    """流式首块嗅探：只看真实字节，避免错误页被当成 MP3。"""
+    return _mp3_header(bytes(data or b"")[:16])
+
+
+def _is_cache_name(name):
+    """缓存文件固定为 40 位 sha1（可带 .resume-N）+ .mp3；不要误删用户音乐。"""
+    return bool(re.match(r"^[0-9a-f]{40}(?:\.resume-\d+)?\.mp3$", str(name or "")))
+
+
+def _is_cache_aux(name):
+    return bool(re.match(r"^[0-9a-f]{40}(?:\.resume-\d+)?\.mp3(?:\..*)?$", str(name or "")))
 
 
 def _call_iter_stream(provider, guid, quality=None):
@@ -84,6 +118,73 @@ def _call_iter_stream(provider, guid, quality=None):
     if not callable(fn):
         return None
     return fn(guid, quality=quality) if _accepts_quality(fn) else fn(guid)
+
+
+class _TimedStreamIterator:
+    """给可能永久阻塞的迭代器套一层空闲超时，避免无限占住播放线程/缓存锁。"""
+
+    _END = object()
+
+    def __init__(self, source, timeout, label):
+        self._source = source
+        self._timeout = max(0.1, float(timeout or 1.0))
+        self._label = label
+        self._queue = queue.Queue(maxsize=8)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._pump, daemon=True,
+                                        name="cache-stream-source")
+        self._thread.start()
+
+    def _pump(self):
+        try:
+            for item in self._source:
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(("item", item), timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+                if self._stop.is_set():
+                    return
+            if not self._stop.is_set():
+                try:
+                    self._queue.put(("end", None), timeout=0.5)
+                except queue.Full:
+                    pass
+        except BaseException as exc:  # noqa: BLE001
+            if not self._stop.is_set():
+                try:
+                    self._queue.put(("error", exc), timeout=0.5)
+                except queue.Full:
+                    pass
+
+    def __iter__(self):
+        return self
+
+    def close(self):
+        self._stop.set()
+        try:
+            close = getattr(self._source, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
+
+    def __next__(self):
+        try:
+            kind, value = self._queue.get(timeout=self._timeout)
+        except queue.Empty:
+            self.close()
+            raise StorageError("音频流超时: %s" % self._label)
+        if kind == "item":
+            return value
+        if kind == "error":
+            self.close()
+            raise value
+        self.close()
+        raise StopIteration
 
 
 def audio_seconds(path):
@@ -176,7 +277,7 @@ class MediaCache:
     def _cleanup_stale(self):
         try:
             for name in os.listdir(self.dir):
-                if name.endswith(".part") or ".src" in name:
+                if _is_cache_aux(name) and (name.endswith(".part") or ".src" in name):
                     try:
                         os.remove(os.path.join(self.dir, name))
                     except OSError:
@@ -197,13 +298,17 @@ class MediaCache:
         profile = get_profile(quality)
         dst = self.path(guid, profile["name"])
         try:
-            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            if _looks_like_audio_file(dst):
                 return dst
         except OSError:
             pass
         key = os.path.basename(dst)
         now = time.time()
         with self._prefetch_guard:
+            if len(self._prefetch_failed) > 256:
+                self._prefetch_failed = {
+                    k: v for k, v in self._prefetch_failed.items()
+                    if now - v[0] < v[1]}
             failed = self._prefetch_failed.get(key)
             if failed and now - failed[0] < failed[1]:
                 return dst
@@ -263,18 +368,18 @@ class MediaCache:
     def ensure(self, guid, provider, timeout=180, quality=None, prefetch=False):
         profile = get_profile(quality)
         dst = self.path(guid, profile["name"])
-        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+        if _looks_like_audio_file(dst):
             return dst
         with self._lock(os.path.basename(dst)):
-            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            if _looks_like_audio_file(dst):
                 return dst
             src = dst + ".src"
             tmp = dst + ".part"
             try:
                 # 直接流式落盘到临时源文件，避免整首 FLAC/MP3 读进内存
                 ctype, _ = _call_stream_to_path(provider, guid, src, profile["name"])
-                if not os.path.exists(src) or os.path.getsize(src) < 1:
-                    raise StorageError("empty audio for %s" % guid)
+                if not os.path.exists(src) or os.path.getsize(src) < 1024:
+                    raise StorageError("empty/short audio for %s" % guid)
                 # 标准音质且源本身是 MP3：直接改名复用，跳过 ffmpeg。
                 if profile["name"] == "standard" and _looks_like_mp3(src, ctype):
                     os.replace(src, dst)
@@ -321,7 +426,7 @@ class MediaCache:
         """
         profile = get_profile(quality)
         dst = self.path(guid, profile["name"])
-        if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+        if _looks_like_audio_file(dst):
             with open(dst, "rb") as fh:
                 while True:
                     block = fh.read(chunk_size)
@@ -343,8 +448,10 @@ class MediaCache:
         proc = None
         errf = None
         writer = None
+        watchdog = None
+        timed_out = []
         with self._lock(os.path.basename(dst)):
-            if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            if _looks_like_audio_file(dst):
                 with open(dst, "rb") as fh:
                     while True:
                         block = fh.read(chunk_size)
@@ -357,6 +464,7 @@ class MediaCache:
                 if not got:
                     raise StorageError("provider does not support streaming: %s" % guid)
                 ctype, iterator = got
+                iterator = _TimedStreamIterator(iterator, timeout, guid)
                 first = next(iterator, b"")
                 if not first:
                     raise StorageError("empty audio for %s" % guid)
@@ -383,6 +491,23 @@ class MediaCache:
                     errf = tempfile.TemporaryFile()
                     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE, stderr=errf)
+
+                    def _kill_on_timeout():
+                        timed_out.append(True)
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+
+                    def _arm_watchdog():
+                        nonlocal watchdog
+                        if watchdog is not None:
+                            watchdog.cancel()
+                        watchdog = threading.Timer(max(1.0, float(timeout)), _kill_on_timeout)
+                        watchdog.daemon = True
+                        watchdog.start()
+
+                    _arm_watchdog()
                     feed_errors = []
                     def _feed():
                         try:
@@ -405,6 +530,7 @@ class MediaCache:
                     with self._slots:
                         writer = open(tmp, "wb")
                         while True:
+                            _arm_watchdog()
                             out = proc.stdout.read(chunk_size)
                             if not out:
                                 break
@@ -413,6 +539,10 @@ class MediaCache:
                         writer.close()
                         writer = None
                         rc = proc.wait(timeout=timeout)
+                    if watchdog is not None:
+                        watchdog.cancel()
+                    if timed_out:
+                        raise StorageError("ffmpeg 流转码超时: %s" % guid)
                     if rc != 0:
                         try:
                             errf.seek(0)
@@ -435,6 +565,8 @@ class MediaCache:
             except Exception as exc:
                 raise StorageError("音频源读取失败: %s（%s）" % (guid, exc))
             finally:
+                if watchdog is not None:
+                    watchdog.cancel()
                 if writer is not None:
                     try:
                         writer.close()
@@ -495,7 +627,7 @@ class MediaCache:
             protected = os.path.abspath(protect) if protect else None
             items = []
             for name in os.listdir(self.dir):
-                if not name.endswith(".mp3"):
+                if not _is_cache_name(name):
                     continue
                 fp = os.path.join(self.dir, name)
                 try:
@@ -528,7 +660,7 @@ class MediaCache:
         total = 0
         try:
             for name in os.listdir(self.dir):
-                if not name.endswith(".mp3"):
+                if not _is_cache_name(name):
                     continue
                 try:
                     size = os.path.getsize(os.path.join(self.dir, name))
@@ -563,8 +695,14 @@ class LibraryStore:
         self._scan_callback_getter = scan_callback_getter or (lambda: None)
         self.scan_debounce = max(0.0, float(scan_debounce or 0))
         self.scan_timeout = max(1.0, float(scan_timeout or 60))
+        try:
+            self.download_transcode_timeout = max(
+                10.0, float(os.environ.get("GW_DOWNLOAD_TRANSCODE_TIMEOUT", "600") or 600))
+        except (TypeError, ValueError):
+            self.download_transcode_timeout = 600.0
         self._scan_job = None
         self._scan_last = 0.0
+        self._scan_pending = False
         self._scan_lock = threading.Lock()
 
     def enabled(self):
@@ -576,9 +714,14 @@ class LibraryStore:
             raise BadRequest("保存到本地曲库需要先配置 GW_DOWNLOAD_DIR")
         name = "%s - %s" % (track.get("title") or track.get("guid") or "unknown",
                             track.get("artist") or "未知")
-        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().lstrip(".")[:150] or "unknown"
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().lstrip(".") or "unknown"
+        # Linux ext4/Btrfs 单文件名上限 255 字节；按 UTF-8 字节截断并预留后缀/扩展名空间。
+        name = name.encode("utf-8")[:180].decode("utf-8", "ignore") or "unknown"
+        # 同名不同曲（不同 guid）不能互相覆盖：加稳定短哈希；同一 guid 重下仍覆盖同一文件。
+        guid = str(track.get("guid") or "")
+        suffix = "-" + hashlib.sha1(guid.encode("utf-8")).hexdigest()[:8] if guid else ""
         os.makedirs(directory, exist_ok=True)
-        return os.path.join(directory, name + ext)
+        return os.path.join(directory, name + suffix + ext)
 
     @staticmethod
     def _ext_for(ctype):
@@ -589,7 +732,38 @@ class LibraryStore:
             return ".mp3"
         if "wav" in low:
             return ".wav"
+        if "ogg" in low:
+            return ".ogg"
+        if "mp4" in low or "m4a" in low:
+            return ".m4a"
         return ".bin"
+
+    @classmethod
+    def _ext_for_bytes(cls, ctype, head):
+        ext = cls._ext_for(ctype)
+        if ext != ".bin":
+            return ext
+        head = bytes(head or b"")
+        if _mp3_header(head):
+            return ".mp3"
+        if head[:4] == b"fLaC":
+            return ".flac"
+        if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+            return ".wav"
+        if head[:4] == b"OggS":
+            return ".ogg"
+        if head[4:8] == b"ftyp":
+            return ".m4a"
+        return ext
+
+    @classmethod
+    def _ext_for_file(cls, path, ctype):
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(16)
+        except OSError:
+            head = b""
+        return cls._ext_for_bytes(ctype, head)
 
     def _check_capacity(self, size):
         if not self.max_bytes:
@@ -602,7 +776,7 @@ class LibraryStore:
         if not raw:
             raise BadRequest("在线音源返回空音频")
         self._check_capacity(len(raw))
-        fp = self.target_path(track, self._ext_for(ctype))
+        fp = self.target_path(track, self._ext_for_bytes(ctype, raw[:16]))
         tmp = fp + ".part"
         try:
             with open(tmp, "wb") as fh:
@@ -617,6 +791,27 @@ class LibraryStore:
         self.trigger_scan()
         return fp, len(raw)
 
+    def _transcode_download(self, src, dst, profile):
+        """把下载到的源文件转成目标音质 MP3（非无损档）；失败明确报错，不冒充高音质。"""
+        bitrate = profile.get("bitrate") or "128k"
+        sample_rate = profile.get("sample_rate") or 44100
+        channels = profile.get("channels") or 2
+        cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", src,
+               "-vn", "-map_metadata", "-1", "-ac", str(channels),
+               "-ar", str(sample_rate), "-c:a", "libmp3lame", "-b:a", bitrate,
+               "-f", "mp3", dst]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE,
+                                  timeout=self.download_transcode_timeout)
+        except FileNotFoundError:
+            raise StorageError("下载转码需要 ffmpeg，但当前环境不可用")
+        except subprocess.TimeoutExpired:
+            raise StorageError("下载转码超时")
+        if proc.returncode != 0:
+            detail = (proc.stderr or b"").decode("utf-8", "replace")[:200]
+            raise StorageError("下载转码失败: %s" % (detail or "ffmpeg error"))
+
     def save_from_provider(self, provider, track, quality=None):
         directory = str(self._dir_getter() or "").strip()
         if not directory:
@@ -624,23 +819,37 @@ class LibraryStore:
         os.makedirs(directory, exist_ok=True)
         # 下载前先确认还有空间，避免边下边写把磁盘写满后才报错。
         self._check_capacity(1)
+        profile = get_profile(quality or "lossless")
         fd, tmp = tempfile.mkstemp(prefix=".fnmusic-", suffix=".part", dir=directory)
         os.close(fd)
+        out_tmp = ""
         try:
             # 边下边写临时文件；拿到 Content-Type 后再决定扩展名
-            ctype, size = _call_stream_to_path(provider, track["guid"], tmp, quality)
+            ctype, size = _call_stream_to_path(provider, track["guid"], tmp, profile["name"])
             if not size:
                 raise BadRequest("在线音源返回空音频")
+            ext = self._ext_for_file(tmp, ctype)
+            if not profile.get("download_original"):
+                out_fd, out_tmp = tempfile.mkstemp(prefix=".fnmusic-", suffix=".mp3.part", dir=directory)
+                os.close(out_fd)
+                self._transcode_download(tmp, out_tmp, profile)
+                os.remove(tmp)
+                tmp = out_tmp
+                out_tmp = ""
+                ctype = "audio/mpeg"
+                ext = ".mp3"
+                size = os.path.getsize(tmp)
             self._check_capacity(size)
-            fp = self.target_path(track, self._ext_for(ctype))
+            fp = self.target_path(track, ext)
             os.replace(tmp, fp)
             tmp = ""
         finally:
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+            for leftover in (tmp, out_tmp):
+                if leftover:
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
         self.trigger_scan()
         return fp, size
 
@@ -649,6 +858,9 @@ class LibraryStore:
             return False
         guid = str(track.get("guid") or "")
         if not guid:
+            return False
+        # 已经保存过同一 guid 的曲目就不再重复下载（边播边存/首播补存可能多次触发）。
+        if self.has_track(track):
             return False
         with self._lock:
             if guid in self._jobs and self._jobs[guid].is_alive():
@@ -668,6 +880,22 @@ class LibraryStore:
             with self._lock:
                 self._jobs.pop(track.get("guid"), None)
 
+    def has_track(self, track):
+        """同一 guid 是否已有落盘文件（按目标文件名/扩展名检查，不读内容）。"""
+        if not self.enabled():
+            return False
+        for ext in self.AUDIO_EXTS:
+            try:
+                fp = self.target_path(track, ext)
+            except Exception:
+                continue
+            try:
+                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def scan_configured(self):
         try:
             callback = self._scan_callback_getter()
@@ -677,15 +905,18 @@ class LibraryStore:
                     or str(self._scan_cmd_getter() or "").strip()
                     or str(self._scan_url_getter() or "").strip())
 
-    def trigger_scan(self):
+    def trigger_scan(self, force=False):
         """下载完成后异步触发飞牛扫描，失败只记日志；同一时间只跑一个。"""
         if not self.scan_configured():
             return False
         with self._scan_lock:
             now = time.monotonic()
             if self._scan_job is not None and self._scan_job.is_alive():
+                # 扫描期间又有下载完成：记一个 pending，当前扫描结束后补扫，
+                # 不能直接丢掉这次请求（之前会漏掉最后一次入库）。
+                self._scan_pending = True
                 return False
-            if self.scan_debounce and now - self._scan_last < self.scan_debounce:
+            if not force and self.scan_debounce and now - self._scan_last < self.scan_debounce:
                 return False
             self._scan_last = now
             job = threading.Thread(target=self._run_scan, name="library-scan", daemon=True)
@@ -699,6 +930,11 @@ class LibraryStore:
         finally:
             with self._scan_lock:
                 self._scan_job = None
+                pending = self._scan_pending
+                self._scan_pending = False
+            if pending:
+                self._scan_last = 0.0
+                self.trigger_scan(force=True)
 
     def run_scan(self):
         try:

@@ -2,7 +2,10 @@
   "mcpServers": {
     "fnmusic": {
       "url": "http://192.168.50.100:8766/mcp",
-      "transport": "streamable-http"
+      "transport": "streamable-http",
+      "headers": {
+        "X-Admin-Token": "replace-with-your-GW_ADMIN_TOKEN"
+      }
     }
   }
 }

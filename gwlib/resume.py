@@ -24,7 +24,10 @@ class ResumeStore:
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            # 单条损坏记录不能拖死整个续播表：只保留 dict 条目。
+            return {str(k): v for k, v in data.items() if isinstance(v, dict)}
         except Exception:
             return {}
 
@@ -39,13 +42,20 @@ class ResumeStore:
             json.dump(data, fh, ensure_ascii=False)
         os.replace(tmp, self.path)
 
+    @staticmethod
+    def _updated_at(value):
+        try:
+            return float((value or {}).get("updated_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _prune(self, data, now):
         dead = [k for k, v in data.items() if not isinstance(v, dict) or
-                float(v.get("updated_at") or 0) + self.ttl <= now]
+                self._updated_at(v) + self.ttl <= now]
         for key in dead:
             data.pop(key, None)
         if len(data) > self.max_items:
-            ordered = sorted(data.items(), key=lambda kv: float(kv[1].get("updated_at") or 0))
+            ordered = sorted(data.items(), key=lambda kv: self._updated_at(kv[1]))
             for key, _ in ordered[:len(data) - self.max_items]:
                 data.pop(key, None)
 
